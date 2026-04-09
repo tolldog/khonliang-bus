@@ -29,7 +29,10 @@ def _free_port() -> int:
 @pytest.fixture
 def bus_url():
     if not BUS_BIN.exists():
-        pytest.skip("khonliang-bus binary not built; run `make build` first")
+        pytest.skip(
+            "khonliang-bus binary not built; run "
+            "`go build -o bin/khonliang-bus ./cmd/khonliang-bus` first"
+        )
 
     port = _free_port()
     proc = subprocess.Popen(
@@ -82,9 +85,19 @@ def test_publish_and_subscribe(bus_url):
                 return
 
         task = asyncio.create_task(consume())
-        await asyncio.sleep(0.1)  # let subscription register
-        bus.publish("events", {"hello": "world"})
-        await asyncio.wait_for(received.wait(), timeout=2)
+        # Publish-and-poll until the subscriber receives. Avoids fixed
+        # sleeps that can flake on slow runners. Bounded by an overall
+        # deadline.
+        deadline = time.monotonic() + 2.0
+        while not received.is_set():
+            bus.publish("events", {"hello": "world"})
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(received.wait(), timeout=min(0.1, remaining))
+            except asyncio.TimeoutError:
+                continue
         task.cancel()
         return got
 

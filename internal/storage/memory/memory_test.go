@@ -156,6 +156,7 @@ func TestConcurrentPublishAndClose(t *testing.T) {
 
 func TestBackfillBeforeLive(t *testing.T) {
 	// Regression: live messages must not interleave with backfill.
+	// Use explicit fromID="0" to opt into a full replay.
 	b := New()
 	defer b.Close()
 	ctx := context.Background()
@@ -164,7 +165,7 @@ func TestBackfillBeforeLive(t *testing.T) {
 	_, _ = b.Publish(ctx, "ordered", []byte("2"))
 	_, _ = b.Publish(ctx, "ordered", []byte("3"))
 
-	sub, err := b.Subscribe(ctx, "sub1", "ordered", "")
+	sub, err := b.Subscribe(ctx, "sub1", "ordered", "0")
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -191,5 +192,58 @@ func TestBackfillBeforeLive(t *testing.T) {
 		if got[i] != w {
 			t.Errorf("position %d: got %s, want %s (full: %v)", i, got[i], w, got)
 		}
+	}
+}
+
+func TestSubscribeWithoutAckStartsAtTail(t *testing.T) {
+	// New subscriber with no prior ack should NOT receive existing messages.
+	b := New()
+	defer b.Close()
+	ctx := context.Background()
+
+	_, _ = b.Publish(ctx, "topic", []byte("old1"))
+	_, _ = b.Publish(ctx, "topic", []byte("old2"))
+
+	sub, err := b.Subscribe(ctx, "fresh", "topic", "")
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	// Wait briefly to ensure backfill (which should be a no-op) settles.
+	time.Sleep(10 * time.Millisecond)
+
+	// Now publish a new message — that's what we should see.
+	_, _ = b.Publish(ctx, "topic", []byte("new"))
+
+	select {
+	case msg := <-sub.Messages():
+		if string(msg.Payload) != "new" {
+			t.Errorf("got %s, want 'new' (no historic replay)", msg.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for new message")
+	}
+}
+
+func TestAckDoesNotRegress(t *testing.T) {
+	b := New()
+	defer b.Close()
+	ctx := context.Background()
+
+	m1, _ := b.Publish(ctx, "topic", []byte("a"))
+	m2, _ := b.Publish(ctx, "topic", []byte("b"))
+
+	if err := b.Ack(ctx, "sub1", m2.ID); err != nil {
+		t.Fatalf("ack m2: %v", err)
+	}
+	// Out-of-order ack of an earlier message must not regress.
+	if err := b.Ack(ctx, "sub1", m1.ID); err != nil {
+		t.Fatalf("ack m1: %v", err)
+	}
+
+	last, _ := b.LastAcked(ctx, "sub1", "topic")
+	if last != m2.ID {
+		t.Errorf("LastAcked = %s, want %s (m2)", last, m2.ID)
 	}
 }

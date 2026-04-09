@@ -54,6 +54,11 @@ func main() {
 	defer cancel()
 	go pruneLoop(ctx, reg, cfg.Registry.HeartbeatInterval)
 
+	// Background retention loop for messages.
+	if cfg.Backend.Retention.MessagesTTL > 0 {
+		go retentionLoop(ctx, backend, cfg.Backend.Retention.MessagesTTL)
+	}
+
 	// Graceful shutdown on SIGINT/SIGTERM.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -103,6 +108,46 @@ func pruneLoop(ctx context.Context, reg *registry.Registry, interval time.Durati
 		case <-ticker.C:
 			if n := reg.Prune(); n > 0 {
 				log.Printf("pruned %d stale services from registry", n)
+			}
+		}
+	}
+}
+
+// retentionLoop periodically trims messages older than ttl across all
+// known topics. The interval is bounded to a fraction of ttl so
+// trimming runs frequently enough to bound disk growth without
+// hammering the DB.
+func retentionLoop(ctx context.Context, backend storage.Backend, ttl time.Duration) {
+	interval := ttl / 24
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	if interval > time.Hour {
+		interval = time.Hour
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			topics, err := backend.Topics(ctx)
+			if err != nil {
+				log.Printf("retention: list topics: %v", err)
+				continue
+			}
+			total := 0
+			for _, topic := range topics {
+				n, err := backend.Trim(ctx, topic, ttl)
+				if err != nil {
+					log.Printf("retention: trim %q: %v", topic, err)
+					continue
+				}
+				total += n
+			}
+			if total > 0 {
+				log.Printf("retention: trimmed %d messages across %d topics", total, len(topics))
 			}
 		}
 	}

@@ -45,6 +45,7 @@ type Backend interface {
 	Subscribe(ctx context.Context, subscriberID, topic, fromID string) (Subscription, error)
 	Ack(ctx context.Context, subscriberID, msgID string) error
 	LastAcked(ctx context.Context, subscriberID, topic string) (string, error)
+	Topics(ctx context.Context) ([]string, error)
 	Trim(ctx context.Context, topic string, olderThan time.Duration) (int, error)
 	Close() error
 }

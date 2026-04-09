@@ -40,7 +40,6 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("got %d services, want 1", len(services))
 	}
 
-	// Subscribe (must happen before publish to receive live messages)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sub, err := c.Subscribe(ctx, "events", "")
@@ -49,28 +48,38 @@ func TestEndToEnd(t *testing.T) {
 	}
 	defer sub.Close()
 
-	// Wait briefly for subscription to register on the server.
-	time.Sleep(50 * time.Millisecond)
+	// Publish-and-poll until the subscription is live, instead of a
+	// fixed sleep. The first publish that lands while the consumer is
+	// connected wins. Bounded by an overall deadline.
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
 
-	// Publish
-	id, err := c.Publish("events", []byte(`{"type":"test"}`))
-	if err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	if id == "" {
-		t.Fatal("expected non-empty message id")
+	var received client.Message
+	got := false
+publishLoop:
+	for {
+		if _, err := c.Publish("events", []byte(`{"type":"test"}`)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		select {
+		case received = <-sub.Messages():
+			got = true
+			break publishLoop
+		case <-tick.C:
+			continue
+		case <-deadline:
+			break publishLoop
+		}
 	}
 
-	// Receive
-	select {
-	case msg := <-sub.Messages():
-		if !strings.Contains(string(msg.Payload), "test") {
-			t.Errorf("got payload %s", msg.Payload)
-		}
-		if err := c.Ack(msg.ID); err != nil {
-			t.Errorf("ack: %v", err)
-		}
-	case <-time.After(2 * time.Second):
+	if !got {
 		t.Fatal("timeout waiting for message")
+	}
+	if !strings.Contains(string(received.Payload), "test") {
+		t.Errorf("got payload %s", received.Payload)
+	}
+	if err := c.Ack(received.ID); err != nil {
+		t.Errorf("ack: %v", err)
 	}
 }

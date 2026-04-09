@@ -98,12 +98,20 @@ func (b *Backend) Subscribe(ctx context.Context, subscriberID, topic, fromID str
 		return nil, storage.ErrClosed
 	}
 
-	// Resolve effective starting ID.
+	// Resolve effective starting ID per the storage.Backend contract:
+	// - non-empty fromID: backfill from there
+	// - empty fromID + prior ack: resume from ack
+	// - empty fromID + no prior ack: start at the current tail
 	start := fromID
 	if start == "" {
 		if topicAcks, ok := b.acks[subscriberID]; ok {
 			start = topicAcks[topic]
 		}
+	}
+	if start == "" {
+		// Anchor to the current latest ID so backfill skips everything
+		// already published.
+		start = strconv.FormatUint(b.nextID, 10)
 	}
 
 	sub := &subscription{
@@ -207,7 +215,11 @@ func (b *Backend) Ack(_ context.Context, subscriberID, msgID string) error {
 				if b.acks[subscriberID] == nil {
 					b.acks[subscriberID] = make(map[string]string)
 				}
-				b.acks[subscriberID][topic] = msgID
+				// Never regress on out-of-order acks: only advance.
+				existing := b.acks[subscriberID][topic]
+				if existing == "" || idGreater(msgID, existing) {
+					b.acks[subscriberID][topic] = msgID
+				}
 				return nil
 			}
 		}
@@ -223,6 +235,22 @@ func (b *Backend) LastAcked(_ context.Context, subscriberID, topic string) (stri
 		return topicAcks[topic], nil
 	}
 	return "", nil
+}
+
+// Topics returns all topics that currently hold at least one message.
+func (b *Backend) Topics(_ context.Context) ([]string, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil, storage.ErrClosed
+	}
+	out := make([]string, 0, len(b.messages))
+	for topic, msgs := range b.messages {
+		if len(msgs) > 0 {
+			out = append(out, topic)
+		}
+	}
+	return out, nil
 }
 
 // Trim removes messages older than cutoff for the topic.
@@ -343,15 +371,33 @@ func (s *subscription) isLive() bool {
 	return s.live
 }
 
-// idLess compares numeric message IDs.
+// parseMessageID parses a numeric message ID, returning ok=false on
+// any parse error so callers can treat invalid IDs as missing.
+func parseMessageID(s string) (uint64, bool) {
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// idLess compares numeric message IDs. Invalid IDs sort lowest.
 func idLess(a, b string) bool {
-	ai, _ := strconv.ParseUint(a, 10, 64)
-	bi, _ := strconv.ParseUint(b, 10, 64)
+	ai, aok := parseMessageID(a)
+	bi, bok := parseMessageID(b)
+	if !aok || !bok {
+		return aok == false && bok == true
+	}
 	return ai < bi
 }
 
+// idGreater returns true iff a is a strictly greater valid ID than b.
+// Invalid a or invalid b returns false.
 func idGreater(a, b string) bool {
-	ai, _ := strconv.ParseUint(a, 10, 64)
-	bi, _ := strconv.ParseUint(b, 10, 64)
+	ai, aok := parseMessageID(a)
+	bi, bok := parseMessageID(b)
+	if !aok || !bok {
+		return false
+	}
 	return ai > bi
 }

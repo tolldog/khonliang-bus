@@ -164,8 +164,13 @@ func (c *Client) Subscribe(ctx context.Context, topic, fromID string) (*Subscrip
 }
 
 func (s *Subscription) readLoop(ctx context.Context) {
+	// Always release resources when the loop exits, even on error or
+	// remote disconnect, so callers don't have to remember to Close().
 	defer close(s.messages)
 	defer close(s.done)
+	defer func() {
+		_ = s.conn.Close(websocket.StatusNormalClosure, "read loop exit")
+	}()
 	for {
 		select {
 		case <-ctx.Done():

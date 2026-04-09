@@ -139,6 +139,14 @@ func (b *Backend) Subscribe(ctx context.Context, subscriberID, topic, fromID str
 	}
 	b.mu.RUnlock()
 
+	// Validate fromID if provided.
+	if fromID != "" {
+		if _, err := strconv.ParseInt(fromID, 10, 64); err != nil {
+			return nil, fmt.Errorf("%w: fromID %q is not a valid id", storage.ErrNotFound, fromID)
+		}
+	}
+
+	// Resolve effective starting ID per the storage.Backend contract.
 	start := fromID
 	if start == "" {
 		acked, err := b.LastAcked(ctx, subscriberID, topic)
@@ -146,6 +154,15 @@ func (b *Backend) Subscribe(ctx context.Context, subscriberID, topic, fromID str
 			return nil, err
 		}
 		start = acked
+	}
+	if start == "" {
+		// No prior ack: anchor to the current tail so the subscriber
+		// only receives newly published messages.
+		latest, err := b.maxIDForTopic(ctx, topic)
+		if err != nil {
+			return nil, err
+		}
+		start = strconv.FormatInt(latest, 10)
 	}
 
 	sub := &subscription{
@@ -167,16 +184,27 @@ func (b *Backend) Subscribe(ctx context.Context, subscriberID, topic, fromID str
 // backfillLoop drains pending DB messages, then loops if new ones
 // arrived during the drain, and finally marks the subscription live
 // under subsMu so the live transition is atomic with Publish.
+//
+// On any unrecoverable error, the subscription is closed so callers
+// stop blocking on Messages().
 func (b *Backend) backfillLoop(ctx context.Context, sub *subscription, fromID string) {
+	// fromID is already validated in Subscribe; treat empty as 0.
 	cursor := int64(0)
 	if fromID != "" {
+		// ParseInt is safe here because Subscribe rejected invalid IDs.
 		if v, err := strconv.ParseInt(fromID, 10, 64); err == nil {
 			cursor = v
 		}
 	}
 
 	for {
-		drained, latest := b.drainOnce(ctx, sub, cursor)
+		drained, latest, err := b.drainOnce(ctx, sub, cursor)
+		if err != nil {
+			// Unrecoverable backfill error — close the subscription so
+			// the consumer doesn't block on Messages() forever.
+			_ = sub.Close()
+			return
+		}
 		if !drained {
 			return
 		}
@@ -188,6 +216,7 @@ func (b *Backend) backfillLoop(ctx context.Context, sub *subscription, fromID st
 		latestInDB, err := b.maxIDForTopic(ctx, sub.topic)
 		if err != nil {
 			b.subsMu.Unlock()
+			_ = sub.Close()
 			return
 		}
 		if latestInDB <= cursor {
@@ -200,9 +229,11 @@ func (b *Backend) backfillLoop(ctx context.Context, sub *subscription, fromID st
 }
 
 // drainOnce sends every message with id > cursor to sub. Returns
-// (continueDrain, latestID). continueDrain is false if the subscription
-// is closed or the context is cancelled.
-func (b *Backend) drainOnce(ctx context.Context, sub *subscription, cursor int64) (bool, int64) {
+// (drained, latestID, err).
+//   - drained=false, err==nil: subscription closed or context cancelled
+//   - drained=false, err!=nil: query/iteration error (caller should close)
+//   - drained=true: all current rows delivered
+func (b *Backend) drainOnce(ctx context.Context, sub *subscription, cursor int64) (bool, int64, error) {
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT id, topic, payload, created_at FROM messages
 		 WHERE topic = ? AND id > ?
@@ -210,7 +241,7 @@ func (b *Backend) drainOnce(ctx context.Context, sub *subscription, cursor int64
 		sub.topic, cursor,
 	)
 	if err != nil {
-		return false, cursor
+		return false, cursor, err
 	}
 	defer rows.Close()
 
@@ -223,7 +254,7 @@ func (b *Backend) drainOnce(ctx context.Context, sub *subscription, cursor int64
 			created time.Time
 		)
 		if err := rows.Scan(&id, &topic, &payload, &created); err != nil {
-			return false, latest
+			return false, latest, err
 		}
 		msg := storage.Message{
 			ID:        strconv.FormatInt(id, 10),
@@ -233,7 +264,7 @@ func (b *Backend) drainOnce(ctx context.Context, sub *subscription, cursor int64
 		}
 		select {
 		case <-ctx.Done():
-			return false, latest
+			return false, latest, nil
 		default:
 		}
 		for !sub.trySend(msg) {
@@ -241,17 +272,20 @@ func (b *Backend) drainOnce(ctx context.Context, sub *subscription, cursor int64
 			closed := sub.closed
 			sub.mu.Unlock()
 			if closed {
-				return false, latest
+				return false, latest, nil
 			}
 			select {
 			case <-ctx.Done():
-				return false, latest
+				return false, latest, nil
 			case <-time.After(5 * time.Millisecond):
 			}
 		}
 		latest = id
 	}
-	return true, latest
+	if err := rows.Err(); err != nil {
+		return false, latest, err
+	}
+	return true, latest, nil
 }
 
 // maxIDForTopic returns the highest message ID for a topic, or 0 if
@@ -292,12 +326,21 @@ func (b *Backend) Ack(ctx context.Context, subscriberID, msgID string) error {
 		return fmt.Errorf("lookup topic: %w", err)
 	}
 
+	// Out-of-order acks must not regress last_acked_id, so only advance.
 	_, err = b.db.ExecContext(ctx, `
 		INSERT INTO subscriber_acks (subscriber_id, topic, last_acked_id, updated_at)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(subscriber_id, topic) DO UPDATE SET
-			last_acked_id = excluded.last_acked_id,
-			updated_at = excluded.updated_at
+			last_acked_id = CASE
+				WHEN excluded.last_acked_id > subscriber_acks.last_acked_id
+					THEN excluded.last_acked_id
+				ELSE subscriber_acks.last_acked_id
+			END,
+			updated_at = CASE
+				WHEN excluded.last_acked_id > subscriber_acks.last_acked_id
+					THEN excluded.updated_at
+				ELSE subscriber_acks.updated_at
+			END
 		`, subscriberID, topic, id, time.Now().UTC(),
 	)
 	if err != nil {
@@ -320,6 +363,30 @@ func (b *Backend) LastAcked(ctx context.Context, subscriberID, topic string) (st
 		return "", fmt.Errorf("lookup ack: %w", err)
 	}
 	return strconv.FormatInt(id, 10), nil
+}
+
+// Topics returns all distinct topics currently in the messages table.
+func (b *Backend) Topics(ctx context.Context) ([]string, error) {
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT DISTINCT topic FROM messages ORDER BY topic`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list topics: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("scan topic: %w", err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate topics: %w", err)
+	}
+	return out, nil
 }
 
 // Trim removes messages older than cutoff for the given topic.

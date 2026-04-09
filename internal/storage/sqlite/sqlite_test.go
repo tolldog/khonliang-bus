@@ -126,3 +126,73 @@ func TestTrim(t *testing.T) {
 		t.Errorf("trimmed %d, want 1", n)
 	}
 }
+
+func TestSubscribeWithoutAckStartsAtTail(t *testing.T) {
+	b := newTest(t)
+	ctx := context.Background()
+
+	_, _ = b.Publish(ctx, "topic", []byte("old1"))
+	_, _ = b.Publish(ctx, "topic", []byte("old2"))
+
+	sub, err := b.Subscribe(ctx, "fresh", "topic", "")
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	_, _ = b.Publish(ctx, "topic", []byte("new"))
+
+	select {
+	case msg := <-sub.Messages():
+		if string(msg.Payload) != "new" {
+			t.Errorf("got %s, want 'new' (no historic replay)", msg.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for new message")
+	}
+}
+
+func TestAckDoesNotRegress(t *testing.T) {
+	b := newTest(t)
+	ctx := context.Background()
+
+	m1, _ := b.Publish(ctx, "topic", []byte("a"))
+	m2, _ := b.Publish(ctx, "topic", []byte("b"))
+
+	if err := b.Ack(ctx, "sub1", m2.ID); err != nil {
+		t.Fatalf("ack m2: %v", err)
+	}
+	if err := b.Ack(ctx, "sub1", m1.ID); err != nil {
+		t.Fatalf("ack m1: %v", err)
+	}
+
+	last, _ := b.LastAcked(ctx, "sub1", "topic")
+	if last != m2.ID {
+		t.Errorf("LastAcked = %s, want %s (m2)", last, m2.ID)
+	}
+}
+
+func TestTopics(t *testing.T) {
+	b := newTest(t)
+	ctx := context.Background()
+
+	_, _ = b.Publish(ctx, "alpha", []byte("a"))
+	_, _ = b.Publish(ctx, "beta", []byte("b"))
+	_, _ = b.Publish(ctx, "alpha", []byte("c"))
+
+	topics, err := b.Topics(ctx)
+	if err != nil {
+		t.Fatalf("topics: %v", err)
+	}
+	want := map[string]bool{"alpha": true, "beta": true}
+	if len(topics) != len(want) {
+		t.Errorf("got %d topics, want %d", len(topics), len(want))
+	}
+	for _, topic := range topics {
+		if !want[topic] {
+			t.Errorf("unexpected topic %q", topic)
+		}
+	}
+}
