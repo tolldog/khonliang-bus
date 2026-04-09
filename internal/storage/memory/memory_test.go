@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/tolldog/khonliang-bus/internal/storage"
 )
 
 func TestPublishSubscribe(t *testing.T) {
@@ -120,5 +122,74 @@ func TestTrim(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("trimmed %d, want 1", n)
+	}
+}
+
+func TestConcurrentPublishAndClose(t *testing.T) {
+	// Regression: Publish must not hold b.mu while taking subscription
+	// locks. Without the snapshot+deliver fix, this test deadlocks.
+	b := New()
+	defer b.Close()
+	ctx := context.Background()
+
+	for i := 0; i < 50; i++ {
+		sub, err := b.Subscribe(ctx, "stress", "topic", "")
+		if err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+		go func() {
+			for j := 0; j < 10; j++ {
+				_, _ = b.Publish(ctx, "topic", []byte("x"))
+			}
+		}()
+		go func(s storage.Subscription) {
+			for j := 0; j < 3; j++ {
+				select {
+				case <-s.Messages():
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+			_ = s.Close()
+		}(sub)
+	}
+}
+
+func TestBackfillBeforeLive(t *testing.T) {
+	// Regression: live messages must not interleave with backfill.
+	b := New()
+	defer b.Close()
+	ctx := context.Background()
+
+	_, _ = b.Publish(ctx, "ordered", []byte("1"))
+	_, _ = b.Publish(ctx, "ordered", []byte("2"))
+	_, _ = b.Publish(ctx, "ordered", []byte("3"))
+
+	sub, err := b.Subscribe(ctx, "sub1", "ordered", "")
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		_, _ = b.Publish(ctx, "ordered", []byte("4"))
+		_, _ = b.Publish(ctx, "ordered", []byte("5"))
+	}()
+
+	got := make([]string, 0, 5)
+	timeout := time.After(2 * time.Second)
+	for len(got) < 5 {
+		select {
+		case msg := <-sub.Messages():
+			got = append(got, string(msg.Payload))
+		case <-timeout:
+			t.Fatalf("timeout, got %v", got)
+		}
+	}
+	want := []string{"1", "2", "3", "4", "5"}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("position %d: got %s, want %s (full: %v)", i, got[i], w, got)
+		}
 	}
 }

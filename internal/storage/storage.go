@@ -30,10 +30,16 @@ type Subscription interface {
 // Semantics:
 //   - Publish appends a message to the topic and returns its assigned ID.
 //   - Subscribe streams messages for topic, starting after fromID.
-//     Pass an empty fromID to receive only new messages.
+//     If fromID is empty, the backend resumes after the last message
+//     acknowledged by subscriberID for that topic (see LastAcked).
+//     If no ack exists, the subscriber starts at the current tail and
+//     receives only newly published messages.
 //   - Ack records that subscriberID has processed up to msgID. The next
-//     Subscribe call without an explicit fromID will resume from there.
+//     Subscribe call with an empty fromID will resume from there.
 //   - Trim removes messages older than the cutoff for the given topic.
+//   - Backends MUST deliver backfilled messages strictly before any
+//     newly-published live messages so reconnecting subscribers observe
+//     a single in-order stream.
 type Backend interface {
 	Publish(ctx context.Context, topic string, payload []byte) (Message, error)
 	Subscribe(ctx context.Context, subscriberID, topic, fromID string) (Subscription, error)

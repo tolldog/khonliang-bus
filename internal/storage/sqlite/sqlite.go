@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS subscriber_acks (
 `
 
 // Backend is the SQLite implementation of storage.Backend.
+//
+// Lock order (when both are held): subsMu before any subscription.mu.
+// Publish snapshots subscribers under subsMu and delivers outside the
+// lock to avoid lock-order inversion with subscription.Close().
 type Backend struct {
 	db     *sql.DB
 	mu     sync.RWMutex
@@ -98,19 +102,31 @@ func (b *Backend) Publish(ctx context.Context, topic string, payload []byte) (st
 		Timestamp: now,
 	}
 
-	// Notify live subscribers.
+	// Snapshot live subscribers under subsMu, deliver after releasing.
+	var live []*subscription
 	b.subsMu.Lock()
 	for _, sub := range b.subs {
-		if sub.topic == topic {
-			sub.deliver(msg)
+		if sub.topic == topic && sub.isLive() {
+			live = append(live, sub)
 		}
 	}
 	b.subsMu.Unlock()
 
+	for _, sub := range live {
+		sub.deliver(msg)
+	}
+
 	return msg, nil
 }
 
-// Subscribe streams messages for the topic, backfilling missed messages.
+// Subscribe streams messages for the topic. If fromID is non-empty, it
+// backfills messages with ID > fromID before going live. If fromID is
+// empty, it resumes from the subscriber's last-acked ID for the topic
+// when present; otherwise it streams only new messages.
+//
+// Backfill completes before the subscription is registered for live
+// delivery, so reconnecting subscribers always observe backfilled
+// messages strictly before live messages.
 func (b *Backend) Subscribe(ctx context.Context, subscriberID, topic, fromID string) (storage.Subscription, error) {
 	if topic == "" {
 		return nil, storage.ErrInvalidTopic
@@ -144,29 +160,61 @@ func (b *Backend) Subscribe(ctx context.Context, subscriberID, topic, fromID str
 	b.subs[sub.id] = sub
 	b.subsMu.Unlock()
 
-	go b.backfill(ctx, sub, start)
+	go b.backfillLoop(ctx, sub, start)
 	return sub, nil
 }
 
-func (b *Backend) backfill(ctx context.Context, sub *subscription, fromID string) {
-	startID := int64(0)
+// backfillLoop drains pending DB messages, then loops if new ones
+// arrived during the drain, and finally marks the subscription live
+// under subsMu so the live transition is atomic with Publish.
+func (b *Backend) backfillLoop(ctx context.Context, sub *subscription, fromID string) {
+	cursor := int64(0)
 	if fromID != "" {
 		if v, err := strconv.ParseInt(fromID, 10, 64); err == nil {
-			startID = v
+			cursor = v
 		}
 	}
 
+	for {
+		drained, latest := b.drainOnce(ctx, sub, cursor)
+		if !drained {
+			return
+		}
+		cursor = latest
+
+		// Try to flip live atomically. If a newer message landed during
+		// the drain, loop and drain again.
+		b.subsMu.Lock()
+		latestInDB, err := b.maxIDForTopic(ctx, sub.topic)
+		if err != nil {
+			b.subsMu.Unlock()
+			return
+		}
+		if latestInDB <= cursor {
+			sub.markLive()
+			b.subsMu.Unlock()
+			return
+		}
+		b.subsMu.Unlock()
+	}
+}
+
+// drainOnce sends every message with id > cursor to sub. Returns
+// (continueDrain, latestID). continueDrain is false if the subscription
+// is closed or the context is cancelled.
+func (b *Backend) drainOnce(ctx context.Context, sub *subscription, cursor int64) (bool, int64) {
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT id, topic, payload, created_at FROM messages
 		 WHERE topic = ? AND id > ?
 		 ORDER BY id ASC`,
-		sub.topic, startID,
+		sub.topic, cursor,
 	)
 	if err != nil {
-		return
+		return false, cursor
 	}
 	defer rows.Close()
 
+	latest := cursor
 	for rows.Next() {
 		var (
 			id      int64
@@ -175,7 +223,7 @@ func (b *Backend) backfill(ctx context.Context, sub *subscription, fromID string
 			created time.Time
 		)
 		if err := rows.Scan(&id, &topic, &payload, &created); err != nil {
-			return
+			return false, latest
 		}
 		msg := storage.Message{
 			ID:        strconv.FormatInt(id, 10),
@@ -185,7 +233,7 @@ func (b *Backend) backfill(ctx context.Context, sub *subscription, fromID string
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return false, latest
 		default:
 		}
 		for !sub.trySend(msg) {
@@ -193,15 +241,33 @@ func (b *Backend) backfill(ctx context.Context, sub *subscription, fromID string
 			closed := sub.closed
 			sub.mu.Unlock()
 			if closed {
-				return
+				return false, latest
 			}
 			select {
 			case <-ctx.Done():
-				return
+				return false, latest
 			case <-time.After(5 * time.Millisecond):
 			}
 		}
+		latest = id
 	}
+	return true, latest
+}
+
+// maxIDForTopic returns the highest message ID for a topic, or 0 if
+// the topic is empty.
+func (b *Backend) maxIDForTopic(ctx context.Context, topic string) (int64, error) {
+	var id sql.NullInt64
+	err := b.db.QueryRowContext(ctx,
+		`SELECT MAX(id) FROM messages WHERE topic = ?`, topic,
+	).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	if !id.Valid {
+		return 0, nil
+	}
+	return id.Int64, nil
 }
 
 // Ack records that subscriberID has processed up to msgID.
@@ -293,6 +359,9 @@ func (b *Backend) Close() error {
 }
 
 // subscription is a per-call streaming handle.
+//
+// Lock order: when both subsMu and s.mu are needed, subsMu must be
+// acquired first. Close() follows this order; trySend() only takes s.mu.
 type subscription struct {
 	id           string
 	subscriberID string
@@ -301,6 +370,7 @@ type subscription struct {
 	backend      *Backend
 	mu           sync.Mutex
 	closed       bool
+	live         bool
 }
 
 func (s *subscription) Messages() <-chan storage.Message {
@@ -308,16 +378,18 @@ func (s *subscription) Messages() <-chan storage.Message {
 }
 
 func (s *subscription) Close() error {
+	// Acquire backend subs lock first to honor lock order with Publish.
+	s.backend.subsMu.Lock()
 	s.mu.Lock()
+	defer s.backend.subsMu.Unlock()
 	defer s.mu.Unlock()
+
 	if s.closed {
 		return nil
 	}
 	s.closed = true
-	close(s.ch)
-	s.backend.subsMu.Lock()
 	delete(s.backend.subs, s.id)
-	s.backend.subsMu.Unlock()
+	close(s.ch)
 	return nil
 }
 
@@ -337,4 +409,19 @@ func (s *subscription) trySend(msg storage.Message) bool {
 
 func (s *subscription) deliver(msg storage.Message) {
 	_ = s.trySend(msg)
+}
+
+// markLive flips the subscription into live-delivery mode. Must be
+// called with subsMu held so the transition is atomic with Publish.
+func (s *subscription) markLive() {
+	s.mu.Lock()
+	s.live = true
+	s.mu.Unlock()
+}
+
+// isLive reports whether the subscription has finished backfill.
+func (s *subscription) isLive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.live
 }

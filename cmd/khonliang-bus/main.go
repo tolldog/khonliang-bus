@@ -41,7 +41,7 @@ func main() {
 	defer backend.Close()
 
 	reg := registry.New(5 * cfg.Registry.HeartbeatInterval)
-	srv := server.New(backend, reg)
+	srv := server.New(backend, reg, server.WithAllowedOrigins(cfg.AllowedOrigins...))
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,

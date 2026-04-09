@@ -34,21 +34,12 @@ def bus_url():
     port = _free_port()
     proc = subprocess.Popen(
         [str(BUS_BIN)],
-        env={**os.environ},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    # Listen on default :8787 so override via flag
-    proc.terminate()
-
-    proc = subprocess.Popen(
-        [str(BUS_BIN)],
         env={**os.environ, "KHONLIANG_BUS_LISTEN": f":{port}"},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
-    # Wait for listen
+    # Wait for the listener to come up.
     deadline = time.time() + 5
     while time.time() < deadline:
         try:
@@ -63,7 +54,11 @@ def bus_url():
     yield f"http://127.0.0.1:{port}"
 
     proc.terminate()
-    proc.wait(timeout=2)
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 def test_register_and_list(bus_url):

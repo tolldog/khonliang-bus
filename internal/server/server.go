@@ -20,21 +20,36 @@ import (
 
 // Server wires storage + registry behind HTTP/WebSocket handlers.
 type Server struct {
-	backend  storage.Backend
-	registry *registry.Registry
-	mux      *http.ServeMux
+	backend        storage.Backend
+	registry       *registry.Registry
+	mux            *http.ServeMux
+	allowedOrigins []string
 
-	mu          sync.Mutex
-	subsByConn  map[*websocket.Conn]storage.Subscription
+	mu         sync.Mutex
+	subsByConn map[*websocket.Conn]storage.Subscription
+}
+
+// Option configures a Server at construction time.
+type Option func(*Server)
+
+// WithAllowedOrigins sets the WebSocket origin allow-list (passed to
+// websocket.AcceptOptions.OriginPatterns). Empty enforces same-host.
+func WithAllowedOrigins(patterns ...string) Option {
+	return func(s *Server) {
+		s.allowedOrigins = patterns
+	}
 }
 
 // New constructs a server with the given backend and registry.
-func New(backend storage.Backend, reg *registry.Registry) *Server {
+func New(backend storage.Backend, reg *registry.Registry, opts ...Option) *Server {
 	s := &Server{
 		backend:    backend,
 		registry:   reg,
 		mux:        http.NewServeMux(),
 		subsByConn: make(map[*websocket.Conn]storage.Subscription),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	s.routes()
 	return s
@@ -177,31 +192,42 @@ type wsMessage struct {
 }
 
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
+	// OriginPatterns enforces same-host by default; callers from other
+	// origins must be explicitly allowed via WithAllowedOrigins.
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // local-only for v0.1; auth comes later
+		OriginPatterns: s.allowedOrigins,
 	})
 	if err != nil {
 		log.Printf("ws accept: %v", err)
 		return
 	}
-	defer c.Close(websocket.StatusInternalError, "internal error")
+	closeStatus := websocket.StatusNormalClosure
+	closeReason := "closing"
+	defer func() {
+		_ = c.Close(closeStatus, closeReason)
+	}()
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	var req subscribeRequest
 	if err := wsjson.Read(ctx, c, &req); err != nil {
-		log.Printf("ws read subscribe: %v", err)
+		closeStatus = websocket.StatusProtocolError
+		closeReason = "missing subscribe frame"
 		return
 	}
 	if req.SubscriberID == "" || req.Topic == "" {
 		_ = wsjson.Write(ctx, c, wsMessage{Type: "error", Error: "subscriber_id and topic required"})
+		closeStatus = websocket.StatusPolicyViolation
+		closeReason = "missing fields"
 		return
 	}
 
 	sub, err := s.backend.Subscribe(ctx, req.SubscriberID, req.Topic, req.FromID)
 	if err != nil {
 		_ = wsjson.Write(ctx, c, wsMessage{Type: "error", Error: err.Error()})
+		closeStatus = websocket.StatusInternalError
+		closeReason = "subscribe failed"
 		return
 	}
 
@@ -233,7 +259,8 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 				Timestamp: msg.Timestamp.Format(time.RFC3339Nano),
 			}
 			if err := wsjson.Write(ctx, c, out); err != nil {
-				log.Printf("ws write: %v", err)
+				closeStatus = websocket.StatusInternalError
+				closeReason = "write failed"
 				return
 			}
 		}

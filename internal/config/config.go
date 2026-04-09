@@ -11,9 +11,10 @@ import (
 
 // Config is the top-level configuration.
 type Config struct {
-	Listen   string         `yaml:"listen"`
-	Backend  BackendConfig  `yaml:"backend"`
-	Registry RegistryConfig `yaml:"registry"`
+	Listen         string         `yaml:"listen"`
+	Backend        BackendConfig  `yaml:"backend"`
+	Registry       RegistryConfig `yaml:"registry"`
+	AllowedOrigins []string       `yaml:"allowed_origins"`
 }
 
 // BackendConfig selects and parameterizes the storage layer.
