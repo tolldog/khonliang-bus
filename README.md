@@ -2,7 +2,7 @@
 
 A cross-app event bus and service registry for the khonliang ecosystem.
 
-Provides push notifications, service discovery, and pub/sub between MCP servers, agents, and applications. Designed so a developer MCP can subscribe to events from the researcher, autostock, and other apps without each project reinventing its own messaging layer.
+Provides push notifications, service discovery, and pub/sub between MCP servers, agents, and applications. Designed so a developer MCP can subscribe to events from the researcher and other apps without each project reinventing its own messaging layer.
 
 ## Features
 
@@ -58,7 +58,7 @@ for msg := range sub.Messages() {
 
 ```
 ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│  researcher MCP  │    │  developer MCP   │    │   autostock      │
+│  researcher MCP  │    │  developer MCP   │    │   your app       │
 └────────┬─────────┘    └────────┬─────────┘    └────────┬─────────┘
          │                       │                       │
          │ pub/sub               │ pub/sub               │ pub/sub
