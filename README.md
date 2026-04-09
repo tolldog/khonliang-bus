@@ -89,7 +89,6 @@ backend:
     path: data/bus.db
   retention:
     messages_ttl: 168h        # 7d
-    subscriber_idle_ttl: 720h # 30d
 
 registry:
   heartbeat_interval: 30s

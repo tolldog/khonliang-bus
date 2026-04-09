@@ -126,7 +126,7 @@ def test_publish_and_subscribe(bus_url):
             # "Task was destroyed but it is pending!" warnings.
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
         return got
 

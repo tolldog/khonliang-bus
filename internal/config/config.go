@@ -35,10 +35,11 @@ type RedisConfig struct {
 	URL string `yaml:"url"`
 }
 
-// RetentionConfig controls automatic message and subscriber pruning.
+// RetentionConfig controls automatic message retention.
+// MessagesTTL sets the maximum age of messages before they are trimmed.
+// Subscriber ack pruning (subscriber_idle_ttl) is planned for v0.2.
 type RetentionConfig struct {
-	MessagesTTL       time.Duration `yaml:"messages_ttl"`
-	SubscriberIdleTTL time.Duration `yaml:"subscriber_idle_ttl"`
+	MessagesTTL time.Duration `yaml:"messages_ttl"`
 }
 
 // RegistryConfig controls service discovery behavior.
@@ -53,8 +54,7 @@ func Default() Config {
 		Backend: BackendConfig{
 			Type: "memory",
 			Retention: RetentionConfig{
-				MessagesTTL:       7 * 24 * time.Hour,
-				SubscriberIdleTTL: 30 * 24 * time.Hour,
+				MessagesTTL: 7 * 24 * time.Hour,
 			},
 		},
 		Registry: RegistryConfig{

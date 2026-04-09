@@ -221,7 +221,7 @@ func (s *Subscription) readLoop(ctx context.Context) {
 		// Surface them via Err() and terminate the subscription so
 		// callers don't see a fake zero-value Message.
 		if frame.Type == "error" {
-			s.setErr(fmt.Errorf("server error: %s", frame.Error))
+			s.setErr(fmt.Errorf("server rejected subscription: %s", frame.Error))
 			return
 		}
 		msg := Message{
