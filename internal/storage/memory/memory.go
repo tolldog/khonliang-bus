@@ -91,6 +91,12 @@ func (b *Backend) Subscribe(ctx context.Context, subscriberID, topic, fromID str
 	if topic == "" {
 		return nil, storage.ErrInvalidTopic
 	}
+	// Validate fromID up front for parity with the sqlite backend.
+	if fromID != "" {
+		if _, ok := parseMessageID(fromID); !ok {
+			return nil, fmt.Errorf("%w: fromID %q is not a valid id", storage.ErrNotFound, fromID)
+		}
+	}
 
 	b.mu.Lock()
 	if b.closed {

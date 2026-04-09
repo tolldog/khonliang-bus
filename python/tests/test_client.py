@@ -35,24 +35,45 @@ def bus_url():
         )
 
     port = _free_port()
+    # Capture stdout/stderr so a startup failure produces useful diagnostics
+    # in the test output instead of being silently skipped.
     proc = subprocess.Popen(
         [str(BUS_BIN)],
         env={**os.environ, "KHONLIANG_BUS_LISTEN": f":{port}"},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
     # Wait for the listener to come up.
     deadline = time.time() + 5
+    started = False
     while time.time() < deadline:
+        if proc.poll() is not None:
+            # Process exited before we could connect — surface its output.
+            stdout, stderr = proc.communicate()
+            pytest.fail(
+                f"khonliang-bus exited during startup with code {proc.returncode}\n"
+                f"stdout: {stdout.decode(errors='replace')}\n"
+                f"stderr: {stderr.decode(errors='replace')}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                started = True
                 break
         except OSError:
             time.sleep(0.05)
-    else:
+    if not started:
         proc.terminate()
-        pytest.skip("bus did not start in time")
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=5)
+        pytest.fail(
+            "khonliang-bus did not start within 5s\n"
+            f"stdout: {stdout.decode(errors='replace')}\n"
+            f"stderr: {stderr.decode(errors='replace')}"
+        )
 
     yield f"http://127.0.0.1:{port}"
 
@@ -85,20 +106,28 @@ def test_publish_and_subscribe(bus_url):
                 return
 
         task = asyncio.create_task(consume())
-        # Publish-and-poll until the subscriber receives. Avoids fixed
-        # sleeps that can flake on slow runners. Bounded by an overall
-        # deadline.
-        deadline = time.monotonic() + 2.0
-        while not received.is_set():
-            bus.publish("events", {"hello": "world"})
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+        try:
+            # Publish-and-poll until the subscriber receives. Avoids fixed
+            # sleeps that can flake on slow runners. Bounded by an overall
+            # deadline.
+            deadline = time.monotonic() + 2.0
+            while not received.is_set():
+                bus.publish("events", {"hello": "world"})
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(received.wait(), timeout=min(0.1, remaining))
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            task.cancel()
+            # Await the task so we don't leave it pending and trigger
+            # "Task was destroyed but it is pending!" warnings.
             try:
-                await asyncio.wait_for(received.wait(), timeout=min(0.1, remaining))
-            except asyncio.TimeoutError:
-                continue
-        task.cancel()
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         return got
 
     got = asyncio.run(run())

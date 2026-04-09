@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -41,6 +42,17 @@ type Message struct {
 	Topic     string          `json:"topic"`
 	Payload   json.RawMessage `json:"payload"`
 	Timestamp string          `json:"timestamp"`
+}
+
+// wireFrame matches the server's wsMessage envelope. The "type" field
+// distinguishes "message" frames from "error" frames.
+type wireFrame struct {
+	Type      string          `json:"type"`
+	ID        string          `json:"id,omitempty"`
+	Topic     string          `json:"topic,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+	Timestamp string          `json:"timestamp,omitempty"`
+	Error     string          `json:"error,omitempty"`
 }
 
 // Client is a khonliang-bus client.
@@ -110,6 +122,25 @@ type Subscription struct {
 	messages chan Message
 	cancel   context.CancelFunc
 	done     chan struct{}
+
+	errMu sync.Mutex
+	err   error
+}
+
+// Err returns the error that terminated the subscription, if any.
+// Returns nil for clean closes (Close() or remote normal closure).
+func (s *Subscription) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.err
+}
+
+func (s *Subscription) setErr(err error) {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	if s.err == nil {
+		s.err = err
+	}
 }
 
 // Messages returns a channel of incoming messages. Closed when the
@@ -127,6 +158,10 @@ func (s *Subscription) Close() error {
 
 // Subscribe opens a WebSocket subscription. Pass an empty fromID to
 // resume from the last acked message (or only new messages if none).
+//
+// If the server rejects the subscribe request (e.g. invalid topic),
+// the error is returned synchronously instead of being delivered as
+// a fake zero-value message.
 func (c *Client) Subscribe(ctx context.Context, topic, fromID string) (*Subscription, error) {
 	wsURL, err := httpToWS(c.baseURL + "/v1/subscribe")
 	if err != nil {
@@ -177,9 +212,23 @@ func (s *Subscription) readLoop(ctx context.Context) {
 			return
 		default:
 		}
-		var msg Message
-		if err := wsjson.Read(ctx, s.conn, &msg); err != nil {
+		var frame wireFrame
+		if err := wsjson.Read(ctx, s.conn, &frame); err != nil {
+			s.setErr(err)
 			return
+		}
+		// Server-side errors are sent as {"type":"error","error":"..."}.
+		// Surface them via Err() and terminate the subscription so
+		// callers don't see a fake zero-value Message.
+		if frame.Type == "error" {
+			s.setErr(fmt.Errorf("server error: %s", frame.Error))
+			return
+		}
+		msg := Message{
+			ID:        frame.ID,
+			Topic:     frame.Topic,
+			Payload:   frame.Payload,
+			Timestamp: frame.Timestamp,
 		}
 		select {
 		case <-ctx.Done():

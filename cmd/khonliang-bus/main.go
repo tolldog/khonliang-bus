@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -86,6 +87,13 @@ func buildBackend(cfg config.BackendConfig) (storage.Backend, error) {
 		path := cfg.SQLite.Path
 		if path == "" {
 			path = "data/bus.db"
+		}
+		// Ensure the parent directory exists so opening the DB doesn't
+		// fail with "unable to open database file" on a fresh install.
+		if dir := filepath.Dir(path); dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return nil, fmt.Errorf("create sqlite dir %q: %w", dir, err)
+			}
 		}
 		return sqlite.New(path)
 	case "redis":
