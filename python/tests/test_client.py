@@ -1,0 +1,98 @@
+"""End-to-end tests for the Python client.
+
+Requires the bus binary to be built. Spawns a real bus instance per test.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+from khonliang_bus import BusClient
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUS_BIN = REPO_ROOT / "bin" / "khonliang-bus"
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture
+def bus_url():
+    if not BUS_BIN.exists():
+        pytest.skip("khonliang-bus binary not built; run `make build` first")
+
+    port = _free_port()
+    proc = subprocess.Popen(
+        [str(BUS_BIN)],
+        env={**os.environ},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Listen on default :8787 so override via flag
+    proc.terminate()
+
+    proc = subprocess.Popen(
+        [str(BUS_BIN)],
+        env={**os.environ, "KHONLIANG_BUS_LISTEN": f":{port}"},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Wait for listen
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            time.sleep(0.05)
+    else:
+        proc.terminate()
+        pytest.skip("bus did not start in time")
+
+    yield f"http://127.0.0.1:{port}"
+
+    proc.terminate()
+    proc.wait(timeout=2)
+
+
+def test_register_and_list(bus_url):
+    bus = BusClient(bus_url, "py-test", topics=["events"])
+    services = bus.services()
+    assert any(s["id"] == "py-test" for s in services)
+
+
+def test_publish_and_subscribe(bus_url):
+    bus = BusClient(bus_url, "py-test", topics=["events"])
+
+    async def run():
+        received = asyncio.Event()
+        got = []
+
+        async def consume():
+            async for msg in bus.subscribe("events"):
+                got.append(msg)
+                bus.ack(msg.id)
+                received.set()
+                return
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.1)  # let subscription register
+        bus.publish("events", {"hello": "world"})
+        await asyncio.wait_for(received.wait(), timeout=2)
+        task.cancel()
+        return got
+
+    got = asyncio.run(run())
+    assert len(got) == 1
+    assert got[0].payload == {"hello": "world"}
