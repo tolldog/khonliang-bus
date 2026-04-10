@@ -26,6 +26,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from bus.db import BusDB
+from bus.versions import validate_collaboration_requirements
 
 logger = logging.getLogger(__name__)
 
@@ -458,14 +459,110 @@ class BusServer:
         installed = self.db.get_installed_agents()
         regs = self.db.get_registrations()
         skills = self.db.get_skills()
-        flows = self.db.get_flows()
+        validated = self.get_validated_flows()
         return {
             "installed_agents": len(installed),
             "registered_agents": len(regs),
             "healthy": sum(1 for r in regs if r["status"] == "healthy"),
             "unhealthy": sum(1 for r in regs if r["status"] != "healthy"),
             "total_skills": len(skills),
-            "total_flows": len(flows),
+            "total_flows": len(validated["available"]) + len(validated["unavailable"]),
+            "available_flows": len(validated["available"]),
+            "unavailable_flows": len(validated["unavailable"]),
+        }
+
+    # -- skill registry + version gates (Step 2) --
+
+    def get_all_skills(self) -> list[dict]:
+        """All skills across all registered agents, namespaced by agent_id."""
+        skills = self.db.get_skills()
+        for s in skills:
+            if isinstance(s.get("parameters"), str):
+                try:
+                    s["parameters"] = json.loads(s["parameters"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return skills
+
+    def get_validated_flows(self) -> dict:
+        """Validate all declared flows against current registrations.
+
+        Returns ``{"available": [...], "unavailable": [...]}`` where each
+        flow includes its validation status and any unmet requirements.
+        """
+        flows = self.db.get_flows()
+        regs = self.db.get_registrations()
+        available = []
+        unavailable = []
+
+        for flow in flows:
+            requires = flow.get("requires", {})
+            if isinstance(requires, str):
+                try:
+                    requires = json.loads(requires)
+                except (json.JSONDecodeError, TypeError):
+                    requires = {}
+
+            # requires can be a list of agent_types (no version gate)
+            # or a dict of agent_type → version gate
+            if isinstance(requires, list):
+                requires = {t: ">=0.0.0" for t in requires}
+
+            met, diagnostics = validate_collaboration_requirements(requires, regs)
+            entry = {
+                "name": flow["name"],
+                "declared_by": flow["declared_by"],
+                "description": flow.get("description", ""),
+                "requires": requires,
+                "valid": met,
+            }
+            if met:
+                available.append(entry)
+            else:
+                entry["unmet"] = diagnostics
+                unavailable.append(entry)
+
+        return {"available": available, "unavailable": unavailable}
+
+    def get_interaction_matrix(self) -> dict:
+        """Build the interaction matrix from current registrations.
+
+        Shows solo skill counts per agent and validated collaborative
+        flows between agents.
+        """
+        regs = self.db.get_registrations()
+        validated = self.get_validated_flows()
+
+        agents = {}
+        for reg in regs:
+            skills = self.db.get_skills(reg["id"])
+            agents[reg["id"]] = {
+                "agent_type": reg["agent_type"],
+                "version": reg["version"],
+                "status": reg["status"],
+                "solo_skills": len(skills),
+            }
+
+        collaborations = []
+        for flow in validated["available"]:
+            collaborations.append({
+                "name": flow["name"],
+                "declared_by": flow["declared_by"],
+                "requires": flow["requires"],
+                "status": "available",
+            })
+        for flow in validated["unavailable"]:
+            collaborations.append({
+                "name": flow["name"],
+                "declared_by": flow["declared_by"],
+                "requires": flow["requires"],
+                "status": "unavailable",
+                "unmet": flow.get("unmet", []),
+            })
+
+        return {
+            "agents": agents,
+            "collaborations": collaborations,
         }
 
 
@@ -594,6 +691,24 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.delete("/v1/session/{session_id}")
     def archive_session(session_id: str):
         return bus.archive_session(session_id)
+
+    # -- observability --
+
+    # -- skill registry (Step 2) --
+
+    @app.get("/v1/skills")
+    def skills(agent_id: str | None = None):
+        if agent_id:
+            return bus.db.get_skills(agent_id)
+        return bus.get_all_skills()
+
+    @app.get("/v1/flows")
+    def flows():
+        return bus.get_validated_flows()
+
+    @app.get("/v1/matrix")
+    def matrix():
+        return bus.get_interaction_matrix()
 
     # -- observability --
 
