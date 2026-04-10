@@ -1,0 +1,25 @@
+[project]
+name = "khonliang-bus"
+version = "0.2.0"
+description = "Agent orchestration platform — agent lifecycle, request/reply routing, pub/sub, sessions, and MCP transport"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+    "websockets>=14.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24", "httpx>=0.28"]
+
+[project.scripts]
+khonliang-bus = "bus.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["bus*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
