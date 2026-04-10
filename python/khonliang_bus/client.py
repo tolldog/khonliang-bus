@@ -76,7 +76,11 @@ class BusClient:
     # ----- lifecycle -----
 
     def close(self) -> None:
-        """Close the underlying HTTP client."""
+        """Deregister from the bus and close the HTTP client."""
+        try:
+            self.deregister()
+        except Exception:
+            pass  # best-effort on shutdown
         self._http.close()
 
     def __enter__(self) -> BusClient:
@@ -126,33 +130,79 @@ class BusClient:
             {"subscriber_id": self.subscriber_id, "message_id": message_id},
         )
 
+    def nack(self, message_id: str, topic: str, reason: str = "") -> None:
+        """Negative-acknowledge: request redelivery of a message.
+
+        Rolls back the ack position so this message (and any after it)
+        will be redelivered on next subscribe/poll.
+        """
+        self._post(
+            "/v1/nack",
+            {
+                "subscriber_id": self.subscriber_id,
+                "message_id": message_id,
+                "topic": topic,
+                "reason": reason,
+            },
+        )
+
+    def deregister(self) -> None:
+        """Remove this service from the bus registry."""
+        self._post("/v1/deregister", {"id": self.subscriber_id})
+
     async def subscribe(
         self,
         topic: str,
         from_id: str = "",
+        reconnect: bool = True,
+        reconnect_delay: float = 2.0,
+        max_reconnect_delay: float = 60.0,
     ) -> AsyncIterator[Message]:
         """Async iterator over messages on a topic.
 
         Pass ``from_id=""`` to resume from the last acked message
         (or only new messages if none acked yet).
+
+        If ``reconnect=True`` (default), automatically reconnects on
+        connection loss with exponential backoff. The bus's durable
+        subscription mechanism (resume from last ack) makes reconnection
+        safe — the subscriber picks up where it left off with no
+        message loss.
         """
-        ws_url = self._ws_url("/v1/subscribe")
-        async with websockets.connect(ws_url) as ws:
-            await ws.send(
-                json.dumps({
-                    "subscriber_id": self.subscriber_id,
-                    "topic": topic,
-                    "from_id": from_id,
-                })
-            )
+        delay = reconnect_delay
+        while True:
             try:
-                async for raw in ws:
-                    data = json.loads(raw)
-                    if data.get("type") == "error":
-                        raise RuntimeError(data.get("error", "unknown"))
-                    yield Message.from_wire(data)
-            except websockets.ConnectionClosedOK:
-                return
+                ws_url = self._ws_url("/v1/subscribe")
+                async with websockets.connect(ws_url) as ws:
+                    await ws.send(
+                        json.dumps({
+                            "subscriber_id": self.subscriber_id,
+                            "topic": topic,
+                            "from_id": from_id,
+                        })
+                    )
+                    delay = reconnect_delay  # reset backoff on successful connect
+                    try:
+                        async for raw in ws:
+                            data = json.loads(raw)
+                            if data.get("type") == "error":
+                                raise RuntimeError(data.get("error", "unknown"))
+                            yield Message.from_wire(data)
+                    except websockets.ConnectionClosedOK:
+                        return  # clean close, don't reconnect
+            except (
+                websockets.ConnectionClosedError,
+                ConnectionRefusedError,
+                OSError,
+            ):
+                if not reconnect:
+                    return
+                logger.warning(
+                    "Subscribe connection lost for %s on %s, reconnecting in %.1fs",
+                    self.subscriber_id, topic, delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_reconnect_delay)
 
     # ----- helpers -----
 
