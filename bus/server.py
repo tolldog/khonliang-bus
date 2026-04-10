@@ -26,6 +26,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from bus.db import BusDB
+from bus.flows import FlowEngine
 from bus.versions import validate_collaboration_requirements
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,17 @@ class SessionMessageRequest(BaseModel):
     args: dict[str, Any] = {}
 
 
+class FlowRequest(BaseModel):
+    flow_id: str
+    args: dict[str, Any] = {}
+    trace_id: str = ""
+
+
+class SessionContextUpdate(BaseModel):
+    public_ctx: dict[str, Any] | None = None
+    private_ctx: dict[str, Any] | None = None
+
+
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
@@ -116,6 +128,7 @@ class BusServer:
             "max_attempts": 3,
             "backoff": "exponential",
         })
+        self.flow_engine = FlowEngine(db, self._http)
 
     async def shutdown(self) -> None:
         await self._http.aclose()
@@ -471,6 +484,42 @@ class BusServer:
             "unavailable_flows": len(validated["unavailable"]),
         }
 
+    # -- flow orchestration (Step 6) --
+
+    async def execute_flow(self, req: FlowRequest) -> dict:
+        return await self.flow_engine.execute(req.flow_id, req.args, req.trace_id)
+
+    # -- session context (Step 5) --
+
+    def update_session_context(self, session_id: str, req: SessionContextUpdate) -> dict:
+        s = self.db.get_session(session_id)
+        if not s:
+            return {"error": "session not found"}
+        public = json.dumps(req.public_ctx) if req.public_ctx is not None else None
+        private = json.dumps(req.private_ctx) if req.private_ctx is not None else None
+        self.db.update_session(session_id, public_ctx=public, private_ctx=private)
+        return {"session_id": session_id, "status": "context_updated"}
+
+    def get_session_context(self, session_id: str, scope: str = "public") -> dict:
+        s = self.db.get_session(session_id)
+        if not s:
+            return {"error": "session not found"}
+        result: dict[str, Any] = {
+            "session_id": session_id,
+            "status": s["status"],
+        }
+        if s.get("public_ctx"):
+            try:
+                result["public"] = json.loads(s["public_ctx"])
+            except (json.JSONDecodeError, TypeError):
+                result["public"] = s["public_ctx"]
+        if scope == "private" and s.get("private_ctx"):
+            try:
+                result["private"] = json.loads(s["private_ctx"])
+            except (json.JSONDecodeError, TypeError):
+                result["private"] = s["private_ctx"]
+        return result
+
     # -- skill registry + version gates (Step 2) --
 
     def get_all_skills(self) -> list[dict]:
@@ -680,6 +729,14 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     async def session_message(session_id: str, req: SessionMessageRequest):
         return await bus.session_message(session_id, req)
 
+    @app.post("/v1/session/{session_id}/context")
+    def update_context(session_id: str, req: SessionContextUpdate):
+        return bus.update_session_context(session_id, req)
+
+    @app.get("/v1/session/{session_id}/context")
+    def get_context(session_id: str, scope: str = "public"):
+        return bus.get_session_context(session_id, scope)
+
     @app.post("/v1/session/{session_id}/suspend")
     def suspend_session(session_id: str):
         return bus.suspend_session(session_id)
@@ -692,8 +749,6 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     def archive_session(session_id: str):
         return bus.archive_session(session_id)
 
-    # -- observability --
-
     # -- skill registry (Step 2) --
 
     @app.get("/v1/skills")
@@ -705,6 +760,10 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/flows")
     def flows():
         return bus.get_validated_flows()
+
+    @app.post("/v1/flow")
+    async def execute_flow(req: FlowRequest):
+        return await bus.execute_flow(req)
 
     @app.get("/v1/matrix")
     def matrix():
