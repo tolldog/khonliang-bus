@@ -270,9 +270,14 @@ class BaseAgent:
 
         try:
             r = await self._http.post(f"{self.bus_url}/v1/register", json=payload)
+            r.raise_for_status()
             logger.info("Registered with bus: %s", r.json())
         except Exception as e:
-            logger.warning("Failed to register with bus: %s", e)
+            raise RuntimeError(
+                f"Agent {self.agent_id} failed to register with bus at "
+                f"{self.bus_url}: {e}. The bus must be running before "
+                f"agents can start."
+            ) from e
 
     # -- heartbeat --
 
@@ -328,13 +333,26 @@ class BaseAgent:
 
         return app
 
-    # -- pub/sub helper --
+    # -- pub/sub helpers --
 
     async def publish(self, topic: str, payload: Any) -> dict:
         """Publish an event to the bus."""
         r = await self._http.post(
             f"{self.bus_url}/v1/publish",
             json={"topic": topic, "payload": payload, "source": self.agent_id},
+        )
+        return r.json()
+
+    async def nack(self, message_id: int, topic: str, reason: str = "") -> dict:
+        """Negative-acknowledge a message for redelivery."""
+        r = await self._http.post(
+            f"{self.bus_url}/v1/nack",
+            json={
+                "subscriber_id": self.agent_id,
+                "message_id": message_id,
+                "topic": topic,
+                "reason": reason,
+            },
         )
         return r.json()
 
