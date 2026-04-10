@@ -15,7 +15,6 @@ import asyncio
 import json
 import logging
 import os
-import signal
 import subprocess
 import time
 import uuid
@@ -185,8 +184,8 @@ class BusServer:
             proc = subprocess.Popen(
                 cmd,
                 cwd=installed["cwd"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             self._processes[agent_id] = proc
             logger.info("Started agent %s (pid=%d)", agent_id, proc.pid)
@@ -285,7 +284,10 @@ class BusServer:
                     self.db.finish_trace_step(trace_id, step=1, status="ok", duration_ms=duration_ms)
                     return {"result": result.get("result"), "trace_id": trace_id}
 
-                error_body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"error": resp.text}
+                try:
+                    error_body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"error": resp.text}
+                except (json.JSONDecodeError, ValueError):
+                    error_body = {"error": resp.text}
                 retryable = error_body.get("retryable", False)
 
                 if not retryable or attempt >= max_attempts:
@@ -352,22 +354,24 @@ class BusServer:
                 self._subscribers[topic].remove(ws)
 
     async def _publish_event(self, topic: str, payload: Any) -> None:
-        self.db.publish_message(topic, payload, "bus")
-        await self._push_to_subscribers(topic, 0)
+        msg_id = self.db.publish_message(topic, payload, "bus")
+        await self._push_to_subscribers(topic, msg_id)
 
     def ack(self, req: AckRequest) -> dict:
         self.db.ack_message(req.subscriber_id, req.topic, req.message_id)
         return {"status": "acked"}
 
     def nack(self, req: NackRequest) -> dict:
-        # NACK: message will be redelivered on next poll/subscribe
-        # (We don't remove the ack, so the subscriber will see it again)
+        # NACK: roll back the ack so the message is redelivered on next
+        # poll/subscribe. We set last_acked_id to one below the NACKed
+        # message so it (and any after it) get redelivered.
+        prev_id = max(0, req.message_id - 1)
+        self.db.ack_message(req.subscriber_id, req.topic, prev_id)
         logger.info("NACK from %s on %s msg %d: %s", req.subscriber_id, req.topic, req.message_id, req.reason)
-        return {"status": "nacked"}
+        return {"status": "nacked", "redelivery_from": prev_id + 1}
 
     async def subscribe_ws(self, ws: WebSocket, topic: str, subscriber_id: str) -> None:
-        """WebSocket subscription handler."""
-        await ws.accept()
+        """WebSocket subscription handler. Caller must accept() first."""
         if topic not in self._subscribers:
             self._subscribers[topic] = []
         self._subscribers[topic].append(ws)
@@ -424,14 +428,20 @@ class BusServer:
         ))
 
     def suspend_session(self, session_id: str) -> dict:
+        if not self.db.get_session(session_id):
+            return {"error": "session not found"}
         self.db.update_session(session_id, status="suspended")
         return {"session_id": session_id, "status": "suspended"}
 
     def resume_session(self, session_id: str) -> dict:
+        if not self.db.get_session(session_id):
+            return {"error": "session not found"}
         self.db.update_session(session_id, status="active")
         return {"session_id": session_id, "status": "active"}
 
     def archive_session(self, session_id: str) -> dict:
+        if not self.db.get_session(session_id):
+            return {"error": "session not found"}
         self.db.update_session(session_id, status="archived")
         return {"session_id": session_id, "status": "archived"}
 
@@ -707,6 +717,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.websocket("/v1/subscribe")
     async def subscribe(ws: WebSocket):
+        await ws.accept()
         data = await ws.receive_text()
         params = json.loads(data)
         await bus.subscribe_ws(

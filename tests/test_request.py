@@ -2,12 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, patch
-
-import httpx
-import pytest
-
 from tests.conftest import register_test_agent
 
 

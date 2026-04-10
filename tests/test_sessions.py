@@ -60,6 +60,21 @@ def test_archive_session(client):
     assert client.get(f"/v1/session/{sid}").json()["status"] == "archived"
 
 
+def test_suspend_unknown_session_returns_error(client):
+    r = client.post("/v1/session/nonexistent/suspend").json()
+    assert "error" in r
+
+
+def test_resume_unknown_session_returns_error(client):
+    r = client.post("/v1/session/nonexistent/resume").json()
+    assert "error" in r
+
+
+def test_archive_unknown_session_returns_error(client):
+    r = client.request("DELETE", "/v1/session/nonexistent").json()
+    assert "error" in r
+
+
 def test_session_message_on_suspended_session_fails(client):
     register_test_agent(client)
     created = client.post("/v1/session", json={"agent_id": "test-agent"}).json()

@@ -43,14 +43,20 @@ def test_ack(client):
     assert r["status"] == "acked"
 
 
-def test_nack(client):
-    msg = client.post("/v1/publish", json={
-        "topic": "t", "payload": {}, "source": "s",
-    }).json()
+def test_nack_rolls_back_ack(client):
+    """NACK should roll back the ack so the message gets redelivered."""
+    msg1 = client.post("/v1/publish", json={"topic": "t", "payload": {"n": 1}, "source": "s"}).json()
+    msg2 = client.post("/v1/publish", json={"topic": "t", "payload": {"n": 2}, "source": "s"}).json()
+
+    # Ack both
+    client.post("/v1/ack", json={"subscriber_id": "sub1", "message_id": msg2["id"], "topic": "t"})
+
+    # NACK msg2 — should roll back so msg2 gets redelivered
     r = client.post("/v1/nack", json={
         "subscriber_id": "sub1",
-        "message_id": msg["id"],
+        "message_id": msg2["id"],
         "topic": "t",
         "reason": "processing failed",
     }).json()
     assert r["status"] == "nacked"
+    assert r["redelivery_from"] == msg2["id"]
