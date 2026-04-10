@@ -130,7 +130,7 @@ class BusClient:
             {"subscriber_id": self.subscriber_id, "message_id": message_id},
         )
 
-    def nack(self, message_id: str, topic: str, reason: str = "") -> None:
+    def nack(self, message_id: int, topic: str, reason: str = "") -> None:
         """Negative-acknowledge: request redelivery of a message.
 
         Rolls back the ack position so this message (and any after it)
@@ -194,9 +194,9 @@ class BusClient:
                 websockets.ConnectionClosedError,
                 ConnectionRefusedError,
                 OSError,
-            ):
+            ) as exc:
                 if not reconnect:
-                    return
+                    raise  # caller expects the error when reconnect is disabled
                 logger.warning(
                     "Subscribe connection lost for %s on %s, reconnecting in %.1fs",
                     self.subscriber_id, topic, delay,
