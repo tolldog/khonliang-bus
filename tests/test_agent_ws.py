@@ -152,6 +152,7 @@ def test_agent_ws_request_round_trip(tmp_path):
             }).json()
 
             t.join(timeout=5)
+            assert not t.is_alive(), "agent thread did not finish in time"
 
     assert "result" in r, f"expected result, got: {r}"
     assert r["result"] == {"echoed": {"msg": "hello"}}

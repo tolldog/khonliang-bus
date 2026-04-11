@@ -855,7 +855,7 @@ class BusServer:
 
     async def evaluate_response(self, req: EvaluateRequest) -> dict:
         if req.verdict not in VALID_VERDICTS:
-            return {"error": f"invalid verdict: {req.verdict!r}. Must be one of {VALID_VERDICTS}"}
+            return {"error": f"invalid verdict: {req.verdict!r}. Must be one of {VALID_VERDICTS}", "invalid_input": True}
 
         self.db.record_evaluation(
             trace_id=req.trace_id,
@@ -1082,7 +1082,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.post("/v1/evaluate")
     async def evaluate_response(req: EvaluateRequest):
         result = await bus.evaluate_response(req)
-        if "error" in result and "invalid verdict" in result.get("error", ""):
+        if result.get("invalid_input"):
             raise HTTPException(status_code=422, detail=result["error"])
         return result
 
