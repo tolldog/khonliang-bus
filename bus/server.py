@@ -66,6 +66,7 @@ class RequestMessage(BaseModel):
     timeout: float = 30.0
     trace_id: str = ""
     session_id: str | None = None
+    response_mode: str = "raw"  # raw | extracted | distilled
 
 
 class PublishRequest(BaseModel):
@@ -103,6 +104,20 @@ class FlowRequest(BaseModel):
     trace_id: str = ""
 
 
+class GapReport(BaseModel):
+    agent_id: str
+    operation: str
+    reason: str
+    context: dict[str, Any] = {}
+
+
+class EvaluateResponse(BaseModel):
+    trace_id: str
+    verdict: str  # accept | push_back | escalate
+    reason: str = ""
+    retry_with: dict[str, Any] = {}  # extra context for push_back
+
+
 class SessionContextUpdate(BaseModel):
     public_ctx: dict[str, Any] | None = None
     private_ctx: dict[str, Any] | None = None
@@ -122,6 +137,8 @@ class BusServer:
         self._processes: dict[str, subprocess.Popen] = {}  # agent_id → process
         self._http = httpx.AsyncClient(timeout=30.0)
         self._subscribers: dict[str, list[WebSocket]] = {}  # topic → websockets
+        self._agent_connections: dict[str, WebSocket] = {}  # agent_id → WebSocket
+        self._pending_responses: dict[str, asyncio.Future] = {}  # correlation_id → Future
         self._retry_config = self.config.get("retry", {
             "delay": 2.0,
             "max_attempts": 3,
@@ -249,20 +266,40 @@ class BusServer:
             return {"error": f"no healthy agent found for {req.agent_id or req.agent_type}", "trace_id": trace_id}
 
         agent_id = reg["id"]
-        callback_url = reg["callback_url"]
 
         # Record trace
         self.db.record_trace_step(trace_id, step=1, agent_id=agent_id, operation=req.operation)
         t0 = time.monotonic()
-
-        # Forward to agent
         correlation_id = f"req-{uuid.uuid4().hex[:12]}"
+
+        # Prefer WebSocket if the agent is connected that way
+        if self.is_agent_ws_connected(agent_id):
+            result = await self.send_request_to_agent_ws(
+                agent_id=agent_id,
+                operation=req.operation,
+                args=req.args,
+                correlation_id=correlation_id,
+                trace_id=trace_id,
+                session_id=req.session_id,
+                response_mode=req.response_mode,
+                timeout=req.timeout,
+            )
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            if "error" in result:
+                self.db.finish_trace_step(trace_id, step=1, status="failed", duration_ms=duration_ms, error=str(result["error"]))
+                return {"error": result["error"], "trace_id": trace_id}
+            self.db.finish_trace_step(trace_id, step=1, status="ok", duration_ms=duration_ms)
+            return {"result": result.get("result"), "trace_id": trace_id}
+
+        # Fall back to HTTP callback
+        callback_url = reg["callback_url"]
         payload = {
             "operation": req.operation,
             "args": req.args,
             "correlation_id": correlation_id,
             "trace_id": trace_id,
             "session_id": req.session_id,
+            "response_mode": req.response_mode,
         }
 
         attempt = 0
@@ -625,6 +662,200 @@ class BusServer:
         }
 
 
+    # -- agent WebSocket connections --
+
+    async def handle_agent_ws(self, ws: WebSocket) -> None:
+        """Handle a persistent agent WebSocket connection.
+
+        Protocol (all JSON over one WebSocket):
+
+        Agent → Bus:
+          {"type": "register", "id": "...", "version": "...", "skills": [...], "collaborations": [...]}
+          {"type": "heartbeat"}
+          {"type": "response", "correlation_id": "...", "result": {...}}
+          {"type": "error", "correlation_id": "...", "error": "...", "retryable": bool}
+          {"type": "publish", "topic": "...", "payload": {...}}
+          {"type": "gap", "operation": "...", "reason": "...", "context": {...}}
+          {"type": "deregister"}
+
+        Bus → Agent:
+          {"type": "registered", "id": "..."}
+          {"type": "request", "operation": "...", "args": {...}, "correlation_id": "...", "trace_id": "...", "session_id": null, "response_mode": "raw"}
+          {"type": "ping"}
+        """
+        await ws.accept()
+        agent_id: str | None = None
+
+        try:
+            while True:
+                data = await ws.receive_json()
+                msg_type = data.get("type", "")
+
+                if msg_type == "register":
+                    agent_id = data["id"]
+                    self._agent_connections[agent_id] = ws
+                    # Store registration in DB
+                    self.db.register_agent(
+                        agent_id=agent_id,
+                        agent_type=data.get("agent_type", agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id),
+                        callback_url=f"ws://connected",  # WebSocket — no callback URL needed
+                        pid=data.get("pid", 0),
+                        version=data.get("version", ""),
+                        skills=data.get("skills", []),
+                        collaborations=data.get("collaborations", []),
+                    )
+                    await ws.send_json({"type": "registered", "id": agent_id})
+                    logger.info("Agent %s connected via WebSocket (%d skills)", agent_id, len(data.get("skills", [])))
+                    await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "registered"})
+
+                elif msg_type == "heartbeat":
+                    if agent_id:
+                        self.db.heartbeat(agent_id)
+                    await ws.send_json({"type": "pong"})
+
+                elif msg_type == "response":
+                    cid = data.get("correlation_id", "")
+                    future = self._pending_responses.pop(cid, None)
+                    if future and not future.done():
+                        future.set_result(data)
+
+                elif msg_type == "error":
+                    cid = data.get("correlation_id", "")
+                    future = self._pending_responses.pop(cid, None)
+                    if future and not future.done():
+                        future.set_result(data)
+
+                elif msg_type == "publish":
+                    topic = data.get("topic", "")
+                    payload = data.get("payload")
+                    source = agent_id or "unknown"
+                    self.db.publish_message(topic, payload, source)
+                    await self._push_to_subscribers(topic, 0)
+
+                elif msg_type == "gap":
+                    if agent_id:
+                        self.db.report_gap(
+                            agent_id=agent_id,
+                            operation=data.get("operation", ""),
+                            reason=data.get("reason", ""),
+                            context=data.get("context", {}),
+                        )
+
+                elif msg_type == "deregister":
+                    break
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.warning("Agent WebSocket error for %s: %s", agent_id, e)
+        finally:
+            if agent_id:
+                self._agent_connections.pop(agent_id, None)
+                self.db.deregister_agent(agent_id)
+                logger.info("Agent %s disconnected", agent_id)
+                await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "deregistered"})
+
+    async def send_request_to_agent_ws(
+        self,
+        agent_id: str,
+        operation: str,
+        args: dict,
+        correlation_id: str,
+        trace_id: str = "",
+        session_id: str | None = None,
+        response_mode: str = "raw",
+        timeout: float = 30.0,
+    ) -> dict:
+        """Send a request to an agent over its WebSocket connection."""
+        ws = self._agent_connections.get(agent_id)
+        if not ws:
+            return {"error": f"agent {agent_id} not connected via WebSocket"}
+
+        # Create a Future for the response
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_responses[correlation_id] = future
+
+        # Send the request
+        await ws.send_json({
+            "type": "request",
+            "operation": operation,
+            "args": args,
+            "correlation_id": correlation_id,
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "response_mode": response_mode,
+        })
+
+        # Wait for response with timeout
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            self._pending_responses.pop(correlation_id, None)
+            return {"error": "timeout", "correlation_id": correlation_id}
+
+    def is_agent_ws_connected(self, agent_id: str) -> bool:
+        return agent_id in self._agent_connections
+
+    # -- gap reporting --
+
+    def report_gap(self, req: GapReport) -> dict:
+        gap_id = self.db.report_gap(
+            agent_id=req.agent_id,
+            operation=req.operation,
+            reason=req.reason,
+            context=req.context,
+        )
+        logger.info("Gap reported by %s: %s — %s", req.agent_id, req.operation, req.reason)
+        return {"gap_id": gap_id, "status": "reported"}
+
+    def get_gaps(self, status: str = "open") -> list[dict]:
+        return self.db.get_gaps(status)
+
+    def update_gap(self, gap_id: int, status: str) -> dict:
+        self.db.update_gap_status(gap_id, status)
+        return {"gap_id": gap_id, "status": status}
+
+    # -- response evaluation --
+
+    async def evaluate_response(self, req: EvaluateResponse) -> dict:
+        self.db.record_evaluation(
+            trace_id=req.trace_id,
+            verdict=req.verdict,
+            reason=req.reason,
+            retry_with=req.retry_with,
+        )
+
+        if req.verdict == "push_back":
+            # Replay the original request with extra context
+            trace = self.db.get_trace(req.trace_id)
+            if trace:
+                last_step = trace[-1]
+                logger.info(
+                    "Push-back on %s.%s — retrying with extra context",
+                    last_step.get("agent_id", "?"),
+                    last_step.get("operation", "?"),
+                )
+                return await self.handle_request(RequestMessage(
+                    agent_id=last_step.get("agent_id"),
+                    operation=last_step.get("operation", ""),
+                    args=req.retry_with,
+                    trace_id=f"{req.trace_id}-retry",
+                ))
+            return {"error": "no trace found to retry", "trace_id": req.trace_id}
+
+        if req.verdict == "escalate":
+            gap_id = self.db.report_gap(
+                agent_id="bus",
+                operation=f"escalation from {req.trace_id}",
+                reason=req.reason,
+                context=req.retry_with,
+            )
+            return {"escalated": True, "gap_id": gap_id, "trace_id": req.trace_id}
+
+        return {"verdict": req.verdict, "trace_id": req.trace_id}
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -715,6 +946,10 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     def nack(req: NackRequest):
         return bus.nack(req)
 
+    @app.websocket("/v1/agent")
+    async def agent_ws(ws: WebSocket):
+        await bus.handle_agent_ws(ws)
+
     @app.websocket("/v1/subscribe")
     async def subscribe(ws: WebSocket):
         await ws.accept()
@@ -779,6 +1014,32 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/matrix")
     def matrix():
         return bus.get_interaction_matrix()
+
+    # -- observability --
+
+    # -- gaps --
+
+    @app.post("/v1/gap")
+    def report_gap(req: GapReport):
+        return bus.report_gap(req)
+
+    @app.get("/v1/gaps")
+    def get_gaps(status: str = "open"):
+        return bus.get_gaps(status)
+
+    @app.patch("/v1/gap/{gap_id}")
+    def update_gap(gap_id: int, status: str):
+        return bus.update_gap(gap_id, status)
+
+    # -- response evaluation --
+
+    @app.post("/v1/evaluate")
+    async def evaluate_response(req: EvaluateResponse):
+        return await bus.evaluate_response(req)
+
+    @app.get("/v1/evaluations/{trace_id}")
+    def get_evaluations(trace_id: str):
+        return bus.db.get_evaluations(trace_id)
 
     # -- observability --
 
