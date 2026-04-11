@@ -108,7 +108,7 @@ class SchedulerIntegration:
             "estimated_tokens": estimated_tokens,
             "recommended_model": model.name,
             "model_max_context": model.max_context,
-            "utilization": round(estimated_tokens / model.max_context, 2) if model.max_context else 0,
+            "utilization_pct": round((estimated_tokens / model.max_context) * 100, 1) if model.max_context else 0,
             "should_distill": needs_distill,
             "distill_threshold": self.distill_threshold,
         }

@@ -112,6 +112,9 @@ class Orchestrator:
         except json.JSONDecodeError as e:
             return {"status": "failed", "error": f"LLM returned invalid JSON: {e}", "plan_raw": plan, "trace_id": trace_id}
 
+        if not steps:
+            return {"status": "failed", "error": "LLM returned empty plan", "trace_id": trace_id}
+
         # 3. Execute
         step_outputs: dict[str, Any] = {}
         last_result: Any = None
