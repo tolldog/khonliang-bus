@@ -105,6 +105,27 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Persistent: capability gap reports from agents
+CREATE TABLE IF NOT EXISTS gaps (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id     TEXT NOT NULL,
+    operation    TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    context      TEXT,              -- JSON
+    status       TEXT NOT NULL DEFAULT 'open',  -- open | reviewed | dismissed
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Persistent: response evaluations (push-back, escalation)
+CREATE TABLE IF NOT EXISTS evaluations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id     TEXT NOT NULL,
+    verdict      TEXT NOT NULL,     -- accept | push_back | escalate
+    reason       TEXT,
+    retry_with   TEXT,              -- JSON (extra context for push_back)
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Persistent: execution traces
 CREATE TABLE IF NOT EXISTS traces (
     trace_id     TEXT NOT NULL,
@@ -416,10 +437,63 @@ class BusDB:
             return [_row_to_dict(r) for r in rows]
 
 
+    # -- gaps --
+
+    def report_gap(
+        self,
+        agent_id: str,
+        operation: str,
+        reason: str,
+        context: dict | None = None,
+    ) -> int:
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO gaps (agent_id, operation, reason, context) VALUES (?, ?, ?, ?)",
+                (agent_id, operation, reason, json.dumps(context or {})),
+            )
+            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_gaps(self, status: str = "open") -> list[dict[str, Any]]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM gaps WHERE status = ? ORDER BY created_at DESC",
+                (status,),
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
+
+    def update_gap_status(self, gap_id: int, status: str) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE gaps SET status = ? WHERE id = ?", (status, gap_id))
+
+    # -- evaluations --
+
+    def record_evaluation(
+        self,
+        trace_id: str,
+        verdict: str,
+        reason: str = "",
+        retry_with: dict | None = None,
+    ) -> int:
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO evaluations (trace_id, verdict, reason, retry_with) VALUES (?, ?, ?, ?)",
+                (trace_id, verdict, reason, json.dumps(retry_with or {})),
+            )
+            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_evaluations(self, trace_id: str) -> list[dict[str, Any]]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM evaluations WHERE trace_id = ? ORDER BY created_at",
+                (trace_id,),
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     # Parse JSON fields
-    for key in ("args", "parameters", "requires", "steps", "payload"):
+    for key in ("args", "parameters", "requires", "steps", "payload", "context", "retry_with"):
         if key in d and isinstance(d[key], str):
             try:
                 d[key] = json.loads(d[key])
