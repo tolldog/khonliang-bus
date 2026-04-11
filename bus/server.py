@@ -26,6 +26,8 @@ from pydantic import BaseModel
 
 from bus.db import BusDB
 from bus.flows import FlowEngine
+from bus.orchestrator import Orchestrator
+from bus.scheduler import SchedulerIntegration
 from bus.versions import validate_collaboration_requirements
 
 logger = logging.getLogger(__name__)
@@ -128,6 +130,13 @@ class SessionContextUpdate(BaseModel):
     private_ctx: dict[str, Any] | None = None
 
 
+class OrchestrateRequest(BaseModel):
+    task: str
+    context: dict[str, Any] = {}
+    model: str = ""
+    trace_id: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
@@ -151,6 +160,12 @@ class BusServer:
             "backoff": "exponential",
         })
         self.flow_engine = FlowEngine(db, self._http)
+        self.orchestrator = Orchestrator(
+            db, self._http,
+            ollama_url=self.config.get("ollama_url", "http://localhost:11434"),
+            default_model=self.config.get("orchestrator_model", "qwen2.5:7b"),
+        )
+        self.scheduler = SchedulerIntegration(db)
 
     async def shutdown(self) -> None:
         await self._http.aclose()
@@ -1089,6 +1104,27 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/evaluations/{trace_id}")
     def get_evaluations(trace_id: str):
         return bus.db.get_evaluations(trace_id)
+
+    # -- orchestrator --
+
+    @app.post("/v1/orchestrate")
+    async def orchestrate(req: OrchestrateRequest):
+        return await bus.orchestrator.orchestrate(
+            task=req.task,
+            context=req.context,
+            model=req.model,
+            trace_id=req.trace_id,
+        )
+
+    # -- scheduler --
+
+    @app.get("/v1/models")
+    def models():
+        return bus.scheduler.get_model_profiles()
+
+    @app.get("/v1/session/{session_id}/model")
+    def session_model(session_id: str):
+        return bus.scheduler.get_session_recommendation(session_id)
 
     # -- observability --
 
