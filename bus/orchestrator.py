@@ -66,11 +66,13 @@ class Orchestrator:
         http: httpx.AsyncClient,
         ollama_url: str = "http://localhost:11434",
         default_model: str = "qwen2.5:7b",
+        bus_url: str = "http://localhost:8787",
     ):
         self.db = db
         self._http = http
         self.ollama_url = ollama_url.rstrip("/")
         self.default_model = default_model
+        self.bus_url = bus_url.rstrip("/")
 
     async def orchestrate(
         self,
@@ -139,17 +141,33 @@ class Orchestrator:
             t0 = time.monotonic()
 
             # Execute via bus request
+            callback_url = agent["callback_url"]
+            use_ws_path = callback_url.startswith("ws:") or callback_url.startswith("wss:")
             try:
-                r = await self._http.post(
-                    f"{agent['callback_url']}/v1/handle" if not agent["callback_url"].startswith("ws:") else "",
-                    json={
-                        "operation": operation,
-                        "args": resolved_args,
-                        "correlation_id": f"orch-{uuid.uuid4().hex[:8]}",
-                        "trace_id": trace_id,
-                    },
-                    timeout=30.0,
-                )
+                if use_ws_path:
+                    # WebSocket agents: route through the bus /v1/request endpoint
+                    r = await self._http.post(
+                        f"{self.bus_url}/v1/request",
+                        json={
+                            "agent_type": agent_type,
+                            "operation": operation,
+                            "args": resolved_args,
+                            "timeout": 30,
+                            "trace_id": trace_id,
+                        },
+                        timeout=30.0,
+                    )
+                else:
+                    r = await self._http.post(
+                        f"{callback_url}/v1/handle",
+                        json={
+                            "operation": operation,
+                            "args": resolved_args,
+                            "correlation_id": f"orch-{uuid.uuid4().hex[:8]}",
+                            "trace_id": trace_id,
+                        },
+                        timeout=30.0,
+                    )
                 duration_ms = int((time.monotonic() - t0) * 1000)
 
                 if r.status_code == 200:
@@ -167,30 +185,12 @@ class Orchestrator:
             except Exception as e:
                 duration_ms = int((time.monotonic() - t0) * 1000)
                 self.db.finish_trace_step(trace_id, i, status="failed", duration_ms=duration_ms, error=str(e))
-
-                # For WebSocket agents, route through the bus /v1/request instead
-                try:
-                    r2 = await self._http.post(
-                        f"http://localhost:8788/v1/request",
-                        json={
-                            "agent_type": agent_type,
-                            "operation": operation,
-                            "args": resolved_args,
-                            "timeout": 30,
-                            "trace_id": trace_id,
-                        },
-                        timeout=30.0,
-                    )
-                    result = r2.json()
-                    step_result = result.get("result", result)
-                    self.db.finish_trace_step(trace_id, i, status="ok", duration_ms=int((time.monotonic() - t0) * 1000))
-                except Exception as e2:
-                    return {
-                        "status": "partial",
-                        "error": f"step {i}: {e2}",
-                        "steps_completed": i - 1,
-                        "trace_id": trace_id,
-                    }
+                return {
+                    "status": "partial",
+                    "error": f"step {i}: {e}",
+                    "steps_completed": i - 1,
+                    "trace_id": trace_id,
+                }
 
             step_outputs[output_name] = step_result
             last_result = step_result
