@@ -729,8 +729,8 @@ class BusServer:
                     topic = data.get("topic", "")
                     payload = data.get("payload")
                     source = agent_id or "unknown"
-                    self.db.publish_message(topic, payload, source)
-                    await self._push_to_subscribers(topic, 0)
+                    msg_id = self.db.publish_message(topic, payload, source)
+                    await self._push_to_subscribers(topic, msg_id)
 
                 elif msg_type == "gap":
                     if agent_id:
@@ -776,15 +776,19 @@ class BusServer:
         self._pending_responses[correlation_id] = future
 
         # Send the request
-        await ws.send_json({
-            "type": "request",
-            "operation": operation,
-            "args": args,
-            "correlation_id": correlation_id,
-            "trace_id": trace_id,
-            "session_id": session_id,
-            "response_mode": response_mode,
-        })
+        try:
+            await ws.send_json({
+                "type": "request",
+                "operation": operation,
+                "args": args,
+                "correlation_id": correlation_id,
+                "trace_id": trace_id,
+                "session_id": session_id,
+                "response_mode": response_mode,
+            })
+        except Exception:
+            self._pending_responses.pop(correlation_id, None)
+            return {"error": f"agent {agent_id} disconnected during send"}
 
         # Wait for response with timeout
         try:
