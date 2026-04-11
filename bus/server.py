@@ -21,7 +21,7 @@ import uuid
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from bus.db import BusDB
@@ -144,6 +144,7 @@ class BusServer:
         self._subscribers: dict[str, list[WebSocket]] = {}  # topic → websockets
         self._agent_connections: dict[str, WebSocket] = {}  # agent_id → WebSocket
         self._pending_responses: dict[str, asyncio.Future] = {}  # correlation_id → Future
+        self._pending_agent: dict[str, str] = {}  # correlation_id → agent_id
         self._retry_config = self.config.get("retry", {
             "delay": 2.0,
             "max_attempts": 3,
@@ -724,12 +725,14 @@ class BusServer:
                 elif msg_type == "response":
                     cid = data.get("correlation_id", "")
                     future = self._pending_responses.pop(cid, None)
+                    self._pending_agent.pop(cid, None)
                     if future and not future.done():
                         future.set_result(data)
 
                 elif msg_type == "error":
                     cid = data.get("correlation_id", "")
                     future = self._pending_responses.pop(cid, None)
+                    self._pending_agent.pop(cid, None)
                     if future and not future.done():
                         future.set_result(data)
 
@@ -759,12 +762,13 @@ class BusServer:
         finally:
             if agent_id:
                 self._agent_connections.pop(agent_id, None)
-                # Cancel any pending request futures for this agent
+                # Cancel only pending requests belonging to this agent
                 to_cancel = [
-                    cid for cid, fut in self._pending_responses.items()
-                    if not fut.done()
+                    cid for cid, aid in self._pending_agent.items()
+                    if aid == agent_id
                 ]
                 for cid in to_cancel:
+                    self._pending_agent.pop(cid, None)
                     fut = self._pending_responses.pop(cid, None)
                     if fut and not fut.done():
                         fut.set_result({"error": f"agent {agent_id} disconnected"})
@@ -791,6 +795,7 @@ class BusServer:
         # Create a Future for the response
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_responses[correlation_id] = future
+        self._pending_agent[correlation_id] = agent_id
 
         # Send the request
         try:
@@ -805,6 +810,7 @@ class BusServer:
             })
         except Exception:
             self._pending_responses.pop(correlation_id, None)
+            self._pending_agent.pop(correlation_id, None)
             return {"error": f"agent {agent_id} disconnected during send"}
 
         # Wait for response with timeout
@@ -813,6 +819,7 @@ class BusServer:
             return result
         except asyncio.TimeoutError:
             self._pending_responses.pop(correlation_id, None)
+            self._pending_agent.pop(correlation_id, None)
             return {"error": "timeout", "correlation_id": correlation_id}
 
     def is_agent_ws_connected(self, agent_id: str) -> bool:
@@ -847,6 +854,9 @@ class BusServer:
     # -- response evaluation --
 
     async def evaluate_response(self, req: EvaluateRequest) -> dict:
+        if req.verdict not in VALID_VERDICTS:
+            return {"error": f"invalid verdict: {req.verdict!r}. Must be one of {VALID_VERDICTS}"}
+
         self.db.record_evaluation(
             trace_id=req.trace_id,
             verdict=req.verdict,
@@ -1059,13 +1069,22 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.patch("/v1/gap/{gap_id}")
     def update_gap(gap_id: int, status: str):
-        return bus.update_gap(gap_id, status)
+        result = bus.update_gap(gap_id, status)
+        if "error" in result:
+            error = result["error"]
+            if "not found" in error:
+                raise HTTPException(status_code=404, detail=error)
+            raise HTTPException(status_code=422, detail=error)
+        return result
 
     # -- response evaluation --
 
     @app.post("/v1/evaluate")
     async def evaluate_response(req: EvaluateRequest):
-        return await bus.evaluate_response(req)
+        result = await bus.evaluate_response(req)
+        if "error" in result and "invalid verdict" in result.get("error", ""):
+            raise HTTPException(status_code=422, detail=result["error"])
+        return result
 
     @app.get("/v1/evaluations/{trace_id}")
     def get_evaluations(trace_id: str):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -104,3 +106,52 @@ def test_agent_ws_gap_report(client):
     assert len(gaps) == 1
     assert gaps[0]["operation"] == "do_something"
     assert gaps[0]["reason"] == "I don't know how to do this"
+
+
+def test_agent_ws_request_round_trip(tmp_path):
+    """Full WS round-trip: bus dispatches a request to the agent, agent responds.
+
+    Uses ``with TestClient(app) as client`` so that HTTP requests and the WS
+    handler share the same anyio event loop (portal), which is required for
+    asyncio.Future-based request/response correlation to work in tests.
+    """
+    app = create_app(db_path=str(tmp_path / "test.db"))
+    registered = threading.Event()
+
+    def agent(ws):
+        ws.send_json({
+            "type": "register",
+            "id": "ws-roundtrip",
+            "agent_type": "echo",
+            "skills": [{"name": "echo", "description": "echo args"}],
+        })
+        ws.receive_json()  # registered confirmation
+        registered.set()
+
+        # Wait for a request from the bus then echo it back
+        msg = ws.receive_json()
+        assert msg["type"] == "request"
+        assert msg["operation"] == "echo"
+        ws.send_json({
+            "type": "response",
+            "correlation_id": msg["correlation_id"],
+            "result": {"echoed": msg["args"]},
+        })
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/agent") as ws:
+            t = threading.Thread(target=agent, args=(ws,), daemon=True)
+            t.start()
+            registered.wait(timeout=2)
+
+            r = client.post("/v1/request", json={
+                "agent_id": "ws-roundtrip",
+                "operation": "echo",
+                "args": {"msg": "hello"},
+                "timeout": 5.0,
+            }).json()
+
+            t.join(timeout=5)
+
+    assert "result" in r, f"expected result, got: {r}"
+    assert r["result"] == {"echoed": {"msg": "hello"}}
