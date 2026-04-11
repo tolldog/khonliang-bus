@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS traces (
     step         INTEGER NOT NULL,
     agent_id     TEXT,
     operation    TEXT,
+    args         TEXT,              -- JSON: original request args (for push-back replay)
     started_at   TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at  TEXT,
     status       TEXT,
@@ -407,11 +408,12 @@ class BusDB:
         step: int,
         agent_id: str = "",
         operation: str = "",
+        args: dict | None = None,
     ) -> None:
         with self.conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO traces (trace_id, step, agent_id, operation) VALUES (?, ?, ?, ?)",
-                (trace_id, step, agent_id, operation),
+                "INSERT OR REPLACE INTO traces (trace_id, step, agent_id, operation, args) VALUES (?, ?, ?, ?, ?)",
+                (trace_id, step, agent_id, operation, json.dumps(args) if args else None),
             )
 
     def finish_trace_step(

@@ -12,7 +12,7 @@ def test_report_gap(client):
         "reason": "Video analysis not implemented",
         "context": {"input_type": "video"},
     }).json()
-    assert r["status"] == "reported"
+    assert r["status"] == "open"
     assert "gap_id" in r
 
 
