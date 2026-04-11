@@ -66,7 +66,7 @@ class RequestMessage(BaseModel):
     timeout: float = 30.0
     trace_id: str = ""
     session_id: str | None = None
-    response_mode: str = "raw"  # raw | extracted | distilled
+    response_mode: str = "raw"  # validated in handle_request
 
 
 class PublishRequest(BaseModel):
@@ -111,7 +111,12 @@ class GapReport(BaseModel):
     context: dict[str, Any] = {}
 
 
-class EvaluateResponse(BaseModel):
+VALID_RESPONSE_MODES = {"raw", "extracted", "distilled"}
+VALID_GAP_STATUSES = {"open", "reviewed", "dismissed"}
+VALID_VERDICTS = {"accept", "push_back", "escalate"}
+
+
+class EvaluateRequest(BaseModel):
     trace_id: str
     verdict: str  # accept | push_back | escalate
     reason: str = ""
@@ -254,6 +259,9 @@ class BusServer:
     async def handle_request(self, req: RequestMessage) -> dict:
         trace_id = req.trace_id or f"t-{uuid.uuid4().hex[:8]}"
 
+        if req.response_mode not in VALID_RESPONSE_MODES:
+            return {"error": f"invalid response_mode: {req.response_mode!r}. Must be one of {VALID_RESPONSE_MODES}", "trace_id": trace_id}
+
         # Resolve agent: by ID or by type
         if req.agent_id:
             reg = self.db.get_registration(req.agent_id)
@@ -267,8 +275,8 @@ class BusServer:
 
         agent_id = reg["id"]
 
-        # Record trace
-        self.db.record_trace_step(trace_id, step=1, agent_id=agent_id, operation=req.operation)
+        # Record trace (include args for push-back replay)
+        self.db.record_trace_step(trace_id, step=1, agent_id=agent_id, operation=req.operation, args=req.args)
         t0 = time.monotonic()
         correlation_id = f"req-{uuid.uuid4().hex[:12]}"
 
@@ -751,8 +759,17 @@ class BusServer:
         finally:
             if agent_id:
                 self._agent_connections.pop(agent_id, None)
+                # Cancel any pending request futures for this agent
+                to_cancel = [
+                    cid for cid, fut in self._pending_responses.items()
+                    if not fut.done()
+                ]
+                for cid in to_cancel:
+                    fut = self._pending_responses.pop(cid, None)
+                    if fut and not fut.done():
+                        fut.set_result({"error": f"agent {agent_id} disconnected"})
                 self.db.deregister_agent(agent_id)
-                logger.info("Agent %s disconnected", agent_id)
+                logger.info("Agent %s disconnected (%d pending requests cancelled)", agent_id, len(to_cancel))
                 await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "deregistered"})
 
     async def send_request_to_agent_ws(
@@ -811,18 +828,25 @@ class BusServer:
             context=req.context,
         )
         logger.info("Gap reported by %s: %s — %s", req.agent_id, req.operation, req.reason)
-        return {"gap_id": gap_id, "status": "reported"}
+        return {"gap_id": gap_id, "status": "open"}
 
     def get_gaps(self, status: str = "open") -> list[dict]:
         return self.db.get_gaps(status)
 
     def update_gap(self, gap_id: int, status: str) -> dict:
+        if status not in VALID_GAP_STATUSES:
+            return {"error": f"invalid status: {status!r}. Must be one of {VALID_GAP_STATUSES}"}
+        # Check gap exists
+        with self.db.conn() as c:
+            row = c.execute("SELECT id FROM gaps WHERE id = ?", (gap_id,)).fetchone()
+            if not row:
+                return {"error": f"gap {gap_id} not found"}
         self.db.update_gap_status(gap_id, status)
         return {"gap_id": gap_id, "status": status}
 
     # -- response evaluation --
 
-    async def evaluate_response(self, req: EvaluateResponse) -> dict:
+    async def evaluate_response(self, req: EvaluateRequest) -> dict:
         self.db.record_evaluation(
             trace_id=req.trace_id,
             verdict=req.verdict,
@@ -831,19 +855,21 @@ class BusServer:
         )
 
         if req.verdict == "push_back":
-            # Replay the original request with extra context
+            # Replay the original request, merging original args with retry_with
             trace = self.db.get_trace(req.trace_id)
             if trace:
                 last_step = trace[-1]
+                original_args = last_step.get("args", {}) or {}
+                merged_args = {**original_args, **req.retry_with}
                 logger.info(
-                    "Push-back on %s.%s — retrying with extra context",
+                    "Push-back on %s.%s — retrying with merged context",
                     last_step.get("agent_id", "?"),
                     last_step.get("operation", "?"),
                 )
                 return await self.handle_request(RequestMessage(
                     agent_id=last_step.get("agent_id"),
                     operation=last_step.get("operation", ""),
-                    args=req.retry_with,
+                    args=merged_args,
                     trace_id=f"{req.trace_id}-retry",
                 ))
             return {"error": "no trace found to retry", "trace_id": req.trace_id}
@@ -1038,7 +1064,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     # -- response evaluation --
 
     @app.post("/v1/evaluate")
-    async def evaluate_response(req: EvaluateResponse):
+    async def evaluate_response(req: EvaluateRequest):
         return await bus.evaluate_response(req)
 
     @app.get("/v1/evaluations/{trace_id}")

@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-
 import pytest
 from fastapi.testclient import TestClient
-from starlette.testclient import TestClient as StarletteTestClient
 
 from bus.server import create_app
 
