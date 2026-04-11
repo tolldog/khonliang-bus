@@ -164,6 +164,7 @@ class BusServer:
             db, self._http,
             ollama_url=self.config.get("ollama_url", "http://localhost:11434"),
             default_model=self.config.get("orchestrator_model", "qwen2.5:7b"),
+            bus_url=self.config.get("bus_url", "http://localhost:8787"),
         )
         self.scheduler = SchedulerIntegration(db)
 

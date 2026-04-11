@@ -129,4 +129,4 @@ class SchedulerIntegration:
         for p in self.profiles:
             if p.name == model_name:
                 return p
-        return self.profiles[0]  # default to smallest
+        return self.profiles[-1]  # default to largest when name is unknown
