@@ -63,23 +63,35 @@ class BusMCPAdapter:
         def _format_lifecycle(op: str, agent_id: str, result: dict) -> str:
             """Terse, structured response for lifecycle ops.
 
-            Distinguishes four outcomes the bus exposes today:
-            - transport error       → "error: <msg>"
-            - not installed         → "{id}: not installed"
-            - already running       → "{id}: already_running"
-            - normal success        → "{id}: {status}[ pid={pid}]"
+            Distinguishes transport failures (no ``id`` in the envelope,
+            because ``_async_post`` caught an exception before reaching the
+            bus) from bus-reported outcomes (always include ``id``):
+
+            - transport error              → "error[{op}]: <msg>"
+            - bus-reported 'not installed' → "{id}: {op} not installed"
+            - bus-reported spawn error     → "{id}: {op} error: <msg>"
+            - already running              → "{id}: {op} already_running"
+            - normal success               → "{id}: {op} {status}[ pid={pid}]"
+
+            ``op`` is included in every line so failures and successes carry
+            the operation context (useful when a caller batches or logs).
             """
-            if "error" in result and "status" not in result:
-                # Bus-reported errors (e.g. "not installed") vs. transport errors
-                err = result["error"]
-                if err == "not installed":
-                    return f"{agent_id}: not installed"
-                return f"error: {err}"
+            # Transport error: _async_post returned {"error": ...} without id
+            if "id" not in result and "error" in result:
+                return f"error[{op}]: {result['error']}"
+
+            err = result.get("error")
+            if err == "not installed":
+                return f"{agent_id}: {op} not installed"
+            if err:
+                # Bus-scoped failure (e.g., subprocess spawn exception)
+                return f"{agent_id}: {op} error: {err}"
+
             status = result.get("status", "unknown")
             pid = result.get("pid")
             if pid is not None:
-                return f"{agent_id}: {status} pid={pid}"
-            return f"{agent_id}: {status}"
+                return f"{agent_id}: {op} {status} pid={pid}"
+            return f"{agent_id}: {op} {status}"
 
         @mcp.tool()
         async def bus_services() -> str:

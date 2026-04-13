@@ -178,7 +178,7 @@ def test_bus_start_agent_success(adapter):
     )
     result = asyncio.run(mcp.call_tool("bus_start_agent", {"agent_id": "dev-researcher"}))
     text = _extract_text(result)
-    assert "dev-researcher: started pid=4242" == text.strip()
+    assert text.strip() == "dev-researcher: start started pid=4242"
     assert calls == [("/v1/install/dev-researcher/start", {})]
 
 
@@ -187,7 +187,7 @@ def test_bus_start_agent_already_running(adapter):
     _stub_async_post(adapter, {"id": "dev-researcher", "status": "already_running"})
     result = asyncio.run(mcp.call_tool("bus_start_agent", {"agent_id": "dev-researcher"}))
     text = _extract_text(result)
-    assert text.strip() == "dev-researcher: already_running"
+    assert text.strip() == "dev-researcher: start already_running"
 
 
 def test_bus_start_agent_not_installed(adapter):
@@ -195,7 +195,16 @@ def test_bus_start_agent_not_installed(adapter):
     _stub_async_post(adapter, {"id": "ghost", "error": "not installed"})
     result = asyncio.run(mcp.call_tool("bus_start_agent", {"agent_id": "ghost"}))
     text = _extract_text(result)
-    assert text.strip() == "ghost: not installed"
+    assert text.strip() == "ghost: start not installed"
+
+
+def test_bus_start_agent_bus_reported_spawn_error(adapter):
+    """Bus-side spawn failure: response has id + error (not a transport error)."""
+    mcp = adapter.build()
+    _stub_async_post(adapter, {"id": "dev-researcher", "error": "command not found"})
+    result = asyncio.run(mcp.call_tool("bus_start_agent", {"agent_id": "dev-researcher"}))
+    text = _extract_text(result)
+    assert text.strip() == "dev-researcher: start error: command not found"
 
 
 def test_bus_stop_agent(adapter):
@@ -203,7 +212,7 @@ def test_bus_stop_agent(adapter):
     calls = _stub_async_post(adapter, {"id": "dev-researcher", "status": "stopped"})
     result = asyncio.run(mcp.call_tool("bus_stop_agent", {"agent_id": "dev-researcher"}))
     text = _extract_text(result)
-    assert text.strip() == "dev-researcher: stopped"
+    assert text.strip() == "dev-researcher: stop stopped"
     assert calls == [("/v1/install/dev-researcher/stop", {})]
 
 
@@ -214,7 +223,7 @@ def test_bus_restart_agent(adapter):
     )
     result = asyncio.run(mcp.call_tool("bus_restart_agent", {"agent_id": "dev-researcher"}))
     text = _extract_text(result)
-    assert text.strip() == "dev-researcher: started pid=9999"
+    assert text.strip() == "dev-researcher: restart started pid=9999"
     assert calls == [("/v1/install/dev-researcher/restart", {})]
 
 
@@ -223,7 +232,7 @@ def test_bus_lifecycle_transport_error(adapter):
     _stub_async_post(adapter, {"error": "connection refused"})
     result = asyncio.run(mcp.call_tool("bus_start_agent", {"agent_id": "x"}))
     text = _extract_text(result)
-    assert text.strip() == "error: connection refused"
+    assert text.strip() == "error[start]: connection refused"
 
 
 def _extract_text(result) -> str:
