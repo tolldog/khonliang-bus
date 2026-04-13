@@ -60,6 +60,27 @@ class BusMCPAdapter:
         mcp = self.mcp
         adapter = self
 
+        def _format_lifecycle(op: str, agent_id: str, result: dict) -> str:
+            """Terse, structured response for lifecycle ops.
+
+            Distinguishes four outcomes the bus exposes today:
+            - transport error       → "error: <msg>"
+            - not installed         → "{id}: not installed"
+            - already running       → "{id}: already_running"
+            - normal success        → "{id}: {status}[ pid={pid}]"
+            """
+            if "error" in result and "status" not in result:
+                # Bus-reported errors (e.g. "not installed") vs. transport errors
+                err = result["error"]
+                if err == "not installed":
+                    return f"{agent_id}: not installed"
+                return f"error: {err}"
+            status = result.get("status", "unknown")
+            pid = result.get("pid")
+            if pid is not None:
+                return f"{agent_id}: {status} pid={pid}"
+            return f"{agent_id}: {status}"
+
         @mcp.tool()
         async def bus_services() -> str:
             """List all registered agents with their skills and status."""
@@ -141,6 +162,45 @@ class BusMCPAdapter:
                     f"[{step.get('status', 'pending')} {dur}]{err}"
                 )
             return "\n".join(lines)
+
+        @mcp.tool()
+        async def bus_start_agent(agent_id: str) -> str:
+            """Start an installed agent. Idempotent — returns 'already_running' if up.
+
+            Thin wrapper over POST /v1/install/{id}/start. The bus owns
+            subprocess spawning and registration tracking; this tool just
+            triggers it and formats the structured response.
+            """
+            return _format_lifecycle(
+                "start",
+                agent_id,
+                await adapter._async_post(f"/v1/install/{agent_id}/start", {}),
+            )
+
+        @mcp.tool()
+        async def bus_stop_agent(agent_id: str) -> str:
+            """Stop a running agent and deregister it from the bus.
+
+            Thin wrapper over POST /v1/install/{id}/stop.
+            """
+            return _format_lifecycle(
+                "stop",
+                agent_id,
+                await adapter._async_post(f"/v1/install/{agent_id}/stop", {}),
+            )
+
+        @mcp.tool()
+        async def bus_restart_agent(agent_id: str) -> str:
+            """Restart an agent (stop + start). Returns final status and new pid.
+
+            Useful for picking up code changes without external supervision.
+            Thin wrapper over POST /v1/install/{id}/restart.
+            """
+            return _format_lifecycle(
+                "restart",
+                agent_id,
+                await adapter._async_post(f"/v1/install/{agent_id}/restart", {}),
+            )
 
         @mcp.tool()
         async def bus_skills(agent_id: str = "") -> str:
