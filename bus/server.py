@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from bus.artifacts import ArtifactStore, view_response
 from bus.db import BusDB
 from bus.flows import FlowEngine
 from bus.orchestrator import Orchestrator
@@ -133,6 +134,32 @@ class GapReport(BaseModel):
     context: dict[str, Any] = {}
 
 
+class ArtifactCreateRequest(BaseModel):
+    kind: str
+    title: str
+    content: str
+    producer: str = ""
+    session_id: str = ""
+    trace_id: str = ""
+    content_type: str = "text/plain"
+    metadata: dict[str, Any] = {}
+    source_artifacts: list[str] = []
+    id: str = ""
+    ttl: str | None = None
+
+
+class ArtifactDistillRequest(BaseModel):
+    mode: str = "brief"
+    purpose: str = ""
+    max_chars: int = 4000
+
+
+class ArtifactDistillManyRequest(BaseModel):
+    ids: list[str]
+    purpose: str = ""
+    max_chars: int = 8000
+
+
 VALID_RESPONSE_MODES = {"raw", "extracted", "distilled"}
 VALID_GAP_STATUSES = {"open", "reviewed", "dismissed"}
 VALID_VERDICTS = {"accept", "push_back", "escalate"}
@@ -182,6 +209,7 @@ class BusServer:
             "backoff": "exponential",
         })
         self.flow_engine = FlowEngine(db, self._http)
+        self.artifacts = ArtifactStore(db)
         self.orchestrator = Orchestrator(
             db, self._http,
             ollama_url=self.config.get("ollama_url", "http://localhost:11434"),
@@ -648,6 +676,88 @@ class BusServer:
             "available_flows": len(validated["available"]),
             "unavailable_flows": len(validated["unavailable"]),
         }
+
+    # -- artifacts --
+
+    def create_artifact(self, req: ArtifactCreateRequest) -> dict:
+        try:
+            return self.artifacts.create(
+                kind=req.kind,
+                title=req.title,
+                content=req.content,
+                producer=req.producer,
+                session_id=req.session_id,
+                trace_id=req.trace_id,
+                content_type=req.content_type,
+                metadata=req.metadata,
+                source_artifacts=req.source_artifacts,
+                artifact_id=req.id,
+                ttl=req.ttl,
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+
+    def list_artifacts(
+        self,
+        session_id: str = "",
+        kind: str = "",
+        producer: str = "",
+        limit: int = 20,
+    ) -> list[dict]:
+        return self.artifacts.list(
+            session_id=session_id,
+            kind=kind,
+            producer=producer,
+            limit=limit,
+        )
+
+    def artifact_metadata(self, artifact_id: str) -> dict:
+        meta = self.artifacts.metadata(artifact_id)
+        if meta is None:
+            return {"error": "artifact not found"}
+        return meta
+
+    def artifact_view(self, artifact_id: str, view: str, **kwargs: Any) -> dict:
+        meta = self.artifacts.metadata(artifact_id)
+        if meta is None:
+            return {"error": "artifact not found"}
+        try:
+            if view == "head":
+                return view_response(meta, self.artifacts.head(artifact_id, **kwargs))
+            if view == "tail":
+                return view_response(meta, self.artifacts.tail(artifact_id, **kwargs))
+            if view == "get":
+                return view_response(meta, self.artifacts.get(artifact_id, **kwargs))
+            if view == "grep":
+                return view_response(meta, self.artifacts.grep(artifact_id, **kwargs))
+            if view == "excerpt":
+                return view_response(meta, self.artifacts.excerpt(artifact_id, **kwargs))
+        except ValueError as e:
+            return {"error": str(e)}
+        return {"error": f"unknown artifact view: {view}"}
+
+    def distill_artifact(self, artifact_id: str, req: ArtifactDistillRequest) -> dict:
+        try:
+            return self.artifacts.distill(
+                artifact_id,
+                mode=req.mode,
+                purpose=req.purpose,
+                max_chars=req.max_chars,
+            )
+        except KeyError:
+            return {"error": "artifact not found"}
+
+    def distill_many_artifacts(self, req: ArtifactDistillManyRequest) -> dict:
+        try:
+            return self.artifacts.distill_many(
+                req.ids,
+                purpose=req.purpose,
+                max_chars=req.max_chars,
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+        except KeyError as e:
+            return {"error": f"artifact not found: {e.args[0]}"}
 
     # -- flow orchestration (Step 6) --
 
@@ -1238,6 +1348,116 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/matrix")
     def matrix():
         return bus.get_interaction_matrix()
+
+    # -- artifacts --
+
+    @app.post("/v1/artifacts")
+    def create_artifact(req: ArtifactCreateRequest):
+        result = bus.create_artifact(req)
+        if "error" in result:
+            raise HTTPException(status_code=422, detail=result["error"])
+        return result
+
+    @app.get("/v1/artifacts")
+    def list_artifacts(
+        session_id: str = "",
+        kind: str = "",
+        producer: str = "",
+        limit: int = 20,
+    ):
+        return bus.list_artifacts(
+            session_id=session_id,
+            kind=kind,
+            producer=producer,
+            limit=limit,
+        )
+
+    @app.get("/v1/artifacts/{artifact_id}")
+    def artifact_metadata(artifact_id: str):
+        result = bus.artifact_metadata(artifact_id)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+
+    @app.get("/v1/artifacts/{artifact_id}/head")
+    def artifact_head(artifact_id: str, lines: int = 80, max_chars: int = 4000):
+        result = bus.artifact_view(
+            artifact_id, "head", lines=lines, max_chars=max_chars
+        )
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+
+    @app.get("/v1/artifacts/{artifact_id}/tail")
+    def artifact_tail(artifact_id: str, lines: int = 80, max_chars: int = 4000):
+        result = bus.artifact_view(
+            artifact_id, "tail", lines=lines, max_chars=max_chars
+        )
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+
+    @app.get("/v1/artifacts/{artifact_id}/content")
+    def artifact_content(artifact_id: str, offset: int = 0, max_chars: int = 4000):
+        result = bus.artifact_view(
+            artifact_id, "get", offset=offset, max_chars=max_chars
+        )
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+
+    @app.get("/v1/artifacts/{artifact_id}/grep")
+    def artifact_grep(
+        artifact_id: str,
+        pattern: str,
+        context_lines: int = 10,
+        max_matches: int = 10,
+        max_chars: int = 4000,
+    ):
+        result = bus.artifact_view(
+            artifact_id,
+            "grep",
+            pattern=pattern,
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_chars=max_chars,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+
+    @app.get("/v1/artifacts/{artifact_id}/excerpt")
+    def artifact_excerpt(
+        artifact_id: str,
+        start_line: int,
+        end_line: int,
+        max_chars: int = 4000,
+    ):
+        result = bus.artifact_view(
+            artifact_id,
+            "excerpt",
+            start_line=start_line,
+            end_line=end_line,
+            max_chars=max_chars,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+
+    @app.post("/v1/artifacts/distill_many")
+    def artifact_distill_many(req: ArtifactDistillManyRequest):
+        result = bus.distill_many_artifacts(req)
+        if "error" in result:
+            status = 404 if "not found" in result["error"] else 422
+            raise HTTPException(status_code=status, detail=result["error"])
+        return result
+
+    @app.post("/v1/artifacts/{artifact_id}/distill")
+    def artifact_distill(artifact_id: str, req: ArtifactDistillRequest):
+        result = bus.distill_artifact(artifact_id, req)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
 
     # -- observability --
 

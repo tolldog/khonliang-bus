@@ -72,7 +72,10 @@ def test_build_registers_bus_tools(adapter):
     # Bus management tools
     for bus_tool in (
         "bus_services", "bus_status", "bus_matrix", "bus_flows",
-        "bus_trace", "bus_skills",
+        "bus_trace", "bus_skills", "bus_artifact_list",
+        "bus_artifact_metadata", "bus_artifact_head", "bus_artifact_tail",
+        "bus_artifact_get", "bus_artifact_grep", "bus_artifact_excerpt",
+        "bus_artifact_distill", "bus_artifact_distill_many",
         "bus_start_agent", "bus_stop_agent", "bus_restart_agent",
     ):
         assert bus_tool in tool_names, f"missing bus tool: {bus_tool}"
@@ -101,8 +104,8 @@ def test_build_registers_flow_tools(adapter):
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
-    # 11 bus tools (6 read + bus_wait_for_event + 3 lifecycle + 1 refresh) + 3 skills + 1 flow = 15
-    assert len(tools) == 15
+    # 20 bus tools (11 existing + 9 artifact tools) + 3 skills + 1 flow = 24
+    assert len(tools) == 24
 
 
 def test_bus_services_tool(adapter):
@@ -144,6 +147,27 @@ def test_bus_skills_tool(adapter):
     text = _extract_text(result)
     assert "find_papers" in text
     assert "read_spec" in text
+
+
+def test_bus_artifact_tail_tool(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    created = bus_client.post("/v1/artifacts", json={
+        "kind": "pytest_log",
+        "title": "pytest",
+        "content": "\n".join(f"line {i}" for i in range(20)),
+        "producer": "test",
+    }).json()
+
+    mcp = a.build()
+    result = asyncio.run(mcp.call_tool(
+        "bus_artifact_tail",
+        {"id": created["id"], "lines": 2, "max_chars": 100},
+    ))
+    text = _extract_text(result)
+    assert "line 18" in text
+    assert "line 19" in text
+    assert "pytest_log" in text
 
 
 def test_bus_trace_tool_empty(adapter):
