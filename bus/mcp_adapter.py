@@ -180,6 +180,9 @@ class BusMCPAdapter:
             Returns a string describing the event or "timeout".
             """
             topic_list = [t.strip() for t in topics.split(",") if t.strip()] if topics else []
+            # Add a 5-second buffer to the HTTP transport timeout so the server
+            # always has room to return its graceful {"status":"timeout"} before
+            # the HTTP client fires its own timeout.
             result = await adapter._async_post(
                 "/v1/wait",
                 {
@@ -188,7 +191,10 @@ class BusMCPAdapter:
                     "timeout": timeout,
                     "ack_on_return": True,
                 },
+                http_timeout=timeout + 5,
             )
+            if result.get("error"):
+                return f"bus error: {result['error']}"
             if result.get("status") == "timeout":
                 return f"timeout after {timeout}s (subscriber={subscriber_id})"
             event = result.get("event") or {}
@@ -494,9 +500,12 @@ class BusMCPAdapter:
         except Exception as e:
             return {"error": str(e)}
 
-    async def _async_post(self, path: str, body: dict) -> dict:
+    async def _async_post(self, path: str, body: dict, http_timeout: float | None = None) -> dict:
         try:
-            r = await self._async_http.post(f"{self.bus_url}{path}", json=body)
+            kwargs: dict = {"json": body}
+            if http_timeout is not None:
+                kwargs["timeout"] = httpx.Timeout(http_timeout)
+            r = await self._async_http.post(f"{self.bus_url}{path}", **kwargs)
             return r.json()
         except Exception as e:
             return {"error": str(e)}

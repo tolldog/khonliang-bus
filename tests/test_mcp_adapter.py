@@ -161,7 +161,7 @@ def test_bus_wait_for_event_tool_registered(adapter):
 
 def test_bus_wait_for_event_tool_formats_event(adapter):
     """When the bus returns a matched event, the tool formats it for Claude."""
-    async def mock_post(path, body):
+    async def mock_post(path, body, http_timeout=None):
         assert path == "/v1/wait"
         return {
             "status": "matched",
@@ -188,7 +188,7 @@ def test_bus_wait_for_event_tool_formats_event(adapter):
 
 
 def test_bus_wait_for_event_tool_formats_timeout(adapter):
-    async def mock_post(path, body):
+    async def mock_post(path, body, http_timeout=None):
         return {"status": "timeout", "event": None, "subscriber_id": "claude-mcp"}
     adapter._async_post = mock_post
 
@@ -211,7 +211,7 @@ def _stub_async_post(adapter, response: dict) -> list[tuple[str, dict]]:
     """Replace adapter._async_post with a stub; returns a call-log list."""
     calls: list[tuple[str, dict]] = []
 
-    async def _stub(path: str, body: dict) -> dict:
+    async def _stub(path: str, body: dict, http_timeout: float | None = None) -> dict:
         calls.append((path, body))
         return response
 
