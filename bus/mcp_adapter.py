@@ -35,6 +35,13 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
+from bus.response_envelope import (
+    build_response_envelope,
+    dumps_envelope,
+    extract_response_budget,
+    serialize_result,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -568,12 +575,19 @@ class BusMCPAdapter:
                 parsed_args = json.loads(args) if isinstance(args, str) else args
             except json.JSONDecodeError:
                 return f"error: invalid JSON args: {args}"
+            if not isinstance(parsed_args, dict):
+                return "error: args must be a JSON object"
+            budget = extract_response_budget(parsed_args)
 
             result = await adapter._async_request(agent_id, skill_name, parsed_args)
             if "error" in result:
                 return f"error: {result['error']}"
-            r = result.get("result", "")
-            return r if isinstance(r, str) else json.dumps(r, indent=2)
+            return await adapter._format_tool_result(
+                producer=agent_id,
+                operation=skill_name,
+                result=result.get("result", ""),
+                budget=budget,
+            )
 
     def _register_flow_tools(self) -> None:
         """Generate an @mcp.tool for each available collaborative flow."""
@@ -597,6 +611,9 @@ class BusMCPAdapter:
                 parsed_args = json.loads(args) if isinstance(args, str) else args
             except json.JSONDecodeError:
                 return f"error: invalid JSON args: {args}"
+            if not isinstance(parsed_args, dict):
+                return "error: args must be a JSON object"
+            budget = extract_response_budget(parsed_args)
 
             result = await adapter._async_post("/v1/flow", {
                 "flow_id": flow_name,
@@ -604,8 +621,12 @@ class BusMCPAdapter:
             })
             if "error" in result:
                 return f"error: {result['error']}"
-            r = result.get("result", "")
-            return r if isinstance(r, str) else json.dumps(r, indent=2)
+            return await adapter._format_tool_result(
+                producer="flow",
+                operation=flow_name,
+                result=result.get("result", ""),
+                budget=budget,
+            )
 
     # -- HTTP helpers --
 
@@ -642,6 +663,53 @@ class BusMCPAdapter:
             return r.json()
         except Exception as e:
             return {"error": str(e)}
+
+    async def _format_tool_result(
+        self,
+        *,
+        producer: str,
+        operation: str,
+        result: Any,
+        budget,
+    ) -> str:
+        """Return a bounded envelope for dynamic skill and flow outputs."""
+        text, content_type = serialize_result(result)
+        artifact = None
+        if len(text) > budget.max_chars:
+            artifact = await self._async_post(
+                "/v1/artifacts",
+                {
+                    "kind": "tool_result",
+                    "title": f"{producer}.{operation} result",
+                    "content": text,
+                    "producer": producer,
+                    "content_type": content_type,
+                    "metadata": {
+                        "operation": operation,
+                        "mcp_tool": f"{producer}.{operation}",
+                    },
+                },
+            )
+            if artifact and "error" in artifact:
+                logger.warning(
+                    "Failed to store artifact for %s.%s: %s",
+                    producer,
+                    operation,
+                    artifact["error"],
+                )
+                artifact = None
+
+        envelope = build_response_envelope(
+            ok=True,
+            status="ok",
+            producer=producer,
+            operation=operation,
+            text=text,
+            budget=budget,
+            artifact=artifact,
+            content_type=content_type,
+        )
+        return dumps_envelope(envelope)
 
 
 # ---------------------------------------------------------------------------

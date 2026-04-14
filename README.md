@@ -94,6 +94,40 @@ registry:
   heartbeat_interval: 30s
 ```
 
+## MCP Response Budgets
+
+The bus MCP adapter is a context firewall. Agent skill and flow calls return a
+bounded JSON envelope by default instead of inlining large raw outputs.
+
+Envelope fields include:
+
+- `ok` / `status`
+- `summary`
+- `findings`
+- `refs` and `artifact_ids`
+- `suggested_next_actions`
+- `truncated` / `omitted`
+- `metrics.raw_bytes`, `metrics.raw_chars`, and `metrics.inline_budget_chars`
+
+Default inline budget is 8,000 characters. Non-high-detail calls are capped at
+16,000 characters even if a caller requests more with `_response_budget_chars`.
+Callers can pass `_allow_high_detail: true` to raise the ceiling for explicit
+inspection, but large outputs should still be retrieved through artifact
+helpers.
+
+Agent authors should treat `detail` like this:
+
+- `compact`: one-line status, counts, and artifact refs.
+- `brief`: actionable summary, top findings, and artifact refs.
+- `full`: richer summary, but still no raw logs, full diffs, file bodies, or
+  context dumps inline.
+
+Never return raw pytest output, full command stdout/stderr, complete diffs,
+large FR lists, or file bodies inline by default. Store raw material as an
+artifact and return the artifact id with suggested retrieval commands such as
+`bus_artifact_tail`, `bus_artifact_grep`, `bus_artifact_excerpt`, or
+`bus_artifact_distill`.
+
 ## Status
 
 **v0.1** — initial release
