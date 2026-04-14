@@ -89,6 +89,20 @@ def test_artifact_excerpt_and_grep_are_bounded(db):
         store.grep(meta["id"], pattern="[")
 
 
+def test_grep_matches_is_total_count_not_capped(db):
+    """grep 'matches' field must reflect ALL matching lines, not just returned blocks."""
+    store = ArtifactStore(db)
+    meta = store.create(
+        kind="command_output",
+        title="repeated pattern",
+        content="\n".join(f"ERROR line {i}" for i in range(10)),
+    )
+
+    result = store.grep(meta["id"], pattern="ERROR", max_matches=3, max_chars=10000)
+    assert result["matches"] == 10
+    assert result["returned_matches"] == 3
+
+
 def test_artifact_distill_creates_new_artifact_with_source_ref(db):
     store = ArtifactStore(db)
     source = store.create(
@@ -108,6 +122,16 @@ def test_artifact_distill_creates_new_artifact_with_source_ref(db):
     assert distilled["source_artifacts"] == [source["id"]]
     assert "source_lines: 100" in result["digest"]
     assert len(result["digest"]) <= 500
+
+
+def test_artifact_content_size_limit(db):
+    """create() must reject content exceeding MAX_ARTIFACT_BYTES."""
+    from bus.artifacts import MAX_ARTIFACT_BYTES
+
+    store = ArtifactStore(db)
+    oversized = "x" * (MAX_ARTIFACT_BYTES + 1)
+    with pytest.raises(ValueError, match="exceeds maximum size"):
+        store.create(kind="log", title="big", content=oversized)
 
 
 def test_missing_artifact_raises_key_error(db):

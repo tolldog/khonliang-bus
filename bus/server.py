@@ -1444,19 +1444,19 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             raise HTTPException(status_code=404, detail=result["error"])
         return result
 
-    @app.post("/v1/artifacts/{artifact_id}/distill")
-    def artifact_distill(artifact_id: str, req: ArtifactDistillRequest):
-        result = bus.distill_artifact(artifact_id, req)
-        if "error" in result:
-            raise HTTPException(status_code=404, detail=result["error"])
-        return result
-
     @app.post("/v1/artifacts/distill_many")
     def artifact_distill_many(req: ArtifactDistillManyRequest):
         result = bus.distill_many_artifacts(req)
         if "error" in result:
             status = 404 if "not found" in result["error"] else 422
             raise HTTPException(status_code=status, detail=result["error"])
+        return result
+
+    @app.post("/v1/artifacts/{artifact_id}/distill")
+    def artifact_distill(artifact_id: str, req: ArtifactDistillRequest):
+        result = bus.distill_artifact(artifact_id, req)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
         return result
 
     # -- observability --

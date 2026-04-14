@@ -18,6 +18,7 @@ from bus.db import BusDB, _row_to_dict
 
 DEFAULT_MAX_CHARS = 4000
 HARD_MAX_CHARS = 20000
+MAX_ARTIFACT_BYTES = 10 * 1024 * 1024  # 10 MiB per artifact
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,10 @@ class ArtifactStore:
             raise ValueError("title is required")
         artifact_id = artifact_id or f"art_{uuid.uuid4().hex[:12]}"
         raw = content.encode("utf-8")
+        if len(raw) > MAX_ARTIFACT_BYTES:
+            raise ValueError(
+                f"content exceeds maximum size of {MAX_ARTIFACT_BYTES} bytes"
+            )
         with self.db.conn() as c:
             c.execute(
                 """
@@ -209,14 +214,13 @@ class ArtifactStore:
             if not regex.search(line):
                 continue
             matches += 1
-            if len(blocks) >= max_matches:
-                break
-            start = max(0, idx - context_lines)
-            end = min(len(lines), idx + context_lines + 1)
-            blocks.append(
-                f"--- match {matches} lines {start + 1}-{end} ---\n"
-                + "\n".join(lines[start:end])
-            )
+            if len(blocks) < max_matches:
+                start = max(0, idx - context_lines)
+                end = min(len(lines), idx + context_lines + 1)
+                blocks.append(
+                    f"--- match {matches} lines {start + 1}-{end} ---\n"
+                    + "\n".join(lines[start:end])
+                )
 
         bounded = _bound_text("\n\n".join(blocks), max_chars, truncated=matches > len(blocks))
         return {
