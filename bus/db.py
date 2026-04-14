@@ -140,6 +140,29 @@ CREATE TABLE IF NOT EXISTS traces (
     error        TEXT,
     PRIMARY KEY (trace_id, step)
 );
+
+-- Persistent: large outputs and durable evidence. Tool calls return artifact
+-- IDs and bounded excerpts instead of inlining raw logs/diffs/files.
+CREATE TABLE IF NOT EXISTS artifacts (
+    id               TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    producer         TEXT NOT NULL DEFAULT '',
+    session_id       TEXT NOT NULL DEFAULT '',
+    trace_id         TEXT NOT NULL DEFAULT '',
+    content_type     TEXT NOT NULL DEFAULT 'text/plain',
+    size_bytes       INTEGER NOT NULL,
+    sha256           TEXT NOT NULL,
+    metadata         TEXT NOT NULL DEFAULT '{}',
+    source_artifacts TEXT NOT NULL DEFAULT '[]',
+    content          TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    ttl              TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_producer ON artifacts(producer, created_at);
 """
 
 
@@ -527,7 +550,10 @@ class BusDB:
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     # Parse JSON fields
-    for key in ("args", "parameters", "requires", "steps", "payload", "context", "retry_with"):
+    for key in (
+        "args", "parameters", "requires", "steps", "payload", "context",
+        "retry_with", "metadata", "source_artifacts",
+    ):
         if key in d and isinstance(d[key], str):
             try:
                 d[key] = json.loads(d[key])

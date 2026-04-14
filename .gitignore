@@ -2,6 +2,7 @@ bin/
 data/
 logs/
 config/
+.mcp.json
 *.db
 *.db-shm
 *.db-wal

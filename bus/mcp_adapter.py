@@ -316,6 +316,136 @@ class BusMCPAdapter:
                 lines.append(f"    {s['name']} — {s.get('description', '')}")
             return "\n".join(lines).strip()
 
+        @mcp.tool()
+        async def bus_artifact_list(
+            session_id: str = "",
+            kind: str = "",
+            producer: str = "",
+            limit: int = 20,
+        ) -> str:
+            """List artifact metadata. Does not return artifact content."""
+            result = adapter._get(
+                "/v1/artifacts",
+                params={
+                    "session_id": session_id,
+                    "kind": kind,
+                    "producer": producer,
+                    "limit": limit,
+                },
+            )
+            return json.dumps(result or [], indent=2)
+
+        @mcp.tool()
+        async def bus_artifact_metadata(id: str) -> str:
+            """Return artifact metadata, size, kind, producer, and refs."""
+            result = adapter._get(f"/v1/artifacts/{id}")
+            return json.dumps(result or {"error": "artifact not found"}, indent=2)
+
+        @mcp.tool()
+        async def bus_artifact_head(
+            id: str,
+            lines: int = 80,
+            max_chars: int = 4000,
+        ) -> str:
+            """Bounded beginning of a text artifact."""
+            result = adapter._get(
+                f"/v1/artifacts/{id}/head",
+                params={"lines": lines, "max_chars": max_chars},
+            )
+            return json.dumps(result or {"error": "artifact not found"}, indent=2)
+
+        @mcp.tool()
+        async def bus_artifact_tail(
+            id: str,
+            lines: int = 80,
+            max_chars: int = 4000,
+        ) -> str:
+            """Bounded end of a text artifact."""
+            result = adapter._get(
+                f"/v1/artifacts/{id}/tail",
+                params={"lines": lines, "max_chars": max_chars},
+            )
+            return json.dumps(result or {"error": "artifact not found"}, indent=2)
+
+        @mcp.tool()
+        async def bus_artifact_get(
+            id: str,
+            offset: int = 0,
+            max_chars: int = 4000,
+        ) -> str:
+            """Bounded character window from a text artifact."""
+            result = adapter._get(
+                f"/v1/artifacts/{id}/content",
+                params={"offset": offset, "max_chars": max_chars},
+            )
+            return json.dumps(result or {"error": "artifact not found"}, indent=2)
+
+        @mcp.tool()
+        async def bus_artifact_grep(
+            id: str,
+            pattern: str,
+            context_lines: int = 10,
+            max_matches: int = 10,
+            max_chars: int = 4000,
+        ) -> str:
+            """Bounded pattern excerpts from a text artifact."""
+            result = adapter._get(
+                f"/v1/artifacts/{id}/grep",
+                params={
+                    "pattern": pattern,
+                    "context_lines": context_lines,
+                    "max_matches": max_matches,
+                    "max_chars": max_chars,
+                },
+            )
+            return json.dumps(result or {"error": "artifact not found"}, indent=2)
+
+        @mcp.tool()
+        async def bus_artifact_excerpt(
+            id: str,
+            start_line: int,
+            end_line: int,
+            max_chars: int = 4000,
+        ) -> str:
+            """Bounded explicit line range from a text artifact."""
+            result = adapter._get(
+                f"/v1/artifacts/{id}/excerpt",
+                params={
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "max_chars": max_chars,
+                },
+            )
+            return json.dumps(result or {"error": "artifact not found"}, indent=2)
+
+        @mcp.tool()
+        async def bus_artifact_distill(
+            id: str,
+            mode: str = "brief",
+            purpose: str = "",
+            max_chars: int = 4000,
+        ) -> str:
+            """Create and return a bounded distillation artifact."""
+            result = await adapter._async_post(
+                f"/v1/artifacts/{id}/distill",
+                {"mode": mode, "purpose": purpose, "max_chars": max_chars},
+            )
+            return json.dumps(result, indent=2)
+
+        @mcp.tool()
+        async def bus_artifact_distill_many(
+            ids: str,
+            purpose: str = "",
+            max_chars: int = 8000,
+        ) -> str:
+            """Distill several artifacts. Pass ids as comma-separated artifact IDs."""
+            artifact_ids = [i.strip() for i in ids.split(",") if i.strip()]
+            result = await adapter._async_post(
+                "/v1/artifacts/distill_many",
+                {"ids": artifact_ids, "purpose": purpose, "max_chars": max_chars},
+            )
+            return json.dumps(result, indent=2)
+
     def _register_skill_tools(self) -> None:
         """Generate an @mcp.tool for each registered agent skill."""
         services = self._get("/v1/services")
@@ -535,7 +665,7 @@ def main():
 
     logger.info(
         "Bus-MCP adapter started. %d tools registered. Bus: %s",
-        len(adapter._registered_tools) + 10,  # +10 for bus_* tools
+        len(adapter._registered_tools) + 20,  # +20 for built-in bus tools
         args.bus,
     )
 

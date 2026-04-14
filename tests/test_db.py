@@ -13,6 +13,7 @@ def test_schema_creates_all_tables(db):
     expected = {
         "installed_agents", "registrations", "skills", "flows",
         "messages", "subscriptions", "dead_letters", "sessions", "traces",
+        "artifacts",
     }
     assert expected.issubset(tables)
 
