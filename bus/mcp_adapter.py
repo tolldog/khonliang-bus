@@ -479,7 +479,7 @@ def main():
 
     logger.info(
         "Bus-MCP adapter started. %d tools registered. Bus: %s",
-        len(adapter._registered_tools) + 6,  # +6 for bus_* tools
+        len(adapter._registered_tools) + 10,  # +10 for bus_* tools
         args.bus,
     )
 
