@@ -488,29 +488,11 @@ class BusServer:
         """Return the earliest unacked message matching any of ``topics``
         for ``subscriber_id``, or None.
 
-        If ``topics`` is empty, match any topic the subscriber has ever
-        seen plus all known topics on the bus.
+        If ``topics`` is empty, match any topic on the bus.
+        Delegates to :meth:`BusDB.find_earliest_unacked` — a single
+        indexed query instead of per-topic round-trips.
         """
-        # Resolve which topics to scan
-        scan_topics = list(topics) if topics else self._known_topics()
-        if not scan_topics:
-            return None
-
-        best: dict | None = None
-        for topic in scan_topics:
-            last_acked = self.db.get_last_acked(subscriber_id, topic)
-            msgs = self.db.get_messages(topic, after_id=last_acked, limit=1)
-            if msgs:
-                msg = msgs[0]
-                if best is None or msg["id"] < best["id"]:
-                    best = msg
-        return best
-
-    def _known_topics(self) -> list[str]:
-        """Distinct topics currently stored on the bus (best-effort)."""
-        with self.db.conn() as c:
-            rows = c.execute("SELECT DISTINCT topic FROM messages").fetchall()
-            return [r[0] for r in rows]
+        return self.db.find_earliest_unacked(subscriber_id, topics or None)
 
     async def _push_to_subscribers(self, topic: str, msg_id: int) -> None:
         msgs = self.db.get_messages(topic, after_id=msg_id - 1, limit=1)
