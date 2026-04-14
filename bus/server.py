@@ -77,6 +77,24 @@ class PublishRequest(BaseModel):
     source: str = ""
 
 
+class WaitRequest(BaseModel):
+    """Long-poll for events. Holds the connection until a matching event
+    fires, the timeout elapses, or an already-pending event is returned.
+
+    - ``topics``: list of topic strings to match on. Empty list matches all.
+    - ``subscriber_id``: stable ID for this waiter. Used to track acked
+      messages so the same event isn't re-delivered across calls.
+    - ``timeout``: max seconds to wait before returning empty.
+    - ``ack_on_return``: if true (default), advance the subscriber's ack
+      pointer to the returned event so the next wait call skips it.
+    """
+
+    topics: list[str] = []
+    subscriber_id: str = ""
+    timeout: float = 30.0
+    ack_on_return: bool = True
+
+
 class AckRequest(BaseModel):
     subscriber_id: str
     message_id: int
@@ -154,6 +172,8 @@ class BusServer:
         self._agent_connections: dict[str, WebSocket] = {}  # agent_id → WebSocket
         self._pending_responses: dict[str, asyncio.Future] = {}  # correlation_id → Future
         self._pending_agent: dict[str, str] = {}  # correlation_id → agent_id
+        # Long-poll waiters: event fires on any new publish so waiters can re-check
+        self._publish_notify: asyncio.Event | None = None
         self._retry_config = self.config.get("retry", {
             "delay": 2.0,
             "max_attempts": 3,
@@ -402,7 +422,95 @@ class BusServer:
         msg_id = self.db.publish_message(req.topic, req.payload, req.source)
         # Notify WebSocket subscribers
         await self._push_to_subscribers(req.topic, msg_id)
+        # Wake any long-poll waiters so they can re-check their topic filters
+        self._notify_waiters()
         return {"id": msg_id, "topic": req.topic}
+
+    def _notify_waiters(self) -> None:
+        """Signal all active long-poll waiters that a new event was published."""
+        if self._publish_notify is not None:
+            # Swap in a fresh event so the current one fires once and waiters
+            # that re-wait get a new Event object to await on.
+            old = self._publish_notify
+            self._publish_notify = asyncio.Event()
+            old.set()
+
+    async def wait_for_event(self, req: WaitRequest) -> dict:
+        """Long-poll for the next event matching ``topics`` for ``subscriber_id``.
+
+        Returns the first unacked event that matches a subscribed topic. If
+        no match exists, waits up to ``timeout`` seconds for a new publish.
+        Advances the subscriber's ack pointer if ``ack_on_return`` is true.
+        """
+        # Lazy-init so there's always a current event object
+        if self._publish_notify is None:
+            self._publish_notify = asyncio.Event()
+
+        topics = req.topics or []  # empty = match any
+        subscriber_id = req.subscriber_id or f"waiter-{uuid.uuid4().hex[:8]}"
+        deadline = time.monotonic() + max(0.0, float(req.timeout))
+
+        while True:
+            # Check each subscribed topic for unacked messages
+            match = self._find_next_matching(subscriber_id, topics)
+            if match is not None:
+                if req.ack_on_return:
+                    self.db.ack_message(subscriber_id, match["topic"], match["id"])
+                return {
+                    "event": match,
+                    "subscriber_id": subscriber_id,
+                    "status": "matched",
+                }
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {
+                    "event": None,
+                    "subscriber_id": subscriber_id,
+                    "status": "timeout",
+                }
+
+            # Wait for the next publish (or timeout)
+            current_notify = self._publish_notify
+            try:
+                await asyncio.wait_for(current_notify.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return {
+                    "event": None,
+                    "subscriber_id": subscriber_id,
+                    "status": "timeout",
+                }
+            # Loop and re-check — a publish fired, there may be a match now
+
+    def _find_next_matching(
+        self, subscriber_id: str, topics: list[str]
+    ) -> dict | None:
+        """Return the earliest unacked message matching any of ``topics``
+        for ``subscriber_id``, or None.
+
+        If ``topics`` is empty, match any topic the subscriber has ever
+        seen plus all known topics on the bus.
+        """
+        # Resolve which topics to scan
+        scan_topics = list(topics) if topics else self._known_topics()
+        if not scan_topics:
+            return None
+
+        best: dict | None = None
+        for topic in scan_topics:
+            last_acked = self.db.get_last_acked(subscriber_id, topic)
+            msgs = self.db.get_messages(topic, after_id=last_acked, limit=1)
+            if msgs:
+                msg = msgs[0]
+                if best is None or msg["id"] < best["id"]:
+                    best = msg
+        return best
+
+    def _known_topics(self) -> list[str]:
+        """Distinct topics currently stored on the bus (best-effort)."""
+        with self.db.conn() as c:
+            rows = c.execute("SELECT DISTINCT topic FROM messages").fetchall()
+            return [r[0] for r in rows]
 
     async def _push_to_subscribers(self, topic: str, msg_id: int) -> None:
         msgs = self.db.get_messages(topic, after_id=msg_id - 1, limit=1)
@@ -418,6 +526,7 @@ class BusServer:
     async def _publish_event(self, topic: str, payload: Any) -> None:
         msg_id = self.db.publish_message(topic, payload, "bus")
         await self._push_to_subscribers(topic, msg_id)
+        self._notify_waiters()
 
     def ack(self, req: AckRequest) -> dict:
         self.db.ack_message(req.subscriber_id, req.topic, req.message_id)
@@ -758,6 +867,7 @@ class BusServer:
                     source = agent_id or "unknown"
                     msg_id = self.db.publish_message(topic, payload, source)
                     await self._push_to_subscribers(topic, msg_id)
+                    self._notify_waiters()
 
                 elif msg_type == "gap":
                     if agent_id:
@@ -1001,6 +1111,10 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.post("/v1/nack")
     def nack(req: NackRequest):
         return bus.nack(req)
+
+    @app.post("/v1/wait")
+    async def wait_for_event(req: WaitRequest):
+        return await bus.wait_for_event(req)
 
     @app.websocket("/v1/agent")
     async def agent_ws(ws: WebSocket):
