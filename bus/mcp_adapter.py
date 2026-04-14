@@ -160,6 +160,50 @@ class BusMCPAdapter:
             return "\n".join(lines) if lines else "no flows declared"
 
         @mcp.tool()
+        async def bus_wait_for_event(
+            topics: str = "",
+            subscriber_id: str = "claude-mcp",
+            timeout: float = 30.0,
+        ) -> str:
+            """Long-poll for the next bus event matching ``topics``.
+
+            Inverts polling: instead of Claude calling ``bus_events``
+            repeatedly, Claude opens this tool and the bus holds the
+            connection until a matching event fires (or timeout).
+
+            Args:
+                topics: Comma-separated topic names. Empty = match any topic.
+                subscriber_id: Stable ID so the bus doesn't re-deliver
+                    the same event across wait calls. Default "claude-mcp".
+                timeout: Max seconds to wait (default 30).
+
+            Returns a string describing the event or "timeout".
+            """
+            topic_list = [t.strip() for t in topics.split(",") if t.strip()] if topics else []
+            result = await adapter._async_post(
+                "/v1/wait",
+                {
+                    "topics": topic_list,
+                    "subscriber_id": subscriber_id,
+                    "timeout": timeout,
+                    "ack_on_return": True,
+                },
+            )
+            if result.get("status") == "timeout":
+                return f"timeout after {timeout}s (subscriber={subscriber_id})"
+            event = result.get("event") or {}
+            payload = event.get("payload")
+            try:
+                payload_str = json.dumps(payload, indent=2) if not isinstance(payload, str) else payload
+            except (TypeError, ValueError):
+                payload_str = str(payload)
+            return (
+                f"event id={event.get('id', '?')} topic={event.get('topic', '?')} "
+                f"source={event.get('source', '?')} at={event.get('created_at', '?')}\n"
+                f"{payload_str}"
+            )
+
+        @mcp.tool()
         async def bus_trace(trace_id: str) -> str:
             """Query execution trace for a request or flow."""
             steps = adapter._get(f"/v1/trace/{trace_id}")

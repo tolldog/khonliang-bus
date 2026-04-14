@@ -101,8 +101,8 @@ def test_build_registers_flow_tools(adapter):
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
-    # 10 bus tools (6 read + 3 lifecycle + 1 refresh) + 3 skills + 1 flow = 14
-    assert len(tools) == 14
+    # 11 bus tools (6 read + bus_wait_for_event + 3 lifecycle + 1 refresh) + 3 skills + 1 flow = 15
+    assert len(tools) == 15
 
 
 def test_bus_services_tool(adapter):
@@ -151,6 +151,54 @@ def test_bus_trace_tool_empty(adapter):
     result = asyncio.run(mcp.call_tool("bus_trace", {"trace_id": "nonexistent"}))
     text = _extract_text(result)
     assert "no trace" in text
+
+
+def test_bus_wait_for_event_tool_registered(adapter):
+    mcp = adapter.build()
+    tools = asyncio.run(mcp.list_tools())
+    assert "bus_wait_for_event" in {t.name for t in tools}
+
+
+def test_bus_wait_for_event_tool_formats_event(adapter):
+    """When the bus returns a matched event, the tool formats it for Claude."""
+    async def mock_post(path, body):
+        assert path == "/v1/wait"
+        return {
+            "status": "matched",
+            "subscriber_id": "claude-mcp",
+            "event": {
+                "id": 42,
+                "topic": "pr.review",
+                "source": "github-webhook",
+                "created_at": "2026-04-12T10:00:00",
+                "payload": {"pr": 123, "action": "opened"},
+            },
+        }
+    adapter._async_post = mock_post
+
+    mcp = adapter.build()
+    result = asyncio.run(mcp.call_tool(
+        "bus_wait_for_event",
+        {"topics": "pr.review,pr.merge", "timeout": 1.0},
+    ))
+    text = _extract_text(result)
+    assert "pr.review" in text
+    assert "github-webhook" in text
+    assert "id=42" in text
+
+
+def test_bus_wait_for_event_tool_formats_timeout(adapter):
+    async def mock_post(path, body):
+        return {"status": "timeout", "event": None, "subscriber_id": "claude-mcp"}
+    adapter._async_post = mock_post
+
+    mcp = adapter.build()
+    result = asyncio.run(mcp.call_tool(
+        "bus_wait_for_event",
+        {"topics": "nothing", "timeout": 0.5},
+    ))
+    text = _extract_text(result)
+    assert "timeout" in text.lower()
 
 
 # -- lifecycle tools --
