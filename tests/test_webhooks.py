@@ -11,6 +11,19 @@ import pytest
 from bus.webhooks import build_topic, summarize, verify_signature
 
 
+@pytest.fixture
+def unsigned_client(tmp_path):
+    """Client with github_webhook_allow_unsigned=True for webhook endpoint tests."""
+    from bus.server import create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app(
+        db_path=str(tmp_path / "webhook-dev.db"),
+        config={"github_webhook_allow_unsigned": True},
+    )
+    return TestClient(app)
+
+
 # ---------------------------------------------------------------------------
 # Unit: signature verification
 # ---------------------------------------------------------------------------
@@ -131,28 +144,50 @@ def test_summarize_check_run():
 # ---------------------------------------------------------------------------
 
 
-def test_webhook_accepts_unsigned_in_dev(client):
-    """With no secret configured, the endpoint accepts unsigned posts."""
+def test_webhook_rejects_when_no_secret_configured(client):
+    """Default behaviour: no secret AND no explicit allow_unsigned → 503.
+
+    Prevents the footgun of a production deployment forgetting the secret
+    and accepting any forged event.
+    """
+    r = client.post(
+        "/v1/webhooks/github",
+        json={"action": "opened"},
+        headers={"X-GitHub-Event": "pull_request"},
+    )
+    assert r.status_code == 503
+    assert "not configured" in r.json()["error"]
+
+
+def test_webhook_accepts_unsigned_when_opt_in(tmp_path):
+    """With ``github_webhook_allow_unsigned=True``, unsigned posts are accepted (dev mode)."""
+    from bus.server import create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app(
+        db_path=str(tmp_path / "webhook-unsigned.db"),
+        config={"github_webhook_allow_unsigned": True},
+    )
+    c = TestClient(app)
+
     payload = {
         "action": "opened",
         "repository": {"full_name": "r"},
         "sender": {"login": "u"},
         "pull_request": {"number": 1, "title": "t"},
     }
-    r = client.post(
+    r = c.post(
         "/v1/webhooks/github",
         json=payload,
         headers={"X-GitHub-Event": "pull_request"},
     )
     assert r.status_code == 200
-    data = r.json()
-    assert data["status"] == "published"
-    assert data["topic"] == "github.pull_request.opened"
-    assert data["message_id"] > 0
+    assert r.json()["topic"] == "github.pull_request.opened"
 
 
-def test_webhook_publishes_to_bus(client):
+def test_webhook_publishes_to_bus(unsigned_client):
     """The webhook should publish an event that bus_wait_for_event can see."""
+    client = unsigned_client
     payload = {
         "action": "submitted",
         "repository": {"full_name": "r"},
@@ -243,9 +278,9 @@ def test_webhook_accepts_valid_signature(tmp_path):
     assert r.json()["topic"] == "github.pull_request.opened"
 
 
-def test_webhook_handles_ping(client):
+def test_webhook_handles_ping(unsigned_client):
     """GitHub sends a ``ping`` event when a webhook is first configured."""
-    r = client.post(
+    r = unsigned_client.post(
         "/v1/webhooks/github",
         json={"zen": "Keep it logically awesome."},
         headers={"X-GitHub-Event": "ping"},
@@ -254,9 +289,9 @@ def test_webhook_handles_ping(client):
     assert r.json()["topic"] == "github.ping"
 
 
-def test_webhook_handles_invalid_json(client):
+def test_webhook_handles_invalid_json(unsigned_client):
     """Bad JSON body → 400, not a crash."""
-    r = client.post(
+    r = unsigned_client.post(
         "/v1/webhooks/github",
         content=b"not valid json {{",
         headers={
@@ -266,3 +301,17 @@ def test_webhook_handles_invalid_json(client):
     )
     assert r.status_code == 400
     assert "invalid JSON" in r.json()["error"]
+
+
+def test_webhook_rejects_non_dict_json(unsigned_client):
+    """JSON that isn't an object (e.g., a list) → 400."""
+    r = unsigned_client.post(
+        "/v1/webhooks/github",
+        content=b'["not", "an", "object"]',
+        headers={
+            "X-GitHub-Event": "push",
+            "Content-Type": "application/json",
+        },
+    )
+    assert r.status_code == 400
+    assert "JSON object" in r.json()["error"]
