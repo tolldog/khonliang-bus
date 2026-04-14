@@ -195,8 +195,11 @@ class BusMCPAdapter:
             )
             if result.get("error"):
                 return f"bus error: {result['error']}"
+            # Use the subscriber_id the server returned (it may have
+            # generated one if the caller passed an empty string).
+            returned_sid = result.get("subscriber_id", subscriber_id)
             if result.get("status") == "timeout":
-                return f"timeout after {timeout}s (subscriber={subscriber_id})"
+                return f"timeout after {timeout}s (subscriber={returned_sid})"
             event = result.get("event") or {}
             payload = event.get("payload")
             try:

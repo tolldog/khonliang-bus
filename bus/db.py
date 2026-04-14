@@ -348,6 +348,38 @@ class BusDB:
             ).fetchone()
             return r[0] if r else 0
 
+    def find_earliest_unacked(
+        self, subscriber_id: str, topics: list[str] | None = None
+    ) -> dict[str, Any] | None:
+        """Return the earliest message the subscriber has not acked.
+
+        Single-query replacement for per-topic loops. If ``topics`` is
+        non-empty, restricts to those topics. Otherwise matches any.
+        """
+        with self.conn() as c:
+            if topics:
+                placeholders = ",".join("?" for _ in topics)
+                sql = f"""
+                    SELECT m.* FROM messages m
+                    LEFT JOIN subscriptions s
+                        ON s.subscriber_id = ? AND s.topic = m.topic
+                    WHERE m.topic IN ({placeholders})
+                      AND m.id > COALESCE(s.last_acked_id, 0)
+                    ORDER BY m.id ASC LIMIT 1
+                """
+                params: list[Any] = [subscriber_id, *topics]
+            else:
+                sql = """
+                    SELECT m.* FROM messages m
+                    LEFT JOIN subscriptions s
+                        ON s.subscriber_id = ? AND s.topic = m.topic
+                    WHERE m.id > COALESCE(s.last_acked_id, 0)
+                    ORDER BY m.id ASC LIMIT 1
+                """
+                params = [subscriber_id]
+            r = c.execute(sql, params).fetchone()
+            return _row_to_dict(r) if r else None
+
     def add_dead_letter(
         self,
         topic: str,
