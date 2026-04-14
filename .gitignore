@@ -1,5 +1,7 @@
 bin/
 data/
+logs/
+config/
 *.db
 *.db-shm
 *.db-wal
