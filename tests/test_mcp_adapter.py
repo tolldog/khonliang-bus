@@ -101,8 +101,8 @@ def test_build_registers_flow_tools(adapter):
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
-    # 9 bus tools (6 read + 3 lifecycle) + 3 skills (2 researcher + 1 developer) + 1 flow = 13
-    assert len(tools) == 13
+    # 10 bus tools (6 read + 3 lifecycle + 1 refresh) + 3 skills + 1 flow = 14
+    assert len(tools) == 14
 
 
 def test_bus_services_tool(adapter):
@@ -233,6 +233,163 @@ def test_bus_lifecycle_transport_error(adapter):
     result = asyncio.run(mcp.call_tool("bus_start_agent", {"agent_id": "x"}))
     text = _extract_text(result)
     assert text.strip() == "error[start]: connection refused"
+
+
+# -- dynamic skill refresh --
+#
+# When an agent reloads with new or different skills, the adapter's
+# per-skill tool registry must reconcile automatically. Previously these
+# were registered once at build() time, so new skills stayed invisible to
+# MCP clients until the bus restarted. refresh_skills() closes that gap.
+
+
+def test_build_registers_bus_refresh_skills_tool(adapter):
+    mcp = adapter.build()
+    tools = asyncio.run(mcp.list_tools())
+    names = {t.name for t in tools}
+    assert "bus_refresh_skills" in names
+
+
+def test_refresh_skills_adds_new_skill_after_agent_reload(bus_client):
+    """An agent registering a new skill after build() becomes callable post-refresh."""
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    a.build()
+    # Baseline skill count
+    baseline = asyncio.run(a.mcp.list_tools())
+    assert "researcher-primary.new_skill" not in {t.name for t in baseline}
+
+    # Agent re-registers with an added skill (simulates an in-place reload)
+    bus_client.post("/v1/register", json={
+        "id": "researcher-primary",
+        "callback": "http://localhost:9001",
+        "pid": 1,
+        "version": "0.7.0",
+        "skills": [
+            {"name": "find_papers", "description": "Search for papers"},
+            {"name": "synergize", "description": "Classify concepts"},
+            {"name": "new_skill", "description": "Added during this test"},
+        ],
+    })
+
+    diff = a.refresh_skills()
+    assert "researcher-primary.new_skill" in diff["added"]
+    after = asyncio.run(a.mcp.list_tools())
+    assert "researcher-primary.new_skill" in {t.name for t in after}
+
+
+def test_refresh_skills_removes_tool_when_agent_deregisters(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    a.build()
+    assert "developer-primary.read_spec" in {
+        t.name for t in asyncio.run(a.mcp.list_tools())
+    }
+
+    # Deregister the agent — bus drops its skills from /v1/services
+    bus_client.post("/v1/deregister", json={"id": "developer-primary"})
+
+    diff = a.refresh_skills()
+    assert "developer-primary.read_spec" in diff["removed"]
+    after = {t.name for t in asyncio.run(a.mcp.list_tools())}
+    assert "developer-primary.read_spec" not in after
+
+
+def test_refresh_skills_idempotent_with_no_changes(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    a.build()
+    diff = a.refresh_skills()
+    # Initial build already registered the live skills; no-op on second pass.
+    assert diff == {"added": [], "removed": []}
+
+
+def test_refresh_skills_preserves_bus_and_flow_tools(bus_client):
+    """Reconciliation only touches skill tools, not bus_* or flow tools."""
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    a.build()
+    bus_client.post("/v1/deregister", json={"id": "researcher-primary"})
+    bus_client.post("/v1/deregister", json={"id": "developer-primary"})
+
+    diff = a.refresh_skills()
+    # All per-skill tools should disappear; bus_* and flow tool remain registered.
+    names = {t.name for t in asyncio.run(a.mcp.list_tools())}
+    assert "bus_services" in names
+    assert "bus_start_agent" in names
+    assert "bus_refresh_skills" in names
+    assert "researcher-primary.find_papers" not in names
+    assert "developer-primary.read_spec" not in names
+    # Removals should list each deregistered skill
+    assert "researcher-primary.find_papers" in diff["removed"]
+    assert "developer-primary.read_spec" in diff["removed"]
+
+
+def test_bus_refresh_skills_tool_reports_no_changes(adapter):
+    mcp = adapter.build()
+    result = asyncio.run(mcp.call_tool("bus_refresh_skills", {}))
+    text = _extract_text(result)
+    assert text.strip() == "no changes"
+
+
+def test_bus_refresh_skills_tool_reports_added(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    mcp = a.build()
+    bus_client.post("/v1/register", json={
+        "id": "researcher-primary",
+        "callback": "http://localhost:9001",
+        "pid": 1,
+        "version": "0.7.0",
+        "skills": [
+            {"name": "find_papers", "description": "Search for papers"},
+            {"name": "synergize", "description": "Classify concepts"},
+            {"name": "brand_new", "description": "Freshly added"},
+        ],
+    })
+    result = asyncio.run(mcp.call_tool("bus_refresh_skills", {}))
+    text = _extract_text(result)
+    assert "brand_new" in text
+    assert "+1" in text
+
+
+class _StubSession:
+    """Tracks send_tool_list_changed calls for notification tests."""
+    def __init__(self):
+        self.notify_calls = 0
+
+    async def send_tool_list_changed(self):
+        self.notify_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_notify_list_changed_fires_when_ctx_provided(adapter):
+    adapter.build()
+    session = _StubSession()
+
+    class _Ctx:
+        def __init__(self, sess):
+            self.session = sess
+
+    ctx = _Ctx(session)
+    await adapter._notify_list_changed(ctx)
+    assert session.notify_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_notify_list_changed_tolerates_missing_method(adapter):
+    """Older MCP library versions may lack send_tool_list_changed — never crash."""
+    adapter.build()
+
+    class _OldSession:
+        pass
+
+    class _Ctx:
+        def __init__(self):
+            self.session = _OldSession()
+
+    # Should not raise
+    await adapter._notify_list_changed(_Ctx())
 
 
 def _extract_text(result) -> str:

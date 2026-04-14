@@ -33,7 +33,7 @@ import sys
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 logger = logging.getLogger(__name__)
 
@@ -176,43 +176,76 @@ class BusMCPAdapter:
             return "\n".join(lines)
 
         @mcp.tool()
-        async def bus_start_agent(agent_id: str) -> str:
+        async def bus_start_agent(agent_id: str, ctx: Context | None = None) -> str:
             """Start an installed agent. Idempotent — returns 'already_running' if up.
 
             Thin wrapper over POST /v1/install/{id}/start. The bus owns
             subprocess spawning and registration tracking; this tool just
             triggers it and formats the structured response.
+
+            After the start completes, adapter refreshes its skill-tool
+            registry (the agent may advertise new skills) and fires
+            ``tools/list_changed`` so the MCP client re-lists tools.
             """
-            return _format_lifecycle(
-                "start",
-                agent_id,
-                await adapter._async_post(f"/v1/install/{agent_id}/start", {}),
-            )
+            result = await adapter._async_post(f"/v1/install/{agent_id}/start", {})
+            response = _format_lifecycle("start", agent_id, result)
+            await adapter._refresh_and_notify(ctx)
+            return response
 
         @mcp.tool()
-        async def bus_stop_agent(agent_id: str) -> str:
+        async def bus_stop_agent(agent_id: str, ctx: Context | None = None) -> str:
             """Stop a running agent and deregister it from the bus.
 
-            Thin wrapper over POST /v1/install/{id}/stop.
+            Thin wrapper over POST /v1/install/{id}/stop. Refreshes the
+            adapter's skill-tool registry afterwards (the stopped agent's
+            tools go away) and fires ``tools/list_changed``.
             """
-            return _format_lifecycle(
-                "stop",
-                agent_id,
-                await adapter._async_post(f"/v1/install/{agent_id}/stop", {}),
-            )
+            result = await adapter._async_post(f"/v1/install/{agent_id}/stop", {})
+            response = _format_lifecycle("stop", agent_id, result)
+            await adapter._refresh_and_notify(ctx)
+            return response
 
         @mcp.tool()
-        async def bus_restart_agent(agent_id: str) -> str:
+        async def bus_restart_agent(agent_id: str, ctx: Context | None = None) -> str:
             """Restart an agent (stop + start). Returns final status and new pid.
 
             Useful for picking up code changes without external supervision.
-            Thin wrapper over POST /v1/install/{id}/restart.
+            Thin wrapper over POST /v1/install/{id}/restart. Refreshes the
+            adapter's skill-tool registry afterwards (restarted agents may
+            advertise new or different skills after a code change) and
+            fires ``tools/list_changed``.
             """
-            return _format_lifecycle(
-                "restart",
-                agent_id,
-                await adapter._async_post(f"/v1/install/{agent_id}/restart", {}),
-            )
+            result = await adapter._async_post(f"/v1/install/{agent_id}/restart", {})
+            response = _format_lifecycle("restart", agent_id, result)
+            await adapter._refresh_and_notify(ctx)
+            return response
+
+        @mcp.tool()
+        async def bus_refresh_skills(ctx: Context | None = None) -> str:
+            """Refresh the adapter's skill-tool registry against current bus state.
+
+            Closes a loop: when an agent restarts outside the MCP lifecycle
+            surface (e.g. manual respawn in an iTerm pane) and registers
+            new skills, MCP clients don't see them until this refresh runs.
+            Normally called automatically after ``bus_start_agent`` /
+            ``bus_stop_agent`` / ``bus_restart_agent``; expose it as a
+            manual escape hatch for external-lifecycle cases.
+
+            Returns a summary of added/removed tools.
+            """
+            diff = adapter.refresh_skills()
+            if ctx is not None and (diff["added"] or diff["removed"]):
+                await adapter._notify_list_changed(ctx)
+            added = len(diff["added"])
+            removed = len(diff["removed"])
+            if not (added or removed):
+                return "no changes"
+            parts = []
+            if added:
+                parts.append(f"+{added}: {', '.join(diff['added'])}")
+            if removed:
+                parts.append(f"-{removed}: {', '.join(diff['removed'])}")
+            return " | ".join(parts)
 
         @mcp.tool()
         async def bus_skills(agent_id: str = "") -> str:
@@ -239,6 +272,93 @@ class BusMCPAdapter:
             agent_id = svc["id"]
             for skill_name in svc.get("skills", []):
                 self._register_one_skill(agent_id, skill_name)
+
+    # ------------------------------------------------------------------
+    # Dynamic refresh — pick up new skills when agents reload
+    # ------------------------------------------------------------------
+
+    def refresh_skills(self) -> dict[str, list[str]]:
+        """Reconcile the MCP tool registry against current bus state.
+
+        Queries ``/v1/services``, computes the diff against the set of
+        currently-registered skill tools, and:
+
+        - Adds an ``@mcp.tool`` for each new skill (via ``_register_one_skill``)
+        - Removes the ``@mcp.tool`` for each skill whose agent went away
+
+        Returns ``{"added": [tool_name, ...], "removed": [tool_name, ...]}``.
+
+        Does NOT fire ``tools/list_changed`` on its own — callers with an
+        MCP ``Context`` in hand should call ``_notify_list_changed`` to
+        push the notification to connected clients.
+        """
+        services = self._get("/v1/services") or []
+        # Build the set of currently-live skill tool names
+        live: set[str] = set()
+        for svc in services:
+            if svc.get("status") != "healthy":
+                continue
+            agent_id = svc["id"]
+            for skill_name in svc.get("skills", []):
+                live.add(f"{agent_id}.{skill_name}")
+
+        # Skill tools (namespaced agent_id.skill_name) vs bus/flow tools (no dot
+        # or a single-component flow name). We only reconcile skill tools here;
+        # bus_* and collaborative flows are owned elsewhere.
+        currently_registered = {
+            t for t in self._registered_tools
+            if "." in t and not t.startswith("bus_")
+        }
+
+        added: list[str] = []
+        for tool_name in sorted(live - currently_registered):
+            agent_id, _, skill_name = tool_name.partition(".")
+            self._register_one_skill(agent_id, skill_name)
+            added.append(tool_name)
+
+        removed: list[str] = []
+        for tool_name in sorted(currently_registered - live):
+            try:
+                self.mcp.remove_tool(tool_name)
+            except Exception as e:
+                logger.warning("Failed to remove tool %s: %s", tool_name, e)
+                continue
+            self._registered_tools.discard(tool_name)
+            removed.append(tool_name)
+
+        if added or removed:
+            logger.info(
+                "refresh_skills: +%d -%d (added=%s removed=%s)",
+                len(added), len(removed), added, removed,
+            )
+        return {"added": added, "removed": removed}
+
+    async def _refresh_and_notify(self, ctx: Context | None) -> None:
+        """Refresh skill tools, then push ``tools/list_changed`` if we have a ctx.
+
+        Called by lifecycle handlers after start/stop/restart — these are
+        the common triggers for a skill-set change. ``ctx`` is the MCP
+        request context; without it we can't fire the notification (no
+        session handle), but the refresh itself still happens.
+        """
+        diff = self.refresh_skills()
+        if ctx is not None and (diff["added"] or diff["removed"]):
+            await self._notify_list_changed(ctx)
+
+    async def _notify_list_changed(self, ctx: Context) -> None:
+        """Fire MCP ``notifications/tools/list_changed`` to the active session.
+
+        Best-effort: some transports / clients don't support the notification,
+        and the session may not expose ``send_tool_list_changed`` on all
+        library versions. A failure here is not fatal to the overall
+        lifecycle op; log and continue.
+        """
+        try:
+            send = getattr(ctx.session, "send_tool_list_changed", None)
+            if send is not None:
+                await send()
+        except Exception as e:
+            logger.warning("tools/list_changed notification failed: %s", e)
 
     def _register_one_skill(self, agent_id: str, skill_name: str) -> None:
         tool_name = f"{agent_id}.{skill_name}"
