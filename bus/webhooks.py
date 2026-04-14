@@ -16,10 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import logging
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 
 def verify_signature(secret: str, body: bytes, signature_header: str) -> bool:

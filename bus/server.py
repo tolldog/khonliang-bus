@@ -1098,6 +1098,15 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         ``X-Hub-Signature-256``. We verify the signature against the
         configured secret, then publish to ``github.<event>[.<action>]``
         with a summarized payload plus the full GitHub body.
+
+        Auth:
+          - Normal: ``github_webhook_secret`` (config) or
+            ``GITHUB_WEBHOOK_SECRET`` (env) must be set. Invalid
+            signature → 401.
+          - Dev-only: if no secret is set AND
+            ``github_webhook_allow_unsigned`` is True in config, unsigned
+            requests are accepted. Otherwise, no-secret deployments
+            reject all posts with 503 to prevent forged-event footguns.
         """
         raw = await request.body()
         sig = request.headers.get("X-Hub-Signature-256", "")
@@ -1107,6 +1116,19 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         secret = bus.config.get("github_webhook_secret", "") or os.environ.get(
             "GITHUB_WEBHOOK_SECRET", ""
         )
+        allow_unsigned = bool(bus.config.get("github_webhook_allow_unsigned", False))
+
+        if not secret and not allow_unsigned:
+            logger.warning(
+                "GitHub webhook rejected — no secret configured and "
+                "github_webhook_allow_unsigned is not set (delivery=%s)",
+                delivery_id,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"error": "webhook receiver not configured — set github_webhook_secret or github_webhook_allow_unsigned"},
+            )
+
         if not verify_signature(secret, raw, sig):
             logger.warning("GitHub webhook signature check failed (delivery=%s)", delivery_id)
             return JSONResponse(status_code=401, content={"error": "invalid signature"})
@@ -1115,6 +1137,12 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             payload = json.loads(raw) if raw else {}
         except json.JSONDecodeError as e:
             return JSONResponse(status_code=400, content={"error": f"invalid JSON: {e}"})
+
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"webhook body must be a JSON object (got {type(payload).__name__})"},
+            )
 
         topic = build_topic(event_type, payload)
         summary = summarize(event_type, payload)
