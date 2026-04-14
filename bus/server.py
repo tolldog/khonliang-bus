@@ -21,7 +21,8 @@ import uuid
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from bus.db import BusDB
@@ -29,6 +30,7 @@ from bus.flows import FlowEngine
 from bus.orchestrator import Orchestrator
 from bus.scheduler import SchedulerIntegration
 from bus.versions import validate_collaboration_requirements
+from bus.webhooks import build_topic, summarize, verify_signature
 
 logger = logging.getLogger(__name__)
 
@@ -1085,6 +1087,48 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.post("/v1/publish")
     async def publish(req: PublishRequest):
         return await bus.publish(req)
+
+    # -- external webhooks --
+
+    @app.post("/v1/webhooks/github")
+    async def github_webhook(request: Request):
+        """Receive a GitHub webhook and publish it as a bus event.
+
+        GitHub posts JSON with ``X-GitHub-Event`` and (optionally)
+        ``X-Hub-Signature-256``. We verify the signature against the
+        configured secret, then publish to ``github.<event>[.<action>]``
+        with a summarized payload plus the full GitHub body.
+        """
+        raw = await request.body()
+        sig = request.headers.get("X-Hub-Signature-256", "")
+        event_type = request.headers.get("X-GitHub-Event", "unknown")
+        delivery_id = request.headers.get("X-GitHub-Delivery", "")
+
+        secret = bus.config.get("github_webhook_secret", "") or os.environ.get(
+            "GITHUB_WEBHOOK_SECRET", ""
+        )
+        if not verify_signature(secret, raw, sig):
+            logger.warning("GitHub webhook signature check failed (delivery=%s)", delivery_id)
+            return JSONResponse(status_code=401, content={"error": "invalid signature"})
+
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as e:
+            return JSONResponse(status_code=400, content={"error": f"invalid JSON: {e}"})
+
+        topic = build_topic(event_type, payload)
+        summary = summarize(event_type, payload)
+        summary["delivery_id"] = delivery_id
+
+        # Publish the summary + the full payload so subscribers can
+        # pick whichever level of detail they need.
+        result = await bus.publish(PublishRequest(
+            topic=topic,
+            payload={"summary": summary, "github": payload},
+            source="github-webhook",
+        ))
+        logger.info("GitHub webhook %s (delivery=%s) → %s msg=%s", event_type, delivery_id, topic, result.get("id"))
+        return {"status": "published", "topic": topic, "message_id": result.get("id"), "delivery_id": delivery_id}
 
     @app.post("/v1/ack")
     def ack(req: AckRequest):
