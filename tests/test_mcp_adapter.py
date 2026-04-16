@@ -170,6 +170,95 @@ def test_bus_artifact_tail_tool(bus_client):
     assert "pytest_log" in text
 
 
+def test_skill_proxy_returns_response_envelope(adapter):
+    async def mock_request(agent_id, operation, args):
+        assert agent_id == "researcher-primary"
+        assert operation == "find_papers"
+        assert args == {"query": "context budgets"}
+        return {"result": "Found 3 papers\nUse artifact-backed responses."}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    result = asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {"args": json.dumps({"query": "context budgets"})},
+    ))
+    payload = json.loads(_extract_text(result))
+    assert payload["ok"] is True
+    assert payload["status"] == "ok"
+    assert payload["summary"].startswith("researcher-primary.find_papers:")
+    assert payload["content"] == "Found 3 papers\nUse artifact-backed responses."
+    assert payload["artifact_ids"] == []
+    assert payload["omitted"] is False
+
+
+def test_skill_proxy_stores_large_result_as_artifact(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    large = "\n".join(f"FAILED test_{i}: AssertionError details" for i in range(1000))
+
+    async def mock_request(agent_id, operation, args):
+        assert "_response_budget_chars" not in args
+        return {"result": large}
+
+    async def mock_post(path, body, http_timeout=None):
+        assert path == "/v1/artifacts"
+        response = bus_client.post(path, json=body)
+        assert response.status_code == 200
+        return response.json()
+
+    a._async_request = mock_request
+    a._async_post = mock_post
+    mcp = a.build()
+    result = asyncio.run(mcp.call_tool(
+        "developer-primary.read_spec",
+        {"args": json.dumps({"_response_budget_chars": 1200})},
+    ))
+    text = _extract_text(result)
+    payload = json.loads(text)
+    assert len(text) < 4000
+    assert payload["omitted"] is True
+    assert payload["truncated"] is True
+    assert payload["metrics"]["raw_chars"] == len(large)
+    assert payload["metrics"]["inline_budget_chars"] == 1200
+    assert payload["artifact_ids"]
+    assert "FAILED test_999" not in text
+
+    artifact = bus_client.get(f"/v1/artifacts/{payload['artifact_ids'][0]}").json()
+    assert artifact["kind"] == "tool_result"
+    assert artifact["producer"] == "developer-primary"
+    assert artifact["size_bytes"] == len(large.encode("utf-8"))
+
+
+def test_flow_proxy_stores_large_result_as_artifact(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    large = {"stdout": "\n".join(f"+ changed line {i}" for i in range(800))}
+
+    async def mock_post(path, body, http_timeout=None):
+        if path == "/v1/flow":
+            assert body["args"] == {"path": "/tmp/spec.md"}
+            return {"result": large}
+        if path == "/v1/artifacts":
+            response = bus_client.post(path, json=body)
+            assert response.status_code == 200
+            return response.json()
+        raise AssertionError(path)
+
+    a._async_post = mock_post
+    mcp = a.build()
+    result = asyncio.run(mcp.call_tool(
+        "evaluate_spec",
+        {"args": json.dumps({"path": "/tmp/spec.md", "_response_budget_chars": 1000})},
+    ))
+    text = _extract_text(result)
+    payload = json.loads(text)
+    assert len(text) < 4000
+    assert payload["summary"].startswith("flow.evaluate_spec:")
+    assert payload["artifact_ids"]
+    assert payload["refs"][0]["kind"] == "tool_result"
+
+
 def test_bus_trace_tool_empty(adapter):
     mcp = adapter.build()
     result = asyncio.run(mcp.call_tool("bus_trace", {"trace_id": "nonexistent"}))
