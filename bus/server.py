@@ -134,6 +134,19 @@ class GapReport(BaseModel):
     context: dict[str, Any] = {}
 
 
+class FeedbackReport(BaseModel):
+    agent_id: str
+    kind: str
+    operation: str = ""
+    area: str = ""
+    category: str = ""
+    severity: str = ""
+    message: str = ""
+    context: dict[str, Any] = {}
+    suggestion: str = ""
+    fingerprint: str = ""
+
+
 class ArtifactCreateRequest(BaseModel):
     kind: str
     title: str
@@ -162,6 +175,11 @@ class ArtifactDistillManyRequest(BaseModel):
 
 VALID_RESPONSE_MODES = {"raw", "extracted", "distilled"}
 VALID_GAP_STATUSES = {"open", "reviewed", "dismissed"}
+VALID_FEEDBACK_KINDS = {"gap", "friction", "suggestion"}
+VALID_FRICTION_CATEGORIES = {
+    "token", "latency", "round_trip", "routing", "format", "retry", "fallback"
+}
+VALID_FEEDBACK_SEVERITIES = {"", "low", "medium", "high"}
 VALID_VERDICTS = {"accept", "push_back", "escalate"}
 
 
@@ -904,6 +922,7 @@ class BusServer:
           {"type": "error", "correlation_id": "...", "error": "...", "retryable": bool}
           {"type": "publish", "topic": "...", "payload": {...}}
           {"type": "gap", "operation": "...", "reason": "...", "context": {...}}
+          {"type": "feedback", "kind": "gap|friction|suggestion", ...}
           {"type": "deregister"}
 
         Bus → Agent:
@@ -971,6 +990,21 @@ class BusServer:
                             reason=data.get("reason", ""),
                             context=data.get("context", {}),
                         )
+
+                elif msg_type == "feedback":
+                    if agent_id:
+                        self.report_feedback(FeedbackReport(
+                            agent_id=agent_id,
+                            kind=data.get("kind", ""),
+                            operation=data.get("operation", ""),
+                            area=data.get("area", ""),
+                            category=data.get("category", ""),
+                            severity=data.get("severity", ""),
+                            message=data.get("message", ""),
+                            context=data.get("context", {}),
+                            suggestion=data.get("suggestion", ""),
+                            fingerprint=data.get("fingerprint", ""),
+                        ))
 
                 elif msg_type == "deregister":
                     break
@@ -1070,6 +1104,55 @@ class BusServer:
                 return {"error": f"gap {gap_id} not found"}
         self.db.update_gap_status(gap_id, status)
         return {"gap_id": gap_id, "status": status}
+
+    def report_feedback(self, req: FeedbackReport) -> dict:
+        if req.kind not in VALID_FEEDBACK_KINDS:
+            return {"error": f"invalid kind: {req.kind!r}. Must be one of {VALID_FEEDBACK_KINDS}"}
+        if req.severity not in VALID_FEEDBACK_SEVERITIES:
+            return {"error": f"invalid severity: {req.severity!r}. Must be one of {VALID_FEEDBACK_SEVERITIES}"}
+        if req.kind == "friction" and req.category not in VALID_FRICTION_CATEGORIES:
+            return {"error": f"invalid friction category: {req.category!r}. Must be one of {VALID_FRICTION_CATEGORIES}"}
+
+        message = req.message
+        if req.kind == "gap":
+            message = message or req.context.get("what_was_needed", "")
+        elif req.kind == "friction":
+            message = message or req.suggestion or req.category
+        elif req.kind == "suggestion":
+            message = message or req.suggestion or req.area
+        if not message:
+            return {"error": "message is required"}
+
+        result = self.db.report_feedback(
+            agent_id=req.agent_id,
+            kind=req.kind,
+            operation=req.operation,
+            area=req.area,
+            category=req.category,
+            severity=req.severity,
+            message=message,
+            context=req.context,
+            suggestion=req.suggestion,
+            fingerprint=req.fingerprint,
+        )
+        logger.info("Feedback reported by %s: %s %s", req.agent_id, req.kind, message)
+        return result
+
+    def get_feedback(
+        self,
+        agent_id: str = "",
+        kind: str = "",
+        status: str = "open",
+        since: str = "",
+        limit: int = 50,
+    ) -> list[dict]:
+        return self.db.get_feedback(
+            agent_id=agent_id,
+            kind=kind,
+            status=status,
+            since=since,
+            limit=limit,
+        )
 
     # -- response evaluation --
 
@@ -1480,6 +1563,29 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
                 raise HTTPException(status_code=404, detail=error)
             raise HTTPException(status_code=422, detail=error)
         return result
+
+    @app.post("/v1/feedback")
+    def report_feedback(req: FeedbackReport):
+        result = bus.report_feedback(req)
+        if "error" in result:
+            raise HTTPException(status_code=422, detail=result["error"])
+        return result
+
+    @app.get("/v1/feedback")
+    def get_feedback(
+        agent_id: str = "",
+        kind: str = "",
+        status: str = "open",
+        since: str = "",
+        limit: int = 50,
+    ):
+        return bus.get_feedback(
+            agent_id=agent_id,
+            kind=kind,
+            status=status,
+            since=since,
+            limit=limit,
+        )
 
     # -- response evaluation --
 

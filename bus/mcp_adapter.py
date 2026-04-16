@@ -324,6 +324,27 @@ class BusMCPAdapter:
             return "\n".join(lines).strip()
 
         @mcp.tool()
+        async def bus_feedback(
+            agent_id: str = "",
+            kind: str = "",
+            status: str = "open",
+            since: str = "",
+            limit: int = 20,
+        ) -> str:
+            """Query structured agent feedback reports."""
+            reports = adapter._get(
+                "/v1/feedback",
+                params={
+                    "agent_id": agent_id,
+                    "kind": kind,
+                    "status": status,
+                    "since": since,
+                    "limit": limit,
+                },
+            )
+            return json.dumps(reports or [], indent=2)
+
+        @mcp.tool()
         async def bus_artifact_list(
             session_id: str = "",
             kind: str = "",
@@ -733,7 +754,7 @@ def main():
 
     logger.info(
         "Bus-MCP adapter started. %d tools registered. Bus: %s",
-        len(adapter._registered_tools) + 20,  # +20 for built-in bus tools
+        len(adapter._registered_tools) + 21,  # +21 for built-in bus tools
         args.bus,
     )
 

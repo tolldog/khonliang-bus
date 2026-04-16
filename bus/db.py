@@ -116,6 +116,31 @@ CREATE TABLE IF NOT EXISTS gaps (
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Persistent: structured agent feedback beyond hard gaps. Gaps remain for
+-- backwards compatibility; feedback_reports is queryable by kind, area,
+-- operation, severity, and de-duplicated fingerprint.
+CREATE TABLE IF NOT EXISTS feedback_reports (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id    TEXT NOT NULL,
+    kind        TEXT NOT NULL,      -- gap | friction | suggestion
+    operation   TEXT NOT NULL DEFAULT '',
+    area        TEXT NOT NULL DEFAULT '',
+    category    TEXT NOT NULL DEFAULT '',
+    severity    TEXT NOT NULL DEFAULT '',
+    message     TEXT NOT NULL,
+    context     TEXT NOT NULL DEFAULT '{}',
+    suggestion  TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'open',
+    fingerprint TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    count       INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_kind ON feedback_reports(kind, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_agent ON feedback_reports(agent_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_fingerprint ON feedback_reports(fingerprint, status);
+
 -- Persistent: response evaluations (push-back, escalation)
 CREATE TABLE IF NOT EXISTS evaluations (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -508,7 +533,15 @@ class BusDB:
                 "INSERT INTO gaps (agent_id, operation, reason, context) VALUES (?, ?, ?, ?)",
                 (agent_id, operation, reason, json.dumps(context or {})),
             )
-            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            gap_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.report_feedback(
+            agent_id=agent_id,
+            kind="gap",
+            operation=operation,
+            message=reason,
+            context=context or {},
+        )
+        return gap_id
 
     def get_gaps(self, status: str = "open") -> list[dict[str, Any]]:
         with self.conn() as c:
@@ -521,6 +554,113 @@ class BusDB:
     def update_gap_status(self, gap_id: int, status: str) -> None:
         with self.conn() as c:
             c.execute("UPDATE gaps SET status = ? WHERE id = ?", (status, gap_id))
+
+    # -- structured feedback --
+
+    def report_feedback(
+        self,
+        *,
+        agent_id: str,
+        kind: str,
+        message: str,
+        operation: str = "",
+        area: str = "",
+        category: str = "",
+        severity: str = "",
+        context: dict | None = None,
+        suggestion: str = "",
+        fingerprint: str = "",
+    ) -> dict[str, Any]:
+        context = context or {}
+        fingerprint = fingerprint or _feedback_fingerprint(
+            agent_id=agent_id,
+            kind=kind,
+            operation=operation,
+            area=area,
+            category=category,
+            message=message,
+        )
+        with self.conn() as c:
+            existing = c.execute(
+                """
+                SELECT id, count FROM feedback_reports
+                WHERE fingerprint = ? AND status = 'open'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (fingerprint,),
+            ).fetchone()
+            if existing:
+                c.execute(
+                    """
+                    UPDATE feedback_reports
+                    SET count = count + 1,
+                        updated_at = datetime('now'),
+                        context = ?,
+                        suggestion = CASE WHEN ? != '' THEN ? ELSE suggestion END
+                    WHERE id = ?
+                    """,
+                    (json.dumps(context), suggestion, suggestion, existing["id"]),
+                )
+                return {"feedback_id": existing["id"], "status": "deduped", "count": existing["count"] + 1}
+
+            c.execute(
+                """
+                INSERT INTO feedback_reports (
+                    agent_id, kind, operation, area, category, severity,
+                    message, context, suggestion, fingerprint
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    kind,
+                    operation,
+                    area,
+                    category,
+                    severity,
+                    message,
+                    json.dumps(context),
+                    suggestion,
+                    fingerprint,
+                ),
+            )
+            return {"feedback_id": c.execute("SELECT last_insert_rowid()").fetchone()[0], "status": "open", "count": 1}
+
+    def get_feedback(
+        self,
+        *,
+        agent_id: str = "",
+        kind: str = "",
+        status: str = "open",
+        since: str = "",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        clauses = []
+        params: list[Any] = []
+        if agent_id:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if since:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.conn() as c:
+            rows = c.execute(
+                f"""
+                SELECT * FROM feedback_reports {where}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
 
     # -- evaluations --
 
@@ -560,3 +700,23 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             except (json.JSONDecodeError, TypeError):
                 pass
     return d
+
+
+def _feedback_fingerprint(
+    *,
+    agent_id: str,
+    kind: str,
+    operation: str,
+    area: str,
+    category: str,
+    message: str,
+) -> str:
+    parts = [
+        agent_id.strip(),
+        kind.strip(),
+        operation.strip(),
+        area.strip(),
+        category.strip(),
+        " ".join(message.lower().split())[:200],
+    ]
+    return "|".join(parts)

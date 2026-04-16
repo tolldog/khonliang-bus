@@ -108,6 +108,29 @@ def test_agent_ws_gap_report(client):
     assert gaps[0]["reason"] == "I don't know how to do this"
 
 
+def test_agent_ws_feedback_report(client):
+    with client.websocket_connect("/v1/agent") as ws:
+        ws.send_json({"type": "register", "id": "ws-feedback", "skills": []})
+        ws.receive_json()
+
+        ws.send_json({
+            "type": "feedback",
+            "kind": "friction",
+            "operation": "run_tests",
+            "category": "token",
+            "severity": "medium",
+            "message": "raw pytest output was too large",
+            "context": {"raw_bytes": 100000},
+            "suggestion": "store raw output as artifact",
+        })
+
+    feedback = client.get("/v1/feedback", params={"kind": "friction"}).json()
+    assert len(feedback) == 1
+    assert feedback[0]["agent_id"] == "ws-feedback"
+    assert feedback[0]["category"] == "token"
+    assert feedback[0]["context"]["raw_bytes"] == 100000
+
+
 def test_agent_ws_request_round_trip(tmp_path):
     """Full WS round-trip: bus dispatches a request to the agent, agent responds.
 
