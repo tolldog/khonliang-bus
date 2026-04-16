@@ -128,6 +128,28 @@ artifact and return the artifact id with suggested retrieval commands such as
 `bus_artifact_tail`, `bus_artifact_grep`, `bus_artifact_excerpt`, or
 `bus_artifact_distill`.
 
+## Agent Feedback
+
+Agents can report structured feedback to the bus when a workflow reveals a
+missing capability, costly friction, or improvement opportunity.
+
+Feedback kinds:
+
+- `gap`: expected capability is missing or insufficient.
+- `friction`: operation succeeded but was costly or awkward. Categories are
+  `token`, `latency`, `round_trip`, `routing`, `format`, `retry`, and
+  `fallback`.
+- `suggestion`: improvement opportunity not tied to a failing operation.
+
+HTTP agents can `POST /v1/feedback`. WebSocket agents can send
+`{"type": "feedback", "kind": "...", ...}`. Reports are queryable with
+`GET /v1/feedback` or the `bus_feedback` MCP tool, filtered by `agent_id`,
+`kind`, `status`, and `since`. Repeated open reports with the same fingerprint
+are de-duplicated and counted.
+
+The older `POST /v1/gap` API remains compatible and also creates a structured
+`gap` feedback report.
+
 ## Status
 
 **v0.1** — initial release

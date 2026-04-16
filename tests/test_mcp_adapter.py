@@ -72,7 +72,7 @@ def test_build_registers_bus_tools(adapter):
     # Bus management tools
     for bus_tool in (
         "bus_services", "bus_status", "bus_matrix", "bus_flows",
-        "bus_trace", "bus_skills", "bus_artifact_list",
+        "bus_trace", "bus_skills", "bus_feedback", "bus_artifact_list",
         "bus_artifact_metadata", "bus_artifact_head", "bus_artifact_tail",
         "bus_artifact_get", "bus_artifact_grep", "bus_artifact_excerpt",
         "bus_artifact_distill", "bus_artifact_distill_many",
@@ -104,8 +104,8 @@ def test_build_registers_flow_tools(adapter):
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
-    # 20 bus tools (11 existing + 9 artifact tools) + 3 skills + 1 flow = 24
-    assert len(tools) == 24
+    # 21 bus tools (12 existing + 9 artifact tools) + 3 skills + 1 flow = 25
+    assert len(tools) == 25
 
 
 def test_bus_services_tool(adapter):
@@ -168,6 +168,31 @@ def test_bus_artifact_tail_tool(bus_client):
     assert "line 18" in text
     assert "line 19" in text
     assert "pytest_log" in text
+
+
+def test_bus_feedback_tool(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    posted = bus_client.post("/v1/feedback", json={
+        "agent_id": "developer-primary",
+        "kind": "friction",
+        "operation": "next_work_unit",
+        "category": "format",
+        "severity": "medium",
+        "message": "JSON string had to be unwrapped client-side",
+        "suggestion": "Return parsed envelope content",
+    })
+    assert posted.status_code == 200
+
+    mcp = a.build()
+    result = asyncio.run(mcp.call_tool(
+        "bus_feedback",
+        {"agent_id": "developer-primary", "kind": "friction"},
+    ))
+    payload = json.loads(_extract_text(result))
+    assert len(payload) == 1
+    assert payload[0]["category"] == "format"
+    assert payload[0]["message"] == "JSON string had to be unwrapped client-side"
 
 
 def test_skill_proxy_returns_response_envelope(adapter):

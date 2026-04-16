@@ -15,6 +15,12 @@ def test_report_gap(client):
     assert r["status"] == "open"
     assert "gap_id" in r
 
+    feedback = client.get("/v1/feedback", params={"kind": "gap"}).json()
+    assert len(feedback) == 1
+    assert feedback[0]["agent_id"] == "researcher-1"
+    assert feedback[0]["operation"] == "analyze_video"
+    assert feedback[0]["message"] == "Video analysis not implemented"
+
 
 def test_list_gaps(client):
     client.post("/v1/gap", json={
@@ -40,6 +46,61 @@ def test_update_gap_status(client):
 
     gaps = client.get("/v1/gaps", params={"status": "reviewed"}).json()
     assert len(gaps) == 1
+
+
+def test_report_friction_feedback(client):
+    r = client.post("/v1/feedback", json={
+        "agent_id": "developer-primary",
+        "kind": "friction",
+        "operation": "next_work_unit",
+        "category": "format",
+        "severity": "medium",
+        "message": "JSON string had to be unwrapped client-side",
+        "context": {"tool": "developer_primary_next_work_unit"},
+        "suggestion": "Return parsed envelope content",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "open"
+    assert body["count"] == 1
+
+    feedback = client.get("/v1/feedback", params={"kind": "friction"}).json()
+    assert len(feedback) == 1
+    assert feedback[0]["category"] == "format"
+    assert feedback[0]["severity"] == "medium"
+    assert feedback[0]["context"]["tool"] == "developer_primary_next_work_unit"
+
+
+def test_feedback_deduplicates_open_reports(client):
+    payload = {
+        "agent_id": "developer-primary",
+        "kind": "friction",
+        "operation": "run_tests",
+        "category": "latency",
+        "severity": "low",
+        "message": "test run exceeded latency threshold",
+    }
+    first = client.post("/v1/feedback", json=payload).json()
+    second = client.post("/v1/feedback", json=payload).json()
+    assert first["status"] == "open"
+    assert second["status"] == "deduped"
+    assert second["feedback_id"] == first["feedback_id"]
+    assert second["count"] == 2
+
+    feedback = client.get("/v1/feedback").json()
+    assert len(feedback) == 1
+    assert feedback[0]["count"] == 2
+
+
+def test_invalid_feedback_rejected(client):
+    r = client.post("/v1/feedback", json={
+        "agent_id": "developer-primary",
+        "kind": "friction",
+        "operation": "run_tests",
+        "category": "not-a-kind",
+        "message": "bad category",
+    })
+    assert r.status_code == 422
 
 
 def test_evaluate_accept(client):
