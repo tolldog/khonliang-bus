@@ -1,105 +1,127 @@
 # khonliang-bus
 
-A cross-app event bus and service registry for the khonliang ecosystem.
+Python agent orchestration platform for the khonliang ecosystem.
 
-Provides push notifications, service discovery, and pub/sub between MCP servers, agents, and applications. Designed so a developer MCP can subscribe to events from the researcher and other apps without each project reinventing its own messaging layer.
+The bus is the single MCP surface Claude connects to. Agents register skills
+with the bus, the MCP adapter exposes those skills as tools, and requests are
+routed through the bus instead of loading every project MCP directly.
 
-## Features
+## What It Provides
 
-- **HTTP + WebSocket transport** — simple and universal
-- **Pluggable backends** — `memory`, `sqlite`, `redis` (planned)
-- **Durable subscriptions** — offline subscribers receive missed messages on reconnect
-- **Service registry** — TTL-based heartbeat tracking
-- **Go and Python clients** — auto-registering, ergonomic APIs
+- **Single MCP adapter** for Claude-facing tools.
+- **Agent lifecycle**: install, start, stop, restart, heartbeat, and service
+  registry.
+- **Request/reply routing** to registered agent callback URLs.
+- **Pub/sub and long-poll waits** for cross-agent events.
+- **Collaborative flows** built from registered agent skills.
+- **Sessions** for long-running agent work.
+- **Artifacts** for large outputs, logs, diffs, test output, and distilled
+  context.
+- **Response envelopes** that keep MCP responses bounded by default.
+- **GitHub webhook ingestion** for repository events.
 
 ## Quick Start
 
+Install the package in the active environment:
+
 ```bash
-# Build the bus
-go build -o bin/khonliang-bus ./cmd/khonliang-bus
-
-# Run with default config (memory backend, port 8787)
-./bin/khonliang-bus
-
-# Or with a config file
-./bin/khonliang-bus -config config/bus.yaml
+python -m pip install -e .
 ```
 
-### Python client
+Run the bus HTTP service:
 
-```python
-from khonliang_bus import BusClient
-
-bus = BusClient(
-    base_url="http://localhost:8787",
-    subscriber_id="researcher",
-    topics=["paper.distilled"],
-)
-
-bus.publish("paper.distilled", {"id": "abc123", "title": "..."})
+```bash
+python -m bus --port 8788 --db /tmp/khonliang-bus.db
 ```
 
-### Go client
+Run the MCP adapter against that bus:
 
-```go
-import "github.com/tolldog/khonliang-bus/pkg/client"
+```bash
+python -m bus.mcp_adapter --bus http://localhost:8788
+```
 
-bus, _ := client.New("http://localhost:8787", "developer-mcp")
-bus.Register([]string{"fr.completed"}, nil)
+Example local `.mcp.json` entry:
 
-sub, _ := bus.Subscribe(ctx, "paper.distilled", "")
-for msg := range sub.Messages() {
-    handle(msg)
-    bus.Ack(msg.ID)
+```json
+{
+  "mcpServers": {
+    "khonliang-bus": {
+      "command": "python",
+      "args": ["-m", "bus.mcp_adapter", "--bus", "http://localhost:8788"]
+    }
+  }
 }
 ```
 
-## Architecture
+Keep `.mcp.json` local and git-ignored. It contains machine-specific command
+paths and live service URLs.
 
+## Current Architecture
+
+```text
+Claude
+  |
+  | stdio MCP
+  v
+bus.mcp_adapter
+  |
+  | HTTP request/reply
+  v
+khonliang-bus FastAPI service
+  |
+  +-- service registry and lifecycle
+  +-- pub/sub and wait_for_event
+  +-- sessions and artifacts
+  +-- flow orchestration
+  |
+  +-- developer agent skills
+  +-- researcher agent skills
+  +-- future domain agents
 ```
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│  researcher MCP  │    │  developer MCP   │    │   your app       │
-└────────┬─────────┘    └────────┬─────────┘    └────────┬─────────┘
-         │                       │                       │
-         │ pub/sub               │ pub/sub               │ pub/sub
-         │ (WebSocket)           │                       │
-         └───────────┬───────────┴───────────┬───────────┘
-                     │                       │
-                ┌────┴───────────────────────┴────┐
-                │       khonliang-bus              │
-                │  ┌──────────┐  ┌─────────────┐  │
-                │  │ Registry │  │  Pub/Sub    │  │
-                │  └──────────┘  └─────┬───────┘  │
-                │         ┌────────────┴───────┐  │
-                │         │ Storage Backend    │  │
-                │         │ memory|sqlite|redis│  │
-                │         └────────────────────┘  │
-                └──────────────────────────────────┘
-```
 
-## Configuration
+The old Go bus implementation has been retired. The current bus is the Python
+service in `bus/`, with shared agent clients supplied by `khonliang-bus-lib`.
 
-```yaml
-# config/bus.yaml
-listen: ":8787"
+## Agent Lifecycle
 
-backend:
-  type: sqlite          # memory | sqlite | redis
-  sqlite:
-    path: data/bus.db
-  retention:
-    messages_ttl: 168h        # 7d
+The bus owns installed agent process lifecycle. Agents register with a callback
+URL, heartbeat, and advertise their skills/collaborations.
 
-registry:
-  heartbeat_interval: 30s
-```
+Common MCP tools:
+
+- `bus_services` lists registered agents and health.
+- `bus_status` summarizes registered/installed agents, skills, and flows.
+- `bus_start_agent(agent_id)` starts an installed agent.
+- `bus_stop_agent(agent_id)` stops an installed agent.
+- `bus_restart_agent(agent_id)` restarts an installed agent.
+- `bus_refresh_skills()` refreshes MCP tools after agent skill changes.
+
+Skill tools are generated dynamically from agent registrations. Tool names are
+namespaced by agent id, for example `developer-primary_next_work_unit`.
+
+## Artifacts
+
+Artifacts are the context firewall for large outputs. Agents should store raw
+logs, command output, diffs, file bodies, research extracts, and long summaries
+as artifacts, then return compact refs through MCP.
+
+Useful artifact tools:
+
+- `bus_artifact_head`
+- `bus_artifact_tail`
+- `bus_artifact_grep`
+- `bus_artifact_excerpt`
+- `bus_artifact_get`
+- `bus_artifact_distill`
+- `bus_artifact_distill_many`
+
+Use artifacts instead of inlining raw pytest output, full command stdout/stderr,
+large diffs, large FR lists, or full file contents.
 
 ## MCP Response Budgets
 
-The bus MCP adapter is a context firewall. Agent skill and flow calls return a
-bounded JSON envelope by default instead of inlining large raw outputs.
-
-Envelope fields include:
+The MCP adapter wraps agent responses in bounded envelopes by default. Envelope
+fields include:
 
 - `ok` / `status`
 - `summary`
@@ -111,56 +133,74 @@ Envelope fields include:
 
 Default inline budget is 8,000 characters. Non-high-detail calls are capped at
 16,000 characters even if a caller requests more with `_response_budget_chars`.
-Callers can pass `_allow_high_detail: true` to raise the ceiling for explicit
-inspection, but large outputs should still be retrieved through artifact
-helpers.
+Callers can pass `_allow_high_detail: true` for explicit inspection, but large
+outputs should still be retrieved through artifact helpers.
 
 Agent authors should treat `detail` like this:
 
 - `compact`: one-line status, counts, and artifact refs.
 - `brief`: actionable summary, top findings, and artifact refs.
-- `full`: richer summary, but still no raw logs, full diffs, file bodies, or
-  context dumps inline.
+- `full`: richer summary, still no raw logs, full diffs, file bodies, or context
+  dumps inline.
 
-Never return raw pytest output, full command stdout/stderr, complete diffs,
-large FR lists, or file bodies inline by default. Store raw material as an
-artifact and return the artifact id with suggested retrieval commands such as
-`bus_artifact_tail`, `bus_artifact_grep`, `bus_artifact_excerpt`, or
-`bus_artifact_distill`.
+## Feedback
 
-## Agent Feedback
-
-Agents can report structured feedback to the bus when a workflow reveals a
-missing capability, costly friction, or improvement opportunity.
+Agents can report structured feedback when a workflow reveals a missing
+capability, costly friction, or improvement opportunity.
 
 Feedback kinds:
 
 - `gap`: expected capability is missing or insufficient.
-- `friction`: operation succeeded but was costly or awkward. Categories are
-  `token`, `latency`, `round_trip`, `routing`, `format`, `retry`, and
-  `fallback`.
+- `friction`: operation succeeded but was costly or awkward.
 - `suggestion`: improvement opportunity not tied to a failing operation.
 
 HTTP agents can `POST /v1/feedback`. WebSocket agents can send
 `{"type": "feedback", "kind": "...", ...}`. Reports are queryable with
-`GET /v1/feedback` or the `bus_feedback` MCP tool, filtered by `agent_id`,
-`kind`, `status`, and `since`. Repeated open reports with the same fingerprint
-are de-duplicated and counted.
+`GET /v1/feedback` or the `bus_feedback` MCP tool.
 
-The older `POST /v1/gap` API remains compatible and also creates a structured
-`gap` feedback report.
+## Development
+
+Run tests:
+
+```bash
+python -m pytest
+```
+
+Run a focused test file:
+
+```bash
+python -m pytest tests/test_mcp_adapter.py -q
+```
+
+Build the package:
+
+```bash
+python -m build
+```
 
 ## Status
 
-**v0.1** — initial release
+The current bus is the Python orchestration service. Retired Go-era artifacts
+have been removed from the active tree.
 
-- [x] HTTP + WebSocket transport
-- [x] Memory backend
-- [x] SQLite backend
-- [x] Service registry with heartbeat
-- [x] Go client
-- [x] Python client (auto-registers on init)
-- [ ] Redis backend (planned v0.2)
-- [ ] gRPC transport (planned v0.3)
-- [ ] Auth (planned)
-- [ ] Topic wildcards (planned)
+Implemented:
+
+- HTTP + WebSocket service
+- SQLite-backed state
+- Service registry and heartbeat
+- Agent lifecycle management
+- Request/reply routing
+- Pub/sub and long-poll waits
+- Session management
+- Artifact storage and distilled retrieval
+- Flow orchestration
+- MCP adapter with dynamic skill tools
+- Response-envelope budgeting
+- GitHub webhook event ingestion
+
+Planned:
+
+- Richer artifact indexing
+- More automatic skill routing
+- Researcher-librarian taxonomy/index maintenance
+- Additional external protocol adapters where useful
