@@ -25,7 +25,7 @@ routed through the bus instead of loading every project MCP directly.
 Install the package in the active environment:
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[mcp]"
 ```
 
 Run the bus HTTP service:
@@ -159,6 +159,12 @@ HTTP agents can `POST /v1/feedback`. WebSocket agents can send
 `GET /v1/feedback` or the `bus_feedback` MCP tool.
 
 ## Development
+
+Install development/test dependencies:
+
+```bash
+python -m pip install -e ".[test,dev,mcp]"
+```
 
 Run tests:
 
