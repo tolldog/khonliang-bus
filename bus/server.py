@@ -72,6 +72,7 @@ class RequestMessage(BaseModel):
     trace_id: str = ""
     session_id: str | None = None
     response_mode: str = "raw"  # validated in handle_request
+    async_mode: bool = False
 
 
 class PublishRequest(BaseModel):
@@ -219,6 +220,9 @@ class BusServer:
         self._agent_connections: dict[str, WebSocket] = {}  # agent_id → WebSocket
         self._pending_responses: dict[str, asyncio.Future] = {}  # correlation_id → Future
         self._pending_agent: dict[str, str] = {}  # correlation_id → agent_id
+        self._async_request_tasks: set[asyncio.Task] = set()
+        async_limit = int(self.config.get("async_request_concurrency", 8))
+        self._async_request_semaphore = asyncio.Semaphore(max(1, async_limit))
         # Long-poll waiters: event fires on any new publish so waiters can re-check
         self._publish_notify: asyncio.Event | None = None
         self._retry_config = self.config.get("retry", {
@@ -237,6 +241,10 @@ class BusServer:
         self.scheduler = SchedulerIntegration(db)
 
     async def shutdown(self) -> None:
+        if self._async_request_tasks:
+            for task in list(self._async_request_tasks):
+                task.cancel()
+            await asyncio.gather(*self._async_request_tasks, return_exceptions=True)
         await self._http.aclose()
 
     # -- agent lifecycle --
@@ -365,6 +373,118 @@ class BusServer:
         t0 = time.monotonic()
         correlation_id = f"req-{uuid.uuid4().hex[:12]}"
 
+        if req.async_mode:
+            artifact_id = f"art_{uuid.uuid4().hex[:12]}"
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            self.db.finish_trace_step(
+                trace_id,
+                step=1,
+                status="accepted",
+                duration_ms=duration_ms,
+            )
+            task = asyncio.create_task(
+                self._run_async_request_task(
+                    req=req,
+                    reg=reg,
+                    agent_id=agent_id,
+                    trace_id=trace_id,
+                    correlation_id=correlation_id,
+                    artifact_id=artifact_id,
+                )
+            )
+            self._async_request_tasks.add(task)
+            task.add_done_callback(self._finish_async_request_task)
+            return {
+                "status": "accepted",
+                "trace_id": trace_id,
+                "artifact_id": artifact_id,
+                "artifact": {
+                    "id": artifact_id,
+                    "kind": "async_request_result",
+                    "available": False,
+                },
+                "message": "request accepted; result artifact will be created when complete",
+            }
+
+        return await self._dispatch_resolved_request(
+            req=req,
+            reg=reg,
+            agent_id=agent_id,
+            trace_id=trace_id,
+            correlation_id=correlation_id,
+            t0=t0,
+        )
+
+    async def _run_async_request_task(
+        self,
+        *,
+        req: RequestMessage,
+        reg: dict[str, Any],
+        agent_id: str,
+        trace_id: str,
+        correlation_id: str,
+        artifact_id: str,
+    ) -> None:
+        async with self._async_request_semaphore:
+            await self._complete_async_request(
+                req=req,
+                reg=reg,
+                agent_id=agent_id,
+                trace_id=trace_id,
+                correlation_id=correlation_id,
+                artifact_id=artifact_id,
+            )
+
+    async def _complete_async_request(
+        self,
+        *,
+        req: RequestMessage,
+        reg: dict[str, Any],
+        agent_id: str,
+        trace_id: str,
+        correlation_id: str,
+        artifact_id: str,
+    ) -> None:
+        t0 = time.monotonic()
+        try:
+            response = await self._dispatch_resolved_request(
+                req=req,
+                reg=reg,
+                agent_id=agent_id,
+                trace_id=trace_id,
+                correlation_id=correlation_id,
+                t0=t0,
+            )
+        except Exception as e:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            self.db.finish_trace_step(
+                trace_id,
+                step=1,
+                status="failed",
+                duration_ms=duration_ms,
+                error=str(e),
+            )
+            response = {"error": str(e), "trace_id": trace_id}
+            logger.exception("Async request %s failed before artifact creation", trace_id)
+
+        self._store_async_request_artifact(
+            req=req,
+            agent_id=agent_id,
+            trace_id=trace_id,
+            artifact_id=artifact_id,
+            response=response,
+        )
+
+    async def _dispatch_resolved_request(
+        self,
+        *,
+        req: RequestMessage,
+        reg: dict[str, Any],
+        agent_id: str,
+        trace_id: str,
+        correlation_id: str,
+        t0: float,
+    ) -> dict:
         # Prefer WebSocket if the agent is connected that way
         if self.is_agent_ws_connected(agent_id):
             result = await self.send_request_to_agent_ws(
@@ -463,6 +583,60 @@ class BusServer:
                 await asyncio.sleep(delay)
 
         return {"error": "max retries exceeded", "trace_id": trace_id}
+
+    def _store_async_request_artifact(
+        self,
+        *,
+        req: RequestMessage,
+        agent_id: str,
+        trace_id: str,
+        artifact_id: str,
+        response: dict[str, Any],
+    ) -> None:
+        status = "failed" if "error" in response else "ok"
+        payload = {
+            "status": status,
+            "trace_id": trace_id,
+            "agent_id": agent_id,
+            "operation": req.operation,
+            "session_id": req.session_id,
+            "response_mode": req.response_mode,
+            "result": response.get("result"),
+            "error": response.get("error"),
+        }
+        try:
+            self.artifacts.create(
+                kind="async_request_result",
+                title=f"Async result for {agent_id}.{req.operation}",
+                content=json.dumps(payload, indent=2, sort_keys=True),
+                producer=agent_id,
+                session_id=req.session_id or "",
+                trace_id=trace_id,
+                content_type="application/json",
+                metadata={
+                    "status": status,
+                    "agent_id": agent_id,
+                    "operation": req.operation,
+                    "response_mode": req.response_mode,
+                },
+                artifact_id=artifact_id,
+            )
+        except Exception:
+            logger.exception("Failed to store async request artifact %s", artifact_id)
+
+    def _finish_async_request_task(self, task: asyncio.Task) -> None:
+        self._async_request_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.error(
+                "Background async request task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     # -- pub/sub --
 
