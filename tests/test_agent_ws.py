@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -179,3 +181,73 @@ def test_agent_ws_request_round_trip(tmp_path):
 
     assert "result" in r, f"expected result, got: {r}"
     assert r["result"] == {"echoed": {"msg": "hello"}}
+
+
+def test_agent_ws_async_request_creates_result_artifact(tmp_path):
+    """Async requests return a receipt and persist the eventual result."""
+    app = create_app(db_path=str(tmp_path / "test.db"))
+    registered = threading.Event()
+
+    def agent(ws):
+        ws.send_json({
+            "type": "register",
+            "id": "ws-async",
+            "agent_type": "echo",
+            "skills": [{"name": "echo", "description": "echo args"}],
+        })
+        ws.receive_json()
+        registered.set()
+
+        msg = ws.receive_json()
+        assert msg["type"] == "request"
+        assert msg["operation"] == "echo"
+        ws.send_json({
+            "type": "response",
+            "correlation_id": msg["correlation_id"],
+            "result": {"echoed": msg["args"]},
+        })
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/agent") as ws:
+            t = threading.Thread(target=agent, args=(ws,), daemon=True)
+            t.start()
+            assert registered.wait(timeout=2), "agent did not register in time"
+
+            receipt = client.post("/v1/request", json={
+                "agent_id": "ws-async",
+                "operation": "echo",
+                "args": {"msg": "hello"},
+                "timeout": 5.0,
+                "async_mode": True,
+            }).json()
+
+            assert receipt["status"] == "accepted"
+            assert receipt["trace_id"].startswith("t-")
+            artifact_id = receipt["artifact_id"]
+            assert receipt["artifact"] == {
+                "id": artifact_id,
+                "kind": "async_request_result",
+                "available": False,
+            }
+
+            t.join(timeout=5)
+            assert not t.is_alive(), "agent thread did not finish in time"
+
+            deadline = time.monotonic() + 5
+            meta = {"error": "artifact not found"}
+            while time.monotonic() < deadline:
+                meta = client.get(f"/v1/artifacts/{artifact_id}").json()
+                if "error" not in meta:
+                    break
+                time.sleep(0.05)
+
+            assert "error" not in meta
+            assert meta["kind"] == "async_request_result"
+            assert meta["producer"] == "ws-async"
+            assert meta["trace_id"] == receipt["trace_id"]
+            assert meta["metadata"]["status"] == "ok"
+
+            content = client.get(f"/v1/artifacts/{artifact_id}/content").json()
+            payload = json.loads(content["text"])
+            assert payload["status"] == "ok"
+            assert payload["result"] == {"echoed": {"msg": "hello"}}
