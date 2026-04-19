@@ -56,6 +56,26 @@ Example local `.mcp.json` entry:
 Keep `.mcp.json` local and git-ignored. It contains machine-specific command
 paths and live service URLs.
 
+## Configuration And Local State
+
+The bus does not require a checked-in config file. Runtime configuration is
+provided by command-line flags and local MCP client settings:
+
+- `python -m bus --port ... --host ... --db ...`
+- `python -m bus.mcp_adapter --bus ...`
+- local `.mcp.json` entries for Claude/Codex clients
+
+Keep these local-only:
+
+- `.mcp.json`
+- SQLite bus databases
+- agent working directories
+- process logs
+- machine-specific command paths
+
+Shared contracts and defaults should be documented in this repo or
+`khonliang-bus-lib`, not encoded in local config files.
+
 ## Current Architecture
 
 ```text
@@ -76,7 +96,7 @@ khonliang-bus FastAPI service
   |
   +-- developer agent skills
   +-- researcher agent skills
-  +-- future domain agents
+  +-- domain agents
 ```
 
 The old Go bus implementation has been retired. The current bus is the Python

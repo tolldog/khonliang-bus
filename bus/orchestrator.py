@@ -12,7 +12,7 @@ Usage::
 
     POST /v1/orchestrate
     {
-        "task": "evaluate specs/MS-02/spec.md against the research corpus",
+        "task": "evaluate the next developer work unit against the research corpus",
         "context": {"project": "developer"},
         "model": "qwen2.5:7b"  // optional, defaults to config
     }
