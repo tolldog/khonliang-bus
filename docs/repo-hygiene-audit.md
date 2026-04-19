@@ -1,7 +1,7 @@
 # Repo Hygiene Audit
 
 Generated: 1776579546.1046805
-Repo: `/mnt/dev/ttoll/dev/khonliang-bus`
+Repo: `khonliang-bus` (environment-specific absolute path omitted)
 
 ## Summary
 
@@ -30,5 +30,5 @@ Repo: `/mnt/dev/ttoll/dev/khonliang-bus`
 
 ## Test Plan
 
-- `.venv/bin/python -m pytest -q`
-- `.venv/bin/python -m compileall .`
+- `python -m pytest -q`
+- `python -m compileall .`
