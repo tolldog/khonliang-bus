@@ -227,6 +227,44 @@ def test_execute_unknown_flow(flow_db):
     assert "not found" in result["error"]
 
 
+def test_execute_flow_forwards_step_timeout(flow_db, flow_engine):
+    """``FlowRequest.timeout`` → ``FlowEngine.execute(step_timeout=...)`` →
+    ``_call_agent(timeout=...)``. Without this plumbing the per-step httpx
+    cap stays at the built-in 30s even when the MCP adapter passed a larger
+    ``_mcp_timeout`` hint, and slow inner-agent calls get truncated.
+    """
+    _register_agents(flow_db)
+    captured: list[float | None] = []
+
+    async def recording_call_agent(agent, operation, args, timeout=None):
+        captured.append(timeout)
+        return {"result": {"echo": operation}}
+
+    flow_engine._call_agent = recording_call_agent
+    result = asyncio.run(flow_engine.execute(
+        "evaluate_spec", {"path": "/x.md"}, trace_id="t-to", step_timeout=180.0,
+    ))
+    assert result["status"] == "completed"
+    # Both steps in the evaluate_spec flow must see the same step_timeout.
+    assert captured == [180.0, 180.0]
+
+
+def test_execute_flow_default_step_timeout_when_unset(flow_db, flow_engine):
+    """Without a ``step_timeout`` override, ``_call_agent`` receives None and
+    falls back to its internal default (preserving legacy behavior for flows
+    invoked outside the MCP adapter path)."""
+    _register_agents(flow_db)
+    captured: list[float | None] = []
+
+    async def recording_call_agent(agent, operation, args, timeout=None):
+        captured.append(timeout)
+        return {"result": {"echo": operation}}
+
+    flow_engine._call_agent = recording_call_agent
+    asyncio.run(flow_engine.execute("evaluate_spec", {"path": "/x.md"}, trace_id="t-def"))
+    assert captured == [None, None]
+
+
 def test_execute_flow_missing_agent(flow_db, flow_engine):
     """Flow references an agent that isn't registered."""
     # Register a dummy agent so we can declare a flow (FK constraint)

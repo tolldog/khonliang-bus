@@ -126,6 +126,11 @@ class FlowRequest(BaseModel):
     flow_id: str
     args: dict[str, Any] = {}
     trace_id: str = ""
+    # Per-step timeout (seconds) for ``FlowEngine._call_agent``. When unset,
+    # the engine's built-in default applies. Propagated from the MCP adapter's
+    # ``_mcp_timeout`` control-plane hint on flow invocations so slow inner
+    # agent steps don't get truncated at the engine's default 30s.
+    timeout: float | None = None
 
 
 class GapReport(BaseModel):
@@ -954,7 +959,9 @@ class BusServer:
     # -- flow orchestration (Step 6) --
 
     async def execute_flow(self, req: FlowRequest) -> dict:
-        return await self.flow_engine.execute(req.flow_id, req.args, req.trace_id)
+        return await self.flow_engine.execute(
+            req.flow_id, req.args, req.trace_id, step_timeout=req.timeout,
+        )
 
     # -- session context (Step 5) --
 
