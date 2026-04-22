@@ -1,5 +1,12 @@
 # Copilot Review Instructions
 
+These instructions govern how **external reviewers** (GitHub Copilot
+and any other cross-vendor reviewer) should respond to pull requests
+in this repository. They do **not** override any internal review-event
+policies of agents that happen to live in this repo (e.g., the
+reviewer agent's own allowed-events list is governed separately by
+its FRs, not by this file).
+
 ## Always submit a formal review, not a bare comment
 
 When invoked on a pull request (including re-review requests via
@@ -10,7 +17,7 @@ When invoked on a pull request (including re-review requests via
 - **If there are findings:** submit as `COMMENTED` with the findings inline.
 - **If the previous round's findings are resolved and nothing new surfaces:**
   submit as `APPROVED` with a one-line justification (e.g.
-  `` `Verified in {sha}: docstring fix + correctness fix land as described` ``).
+  `` `Verified in {sha}: docstring fix + correctness fix lands as described` ``).
   This gives the maintainer an explicit review record in the PR's review list.
 - **If correctness is blocking:** submit as `CHANGES_REQUESTED`.
 
