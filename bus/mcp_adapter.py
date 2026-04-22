@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from typing import Any
@@ -79,9 +80,11 @@ class BusMCPAdapter:
             if default_timeout_s is not None
             else DEFAULT_MCP_TIMEOUT_S
         )
-        # Construct httpx clients without a default timeout cap; actual per-call
-        # timeout is passed on each request so a slow skill doesn't inherit the
-        # cap meant for a fast one, and so short calls return quickly.
+        # Construct httpx clients with the adapter default timeout as the
+        # client-level cap. Call sites that need a longer window (or shorter)
+        # pass a per-request ``timeout=`` kwarg which overrides the client
+        # default, so slow skills can run to completion while short calls
+        # still return quickly.
         self._http = httpx.Client(timeout=httpx.Timeout(self.default_timeout_s))
         self._async_http = httpx.AsyncClient(timeout=httpx.Timeout(self.default_timeout_s))
         self.mcp = FastMCP("khonliang-bus")
@@ -662,7 +665,16 @@ class BusMCPAdapter:
 
         @self.mcp.tool(name=flow_name, description=description)
         async def _flow_proxy(args: str = "{}") -> str:
-            """Execute a collaborative flow. Pass args as JSON string."""
+            """Execute a collaborative flow. Pass args as JSON string.
+
+            The ``_mcp_timeout`` control-plane hint (if present in ``args``)
+            is threaded end-to-end: it caps the adapter→bus transport AND is
+            forwarded to ``FlowRequest.timeout`` so ``FlowEngine._call_agent``
+            uses it as the per-step cap rather than its built-in 30s default.
+            Without that plumbing, a flow whose inner agent step takes >30s
+            would be truncated inside the engine even when the outer MCP
+            timeout is generous.
+            """
             try:
                 parsed_args = json.loads(args) if isinstance(args, str) else args
             except json.JSONDecodeError:
@@ -672,9 +684,13 @@ class BusMCPAdapter:
             budget = extract_response_budget(parsed_args)
             timeout = adapter._pop_timeout_hint(parsed_args)
 
+            flow_body: dict[str, Any] = {"flow_id": flow_name, "args": parsed_args}
+            if timeout is not None:
+                flow_body["timeout"] = timeout
+
             result = await adapter._async_post(
                 "/v1/flow",
-                {"flow_id": flow_name, "args": parsed_args},
+                flow_body,
                 http_timeout=(timeout or adapter.default_timeout_s) + 5.0,
             )
             if "error" in result:
@@ -738,9 +754,12 @@ class BusMCPAdapter:
     ) -> dict:
         """POST to /v1/request. Timeout applies to both httpx transport and the
         bus-side ``timeout`` field (so the server's bus→agent call doesn't cap
-        before ours does). On a transport timeout the response carries
-        ``timed_out=True`` plus ``trace_id`` when the bus supplied one, so
-        callers can reason about partial completion server-side.
+        before ours does). When the bus returns a JSON body, callers may
+        receive bus-supplied fields such as ``trace_id``. If the httpx
+        transport itself times out, this method instead returns a synthetic
+        dict with ``timed_out=True`` and ``timeout_s`` but no bus response
+        metadata (no ``trace_id``) — the request never reached the bus or the
+        response never made it back.
         """
         resolved = float(timeout) if timeout is not None else self.default_timeout_s
         # Give the bus a small buffer to return its own timeout envelope
@@ -851,17 +870,26 @@ def _resolve_default_timeout(cli_value: float | None) -> float:
     Precedence: explicit ``--default-timeout`` CLI arg, then
     ``KHONLIANG_MCP_DEFAULT_TIMEOUT`` env var, then ``DEFAULT_MCP_TIMEOUT_S``.
     Invalid env values log a warning and fall back to the library default.
+    An invalid CLI value (non-positive or non-finite) raises ``ValueError``
+    — the CLI is an explicit operator choice, so we fail loudly rather than
+    silently falling back the way env does.
     """
     if cli_value is not None:
-        return float(cli_value)
+        value = float(cli_value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"--default-timeout must be a positive finite number, got {cli_value!r}"
+            )
+        return value
     env = os.environ.get("KHONLIANG_MCP_DEFAULT_TIMEOUT")
     if env:
         try:
             value = float(env)
-            if value > 0:
+            if math.isfinite(value) and value > 0:
                 return value
             logger.warning(
-                "KHONLIANG_MCP_DEFAULT_TIMEOUT must be positive, got %r — using default",
+                "KHONLIANG_MCP_DEFAULT_TIMEOUT must be a positive finite "
+                "number, got %r — using default",
                 env,
             )
         except ValueError:
@@ -893,7 +921,10 @@ def main():
         stream=sys.stderr,
     )
 
-    default_timeout = _resolve_default_timeout(args.default_timeout)
+    try:
+        default_timeout = _resolve_default_timeout(args.default_timeout)
+    except ValueError as exc:
+        parser.error(str(exc))
     adapter = BusMCPAdapter(args.bus, default_timeout_s=default_timeout)
     mcp = adapter.build()
 

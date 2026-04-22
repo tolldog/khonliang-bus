@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 _TEMPLATE_RE = re.compile(r"\{\{(\w+(?:\.\w+)*)\}\}")
 
 
+_DEFAULT_STEP_TIMEOUT_S: float = 30.0
+
+
 class FlowEngine:
     """Execute multi-agent flows declared in the bus registry."""
 
@@ -45,6 +48,7 @@ class FlowEngine:
         flow_name: str,
         args: dict[str, Any],
         trace_id: str = "",
+        step_timeout: float | None = None,
     ) -> dict[str, Any]:
         """Execute a named flow.
 
@@ -114,7 +118,9 @@ class FlowEngine:
             t0 = time.monotonic()
 
             try:
-                result = await self._call_agent(agent, operation, resolved_args)
+                result = await self._call_agent(
+                    agent, operation, resolved_args, timeout=step_timeout,
+                )
                 duration_ms = int((time.monotonic() - t0) * 1000)
 
                 if "error" in result:
@@ -167,9 +173,22 @@ class FlowEngine:
             return reg
         return self.db.get_healthy_agent_for_type(agent_ref)
 
-    async def _call_agent(self, agent: dict, operation: str, args: dict) -> dict:
-        """Forward a request to an agent's callback URL."""
+    async def _call_agent(
+        self,
+        agent: dict,
+        operation: str,
+        args: dict,
+        timeout: float | None = None,
+    ) -> dict:
+        """Forward a request to an agent's callback URL.
+
+        ``timeout`` overrides the per-step default when set. The default of
+        30s matches the engine's historical cap; callers who need to extend
+        it (e.g. local-Ollama reviewer steps that legitimately run longer)
+        should supply a larger value via ``FlowRequest.timeout``.
+        """
         correlation_id = f"flow-{uuid.uuid4().hex[:8]}"
+        resolved_timeout = timeout if timeout is not None else _DEFAULT_STEP_TIMEOUT_S
         r = await self._http.post(
             f"{agent['callback_url']}/v1/handle",
             json={
@@ -177,7 +196,7 @@ class FlowEngine:
                 "args": args,
                 "correlation_id": correlation_id,
             },
-            timeout=30.0,
+            timeout=resolved_timeout,
         )
         if r.status_code != 200:
             return {"error": f"HTTP {r.status_code}: {r.text}"}

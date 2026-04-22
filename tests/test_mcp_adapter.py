@@ -809,3 +809,83 @@ def test_async_post_surfaces_timeout_with_marker(monkeypatch):
     result = asyncio.run(a._async_post("/v1/flow", {}, http_timeout=30.0))
     assert result["timed_out"] is True
     assert result["timeout_s"] == 30.0
+
+
+def test_resolve_default_timeout_rejects_invalid_cli_value():
+    """CLI ``--default-timeout`` is an explicit operator choice: non-positive
+    or non-finite values must raise rather than silently fall back. This
+    prevents a bad flag from propagating into ``httpx.Timeout(...)`` where
+    the failure would be noisier and further from its cause.
+    """
+    from bus.mcp_adapter import _resolve_default_timeout
+
+    for bad in (0, -1, -0.5, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="positive finite"):
+            _resolve_default_timeout(bad)
+
+
+def test_resolve_default_timeout_accepts_positive_cli_value():
+    from bus.mcp_adapter import _resolve_default_timeout
+
+    assert _resolve_default_timeout(0.1) == 0.1
+    assert _resolve_default_timeout(300.0) == 300.0
+
+
+def test_flow_proxy_forwards_mcp_timeout_into_flow_request():
+    """The ``_mcp_timeout`` hint on a flow invocation must be forwarded to
+    ``FlowRequest.timeout`` so ``FlowEngine._call_agent`` extends its
+    per-step cap. Without this plumbing the engine's built-in 30s cap would
+    truncate slow inner-agent calls even when the outer MCP timeout is
+    generous.
+    """
+    a = BusMCPAdapter("http://testserver")
+    captured: dict = {}
+
+    async def mock_post(path, body, http_timeout=None):
+        captured["path"] = path
+        captured["body"] = body
+        captured["http_timeout"] = http_timeout
+        return {"result": "ok"}
+
+    # Register a fake flow so the _flow_proxy tool exists.
+    a._get = lambda path, params=None: (
+        {"available": [{"name": "evaluate_spec", "description": "fake"}]}
+        if path == "/v1/flows"
+        else None
+    )
+    a._async_post = mock_post
+    mcp = a.build()
+    asyncio.run(mcp.call_tool(
+        "evaluate_spec",
+        {"args": json.dumps({"path": "/x.md", "_mcp_timeout": 180})},
+    ))
+    assert captured["path"] == "/v1/flow"
+    assert captured["body"]["flow_id"] == "evaluate_spec"
+    assert captured["body"]["timeout"] == 180.0
+    assert captured["body"]["args"] == {"path": "/x.md"}
+    # And the transport cap still gets the +5s buffer above the hint.
+    assert captured["http_timeout"] == 185.0
+
+
+def test_flow_proxy_omits_timeout_when_not_supplied():
+    """When no ``_mcp_timeout`` hint is passed, the flow body must not carry
+    a ``timeout`` field — the engine falls back to its own default."""
+    a = BusMCPAdapter("http://testserver")
+    captured: dict = {}
+
+    async def mock_post(path, body, http_timeout=None):
+        captured["body"] = body
+        return {"result": "ok"}
+
+    a._get = lambda path, params=None: (
+        {"available": [{"name": "evaluate_spec", "description": "fake"}]}
+        if path == "/v1/flows"
+        else None
+    )
+    a._async_post = mock_post
+    mcp = a.build()
+    asyncio.run(mcp.call_tool(
+        "evaluate_spec",
+        {"args": json.dumps({"path": "/x.md"})},
+    ))
+    assert "timeout" not in captured["body"]
