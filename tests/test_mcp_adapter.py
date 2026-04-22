@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -196,7 +197,7 @@ def test_bus_feedback_tool(bus_client):
 
 
 def test_skill_proxy_returns_response_envelope(adapter):
-    async def mock_request(agent_id, operation, args):
+    async def mock_request(agent_id, operation, args, timeout=None):
         assert agent_id == "researcher-primary"
         assert operation == "find_papers"
         assert args == {"query": "context budgets"}
@@ -222,7 +223,7 @@ def test_skill_proxy_stores_large_result_as_artifact(bus_client):
     a._http = bus_client
     large = "\n".join(f"FAILED test_{i}: AssertionError details" for i in range(1000))
 
-    async def mock_request(agent_id, operation, args):
+    async def mock_request(agent_id, operation, args, timeout=None):
         assert "_response_budget_chars" not in args
         return {"result": large}
 
@@ -588,3 +589,223 @@ def _extract_text(result) -> str:
         if hasattr(first, "text"):
             return first.text
     return str(result)
+
+
+# -- configurable timeout (FR fr_khonliang_a3dc662d) --
+#
+# Root cause: the adapter hardcoded httpx timeouts at 30s, silently
+# truncating any skill whose local inference exceeded that window even
+# though the server-side agent often completed the work. Tests below
+# cover the four acceptance behaviors: (1) the library fallback default
+# moved above 30s; (2) the fallback is overridable at construction and
+# via env/CLI; (3) a per-call ``_mcp_timeout`` arg wins over the default
+# and is stripped before forwarding to the skill handler; (4) timeout
+# errors surface as non-empty strings carrying ``timed_out=true``.
+
+
+def test_default_timeout_is_above_30s(adapter):
+    """The library fallback must exceed the historic 30s hardcoded cap.
+
+    The exact value may shift with empirical evidence; what matters is
+    that 14-16B local reviewers (30-35s typical) aren't truncated.
+    """
+    assert adapter.default_timeout_s > 30.0
+
+
+def test_default_timeout_constructor_override():
+    a = BusMCPAdapter("http://testserver", default_timeout_s=120.0)
+    assert a.default_timeout_s == 120.0
+
+
+def test_resolve_default_timeout_reads_env(monkeypatch):
+    from bus.mcp_adapter import DEFAULT_MCP_TIMEOUT_S, _resolve_default_timeout
+
+    monkeypatch.setenv("KHONLIANG_MCP_DEFAULT_TIMEOUT", "180")
+    assert _resolve_default_timeout(None) == 180.0
+
+    monkeypatch.delenv("KHONLIANG_MCP_DEFAULT_TIMEOUT", raising=False)
+    assert _resolve_default_timeout(None) == DEFAULT_MCP_TIMEOUT_S
+
+    monkeypatch.setenv("KHONLIANG_MCP_DEFAULT_TIMEOUT", "not-a-number")
+    assert _resolve_default_timeout(None) == DEFAULT_MCP_TIMEOUT_S
+
+    monkeypatch.setenv("KHONLIANG_MCP_DEFAULT_TIMEOUT", "-5")
+    assert _resolve_default_timeout(None) == DEFAULT_MCP_TIMEOUT_S
+
+    # Explicit CLI wins over env.
+    monkeypatch.setenv("KHONLIANG_MCP_DEFAULT_TIMEOUT", "45")
+    assert _resolve_default_timeout(90.0) == 90.0
+
+
+def test_slow_skill_under_cap_returns_payload(adapter):
+    """Regression: a 45s-simulated skill must return its payload under a
+    120s cap. Uses mocking so we never actually sleep 45s.
+
+    Covers FR acceptance: configuring a default cap > 30s lets long calls
+    complete without truncation.
+    """
+    adapter.default_timeout_s = 120.0
+    captured: dict = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        captured["timeout"] = timeout
+        # Returns a completed result; by contract the adapter treats this
+        # as a non-timeout regardless of wall time.
+        return {"result": "findings payload from a long-running reviewer"}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    result = asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {"args": json.dumps({"query": "long"})},
+    ))
+    payload = json.loads(_extract_text(result))
+    assert payload["ok"] is True
+    assert payload["content"] == "findings payload from a long-running reviewer"
+    # The adapter-level default should thread through (None here means
+    # "use adapter default" — the skill-proxy doesn't force-pass it).
+    assert captured["timeout"] is None
+
+
+def test_per_call_mcp_timeout_hint_overrides_default(adapter):
+    """``_mcp_timeout`` in skill args wins over the adapter default and is
+    stripped before reaching the skill handler."""
+    captured: dict = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        captured["timeout"] = timeout
+        captured["args"] = dict(args)
+        return {"result": "ok"}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {"args": json.dumps({"query": "q", "_mcp_timeout": 200})},
+    ))
+    assert captured["timeout"] == 200.0
+    assert "_mcp_timeout" not in captured["args"]
+    assert captured["args"] == {"query": "q"}
+
+
+def test_invalid_mcp_timeout_hint_falls_back_silently(adapter):
+    """Non-numeric / non-positive hints must not crash; adapter default
+    applies instead."""
+    captured: dict = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        captured["timeout"] = timeout
+        return {"result": "ok"}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    for bad in ("not-a-number", -5, 0):
+        asyncio.run(mcp.call_tool(
+            "researcher-primary.find_papers",
+            {"args": json.dumps({"query": "q", "_mcp_timeout": bad})},
+        ))
+        assert captured["timeout"] is None
+
+
+def test_skill_timeout_returns_non_empty_error_with_marker(adapter):
+    """Regression: when a call exceeds the cap, the MCP response must be a
+    non-empty string including ``timed_out=true`` — not the historical
+    silent ``{"error": ""}``. Also preserves trace_id when bus supplied one.
+    """
+    async def mock_request(agent_id, operation, args, timeout=None):
+        # Emulate the shape _async_request returns on httpx.TimeoutException
+        return {
+            "error": f"mcp transport timeout after {(timeout or 60.0) + 5.0:.1f}s",
+            "timed_out": True,
+            "timeout_s": timeout or 60.0,
+        }
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    result = asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {"args": json.dumps({"query": "q", "_mcp_timeout": 30})},
+    ))
+    text = _extract_text(result)
+    # Non-empty, informative.
+    assert text.strip()
+    assert "error:" in text
+    assert "timed_out=true" in text
+    assert "timeout_s=30" in text
+
+
+def test_format_error_preserves_trace_id():
+    """Trace ids from the bus survive into the rendered error string so
+    operators can cross-reference a usage row recorded server-side even
+    when the MCP channel truncated."""
+    a = BusMCPAdapter("http://testserver")
+    out = a._format_error({
+        "error": "mcp transport timeout after 65.0s",
+        "timed_out": True,
+        "timeout_s": 60.0,
+        "trace_id": "trace-abc123",
+    })
+    assert "timed_out=true" in out
+    assert "trace_id=trace-abc123" in out
+    assert "error: mcp transport timeout" in out
+
+
+def test_format_error_plain_bus_error_stays_simple():
+    """Non-timeout bus errors don't get the timeout marker appended."""
+    a = BusMCPAdapter("http://testserver")
+    out = a._format_error({"error": "agent unreachable"})
+    assert out == "error: agent unreachable"
+
+
+def test_async_request_passes_resolved_timeout_to_bus(monkeypatch):
+    """The ``timeout`` field in the /v1/request body must be the resolved
+    value, not the old hardcoded 30. This is what caps the bus→agent call
+    server-side; if it's too low, the bus truncates before the adapter.
+    """
+    a = BusMCPAdapter("http://testserver", default_timeout_s=120.0)
+    captured: dict = {}
+
+    class _Response:
+        def json(self):
+            return {"result": "ok"}
+
+    async def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        captured["transport_timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(a._async_http, "post", fake_post)
+    result = asyncio.run(a._async_request("agent", "op", {"x": 1}, timeout=200.0))
+    assert result == {"result": "ok"}
+    assert captured["json"]["timeout"] == 200.0
+    # Transport timeout gets a small buffer above the bus-side timeout.
+    assert captured["transport_timeout"].read > 200.0
+
+
+def test_async_request_surfaces_timeout_with_marker(monkeypatch):
+    """httpx.TimeoutException must map to a structured error dict carrying
+    ``timed_out=true`` — this is the plumbing that makes
+    ``test_skill_timeout_returns_non_empty_error_with_marker`` possible
+    end-to-end in production."""
+    a = BusMCPAdapter("http://testserver", default_timeout_s=60.0)
+
+    async def fake_post(*args, **kwargs):
+        raise httpx.ReadTimeout("simulated")
+
+    monkeypatch.setattr(a._async_http, "post", fake_post)
+    result = asyncio.run(a._async_request("agent", "op", {}, timeout=45.0))
+    assert result["timed_out"] is True
+    assert result["timeout_s"] == 45.0
+    assert "timeout" in result["error"].lower()
+
+
+def test_async_post_surfaces_timeout_with_marker(monkeypatch):
+    a = BusMCPAdapter("http://testserver", default_timeout_s=60.0)
+
+    async def fake_post(*args, **kwargs):
+        raise httpx.ReadTimeout("simulated")
+
+    monkeypatch.setattr(a._async_http, "post", fake_post)
+    result = asyncio.run(a._async_post("/v1/flow", {}, http_timeout=30.0))
+    assert result["timed_out"] is True
+    assert result["timeout_s"] == 30.0
