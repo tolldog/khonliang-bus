@@ -127,13 +127,24 @@ as artifacts, then return compact refs through MCP.
 
 Useful artifact tools:
 
-- `bus_artifact_head`
-- `bus_artifact_tail`
-- `bus_artifact_grep`
-- `bus_artifact_excerpt`
-- `bus_artifact_get`
+- `store-primary.artifact_list`
+- `store-primary.artifact_metadata`
+- `store-primary.artifact_head`
+- `store-primary.artifact_tail`
+- `store-primary.artifact_grep`
+- `store-primary.artifact_excerpt`
+- `store-primary.artifact_get`
 - `bus_artifact_distill`
 - `bus_artifact_distill_many`
+
+The seven read tools live on the `khonliang-store` agent
+(see [tolldog/khonliang-store](https://github.com/tolldog/khonliang-store)).
+The bus's `/v1/artifacts/*` HTTP routes still serve the same data
+as a fallback for the store agent's composite backend, but the
+`bus_artifact_*` MCP tools that fronted them were retired in
+khonliang-store Phase 4c — operators reach the canonical surface
+through `store-primary.*`. `bus_artifact_distill[_many]` remain
+on the bus until store grows an equivalent (Phase 5 territory).
 
 Use artifacts instead of inlining raw pytest output, full command stdout/stderr,
 large diffs, large FR lists, or full file contents.

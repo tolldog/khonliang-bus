@@ -379,107 +379,25 @@ class BusMCPAdapter:
             )
             return json.dumps(reports or [], indent=2)
 
-        @mcp.tool()
-        async def bus_artifact_list(
-            session_id: str = "",
-            kind: str = "",
-            producer: str = "",
-            limit: int = 20,
-        ) -> str:
-            """List artifact metadata. Does not return artifact content."""
-            result = adapter._get(
-                "/v1/artifacts",
-                params={
-                    "session_id": session_id,
-                    "kind": kind,
-                    "producer": producer,
-                    "limit": limit,
-                },
-            )
-            return json.dumps(result or [], indent=2)
-
-        @mcp.tool()
-        async def bus_artifact_metadata(id: str) -> str:
-            """Return artifact metadata, size, kind, producer, and refs."""
-            result = adapter._get(f"/v1/artifacts/{id}")
-            return json.dumps(result or {"error": "artifact not found"}, indent=2)
-
-        @mcp.tool()
-        async def bus_artifact_head(
-            id: str,
-            lines: int = 80,
-            max_chars: int = 4000,
-        ) -> str:
-            """Bounded beginning of a text artifact."""
-            result = adapter._get(
-                f"/v1/artifacts/{id}/head",
-                params={"lines": lines, "max_chars": max_chars},
-            )
-            return json.dumps(result or {"error": "artifact not found"}, indent=2)
-
-        @mcp.tool()
-        async def bus_artifact_tail(
-            id: str,
-            lines: int = 80,
-            max_chars: int = 4000,
-        ) -> str:
-            """Bounded end of a text artifact."""
-            result = adapter._get(
-                f"/v1/artifacts/{id}/tail",
-                params={"lines": lines, "max_chars": max_chars},
-            )
-            return json.dumps(result or {"error": "artifact not found"}, indent=2)
-
-        @mcp.tool()
-        async def bus_artifact_get(
-            id: str,
-            offset: int = 0,
-            max_chars: int = 4000,
-        ) -> str:
-            """Bounded character window from a text artifact."""
-            result = adapter._get(
-                f"/v1/artifacts/{id}/content",
-                params={"offset": offset, "max_chars": max_chars},
-            )
-            return json.dumps(result or {"error": "artifact not found"}, indent=2)
-
-        @mcp.tool()
-        async def bus_artifact_grep(
-            id: str,
-            pattern: str,
-            context_lines: int = 10,
-            max_matches: int = 10,
-            max_chars: int = 4000,
-        ) -> str:
-            """Bounded pattern excerpts from a text artifact."""
-            result = adapter._get(
-                f"/v1/artifacts/{id}/grep",
-                params={
-                    "pattern": pattern,
-                    "context_lines": context_lines,
-                    "max_matches": max_matches,
-                    "max_chars": max_chars,
-                },
-            )
-            return json.dumps(result or {"error": "artifact not found"}, indent=2)
-
-        @mcp.tool()
-        async def bus_artifact_excerpt(
-            id: str,
-            start_line: int,
-            end_line: int,
-            max_chars: int = 4000,
-        ) -> str:
-            """Bounded explicit line range from a text artifact."""
-            result = adapter._get(
-                f"/v1/artifacts/{id}/excerpt",
-                params={
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "max_chars": max_chars,
-                },
-            )
-            return json.dumps(result or {"error": "artifact not found"}, indent=2)
+        # Read-side ``bus_artifact_*`` MCP tools were retired with
+        # khonliang-store Phase 4c (`fr_khonliang-bus_9151395d`).
+        # The store agent now owns the canonical artifact read
+        # surface — operators reach the same data through
+        # ``store-primary.artifact_list / .artifact_metadata /
+        # .artifact_get / .artifact_head / .artifact_tail /
+        # .artifact_grep / .artifact_excerpt`` (registered
+        # dynamically by ``_register_skill_tools`` from the
+        # ``store-primary`` agent's skill list). The bus's
+        # ``/v1/artifacts/*`` HTTP routes stay reachable so
+        # ``khonliang-store``'s composite read fallback
+        # (``BusBackedArtifactStore``) keeps working until
+        # operators have finished the migration via
+        # ``store-primary.artifact_migrate_from_bus``.
+        #
+        # ``bus_artifact_distill`` and ``bus_artifact_distill_many``
+        # below are NOT part of this deprecation — they create new
+        # artifacts, which store doesn't have an equivalent skill
+        # for yet (Phase 5 territory).
 
         @mcp.tool()
         async def bus_artifact_distill(
