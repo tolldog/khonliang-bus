@@ -177,12 +177,21 @@ def test_artifact_tail_http_route_still_serves(bus_client):
     composite backend. Verify the HTTP surface still answers
     correctly so the composite read path doesn't regress.
     """
-    created = bus_client.post("/v1/artifacts", json={
+    create_resp = bus_client.post("/v1/artifacts", json={
         "kind": "pytest_log",
         "title": "pytest",
         "content": "\n".join(f"line {i}" for i in range(20)),
         "producer": "test",
-    }).json()
+    })
+    # Assert the POST succeeded before reading the body so a
+    # future validation change shows up as a clear status-code
+    # mismatch rather than a confusing KeyError on ``created["id"]``.
+    assert create_resp.status_code == 200, (
+        f"artifact create returned {create_resp.status_code}: "
+        f"{create_resp.text}"
+    )
+    created = create_resp.json()
+    assert "id" in created, f"artifact create response missing 'id': {created}"
 
     resp = bus_client.get(
         f"/v1/artifacts/{created['id']}/tail",
