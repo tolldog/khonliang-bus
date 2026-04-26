@@ -70,16 +70,32 @@ def test_build_registers_bus_tools(adapter):
     tools = asyncio.run(mcp.list_tools())
     tool_names = {t.name for t in tools}
 
-    # Bus management tools
+    # Bus management tools. The seven read-side ``bus_artifact_*``
+    # tools (list/metadata/head/tail/get/grep/excerpt) were retired
+    # with khonliang-store Phase 4c — operators reach the same data
+    # via ``store-primary.artifact_*`` skills now. Distill tools
+    # remain because store doesn't have an equivalent yet.
     for bus_tool in (
         "bus_services", "bus_status", "bus_matrix", "bus_flows",
-        "bus_trace", "bus_skills", "bus_feedback", "bus_artifact_list",
-        "bus_artifact_metadata", "bus_artifact_head", "bus_artifact_tail",
-        "bus_artifact_get", "bus_artifact_grep", "bus_artifact_excerpt",
+        "bus_trace", "bus_skills", "bus_feedback",
         "bus_artifact_distill", "bus_artifact_distill_many",
         "bus_start_agent", "bus_stop_agent", "bus_restart_agent",
     ):
         assert bus_tool in tool_names, f"missing bus tool: {bus_tool}"
+
+    # Lock the deprecation in: the retired tools must NOT be
+    # registered. A regression that re-adds one of them needs to
+    # also touch this list, which forces the conversation about
+    # whether the deprecation is being walked back intentionally.
+    for retired_tool in (
+        "bus_artifact_list", "bus_artifact_metadata",
+        "bus_artifact_head", "bus_artifact_tail",
+        "bus_artifact_get", "bus_artifact_grep",
+        "bus_artifact_excerpt",
+    ):
+        assert retired_tool not in tool_names, (
+            f"deprecated bus tool {retired_tool!r} reappeared in the registry"
+        )
 
 
 def test_build_registers_skill_tools(adapter):
@@ -105,8 +121,10 @@ def test_build_registers_flow_tools(adapter):
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
-    # 21 bus tools (12 existing + 9 artifact tools) + 3 skills + 1 flow = 25
-    assert len(tools) == 25
+    # 14 bus tools (12 non-artifact + 2 distill) + 3 skills + 1 flow = 18.
+    # The seven read-side bus_artifact_* tools were retired with
+    # khonliang-store Phase 4c (`fr_khonliang-bus_9151395d`).
+    assert len(tools) == 18
 
 
 def test_bus_services_tool(adapter):
@@ -150,25 +168,40 @@ def test_bus_skills_tool(adapter):
     assert "read_spec" in text
 
 
-def test_bus_artifact_tail_tool(bus_client):
-    a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
-    created = bus_client.post("/v1/artifacts", json={
+def test_artifact_tail_http_route_still_serves(bus_client):
+    """The MCP-side ``bus_artifact_tail`` tool was retired with
+    khonliang-store Phase 4c, but the underlying
+    ``/v1/artifacts/<id>/tail`` HTTP route stays reachable
+    because :class:`khonliang_store.artifacts.BusBackedArtifactStore`
+    uses it as the read fallback inside the store agent's
+    composite backend. Verify the HTTP surface still answers
+    correctly so the composite read path doesn't regress.
+    """
+    create_resp = bus_client.post("/v1/artifacts", json={
         "kind": "pytest_log",
         "title": "pytest",
         "content": "\n".join(f"line {i}" for i in range(20)),
         "producer": "test",
-    }).json()
+    })
+    # Assert the POST succeeded before reading the body so a
+    # future validation change shows up as a clear status-code
+    # mismatch rather than a confusing KeyError on ``created["id"]``.
+    assert create_resp.status_code == 200, (
+        f"artifact create returned {create_resp.status_code}: "
+        f"{create_resp.text}"
+    )
+    created = create_resp.json()
+    assert "id" in created, f"artifact create response missing 'id': {created}"
 
-    mcp = a.build()
-    result = asyncio.run(mcp.call_tool(
-        "bus_artifact_tail",
-        {"id": created["id"], "lines": 2, "max_chars": 100},
-    ))
-    text = _extract_text(result)
-    assert "line 18" in text
-    assert "line 19" in text
-    assert "pytest_log" in text
+    resp = bus_client.get(
+        f"/v1/artifacts/{created['id']}/tail",
+        params={"lines": 2, "max_chars": 100},
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert "line 18" in payload["text"]
+    assert "line 19" in payload["text"]
+    assert payload["artifact"]["kind"] == "pytest_log"
 
 
 def test_bus_feedback_tool(bus_client):

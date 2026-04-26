@@ -93,9 +93,14 @@ def build_response_envelope(
                 "title": artifact.get("title", ""),
                 "size_bytes": artifact.get("size_bytes", 0),
             })
+            # Read-side ``bus_artifact_*`` tools were retired with
+            # khonliang-store Phase 4c — point callers at the
+            # ``store-primary`` skills that own the read surface
+            # now. ``bus_artifact_distill`` stays on the bus until
+            # store grows an equivalent (Phase 5 territory).
             envelope["suggested_next_actions"].extend([
-                f"bus_artifact_tail id={artifact_id} lines=80",
-                f"bus_artifact_grep id={artifact_id} pattern=<term>",
+                f"store-primary.artifact_tail id={artifact_id} lines=80",
+                f"store-primary.artifact_grep id={artifact_id} pattern=<term>",
                 f"bus_artifact_distill id={artifact_id}",
             ])
 
