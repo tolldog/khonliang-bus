@@ -1,0 +1,19 @@
+[Unit]
+Description=khonliang-bus agent platform (prod, port 8788)
+Documentation=https://github.com/tolldog/khonliang-bus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/dev/ttoll/dev/khonliang-bus
+ExecStart=/mnt/dev/ttoll/dev/khonliang-bus/.venv/bin/python -m bus --port 8788 --db data/bus.db
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=khonliang-bus
+
+[Install]
+WantedBy=default.target
