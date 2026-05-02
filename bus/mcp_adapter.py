@@ -68,9 +68,9 @@ class BusMCPAdapter:
        parameter names starting with ``_``, so the schema-level kwarg
        drops the underscore that the in-args hint and the library
        constant still carry.
-    2. Per-call ``_mcp_timeout`` hint inside the skill's JSON ``args``
-       string (legacy / undiscoverable but still honored). Stripped
-       before forwarding to the skill handler.
+    2. Per-call ``_mcp_timeout`` hint inside the skill-or-flow JSON
+       ``args`` string (legacy / undiscoverable but still honored).
+       Stripped before forwarding to the skill handler.
     3. Adapter default set at construction (``default_timeout_s``), normally
        resolved from ``KHONLIANG_MCP_DEFAULT_TIMEOUT`` env var in ``main()``.
     4. Library fallback (``DEFAULT_MCP_TIMEOUT_S`` = 60s).
@@ -640,19 +640,22 @@ class BusMCPAdapter:
 
     # -- Control-plane helpers --
 
-    def _coerce_timeout(self, raw: Any) -> float | None:
-        """Validate a raw ``_mcp_timeout`` value (from either the top-level
-        kwarg or the in-args hint). Returns None when absent or invalid
-        (adapter default applies)."""
+    def _coerce_timeout(self, raw: Any, source: str = MCP_TIMEOUT_ARG) -> float | None:
+        """Validate a raw timeout value from either the top-level
+        ``mcp_timeout`` kwarg or the legacy in-args ``_mcp_timeout`` hint.
+        ``source`` is the spelling used in the warning logs so an operator
+        can see which ingress path supplied a bad value (the two spellings
+        differ because FastMCP rejects underscore-prefixed kwarg names).
+        Returns None when absent or invalid (adapter default applies)."""
         if raw is None:
             return None
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            logger.warning("Invalid %s value (not numeric): %r", MCP_TIMEOUT_ARG, raw)
+            logger.warning("Invalid %s value (not numeric): %r", source, raw)
             return None
         if value <= 0:
-            logger.warning("Invalid %s value (non-positive): %r", MCP_TIMEOUT_ARG, raw)
+            logger.warning("Invalid %s value (non-positive): %r", source, raw)
             return None
         return value
 
@@ -660,21 +663,23 @@ class BusMCPAdapter:
         """Extract and remove the ``_mcp_timeout`` control-plane hint from
         skill args so it isn't forwarded to the skill handler. Returns None
         when absent or invalid (adapter default applies)."""
-        return self._coerce_timeout(args.pop(MCP_TIMEOUT_ARG, None))
+        return self._coerce_timeout(args.pop(MCP_TIMEOUT_ARG, None), MCP_TIMEOUT_ARG)
 
     def _resolve_timeout(
         self, top_level: int | float | None, args: dict
     ) -> float | None:
-        """Pick the effective ``_mcp_timeout`` for a skill or flow call.
+        """Pick the effective per-call timeout for a skill or flow call.
 
-        Top-level kwarg (visible in the tool's JSON schema) wins over the
-        in-args hint (legacy, hidden inside the args JSON string). Either
-        path strips the hint from ``args`` so the skill handler never sees
-        it. Invalid values silently fall through to the next tier."""
+        Top-level ``mcp_timeout`` kwarg (visible in the tool's JSON schema)
+        wins over the legacy ``_mcp_timeout`` hint (hidden inside the args
+        JSON string). Either path strips the hint from ``args`` so the
+        skill handler never sees it. Invalid values silently fall through
+        to the next tier; warning logs label the bad value with the source
+        spelling so it's clear which ingress was supplied."""
         # Always pop the in-args hint to keep it out of the forwarded args,
         # even when the top-level kwarg ultimately wins.
         in_args = self._pop_timeout_hint(args)
-        top = self._coerce_timeout(top_level)
+        top = self._coerce_timeout(top_level, "mcp_timeout")
         return top if top is not None else in_args
 
     def _format_error(self, result: dict) -> str:
@@ -865,8 +870,10 @@ def main():
         default=None,
         help=(
             "Adapter-level default timeout (seconds) for skill invocations. "
-            "Overrides KHONLIANG_MCP_DEFAULT_TIMEOUT env var. Per-call "
-            "_mcp_timeout (top-level kwarg or in-args hint) still takes precedence."
+            "Overrides KHONLIANG_MCP_DEFAULT_TIMEOUT env var. A per-call "
+            "override still takes precedence: the top-level ``mcp_timeout`` "
+            "kwarg on a skill or flow tool, or the legacy ``_mcp_timeout`` "
+            "hint embedded in the ``args`` JSON string."
         ),
     )
     args = parser.parse_args()
