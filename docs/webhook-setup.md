@@ -117,7 +117,36 @@ skip the tunnel.
 
 ## 4. Configure each repo's GitHub webhook
 
-For every repository that should drive bus events, in
+### Option A: scripted (preferred for the khonliang-* fleet)
+
+`scripts/install-github-webhook.sh` reads the secret from
+`/etc/khonliang/webhook-secret.env`, derives the public URL from the
+local Tailscale hostname, and POSTs the canonical config (events:
+`pull_request`, `pull_request_review`, `pull_request_review_comment`,
+`issue_comment`, `push`, `check_run`) to one repo or all
+`tolldog/khonliang-*` repos at once. It is idempotent — installs that
+already target the resolved URL are skipped, not duplicated.
+
+```sh
+# Install on a single repo (defaults to owner=tolldog if no slash)
+scripts/install-github-webhook.sh khonliang-bus
+scripts/install-github-webhook.sh someorg/their-repo
+
+# Install on every tolldog/khonliang-* in one pass
+scripts/install-github-webhook.sh --all-khonliang
+
+# Verify last_response across one or many repos without making changes
+scripts/install-github-webhook.sh --check khonliang-bus khonliang-developer
+scripts/install-github-webhook.sh --check --all-khonliang
+```
+
+The script never echoes the secret, never writes it to a persistent
+location, and uses a `mode 0600` tempfile for the POST body. Override
+either input via `KHONLIANG_WEBHOOK_URL` or `KHONLIANG_SECRET_FILE`.
+
+### Option B: GitHub UI (one repo at a time)
+
+For repos outside the `tolldog/khonliang-*` fleet, in
 `Settings → Webhooks → Add webhook`:
 
 | Field | Value |
@@ -128,7 +157,9 @@ For every repository that should drive bus events, in
 | SSL verification | enabled |
 | Events | at minimum `Pull request reviews`; usually also `Pull requests`, `Check runs`, `Pushes` |
 
-After saving, GitHub fires a `ping` event. Verify it on the bus:
+### Verify the ping arrived on the bus
+
+After saving (either option), GitHub fires a `ping` event. Verify it on the bus:
 
 ```sh
 # Long-poll for any github.* event for up to 30s.
