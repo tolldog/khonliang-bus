@@ -162,3 +162,77 @@ def test_trace_lifecycle(db):
     assert len(trace) == 1
     assert trace[0]["status"] == "ok"
     assert trace[0]["duration_ms"] == 150
+
+
+def test_list_topics_empty_returns_empty_list(db):
+    assert db.list_topics() == []
+
+
+def test_list_topics_summarises_per_topic(db):
+    db.publish_message("github.pull_request_review.submitted", {"pr": 1}, "github-webhook")
+    db.publish_message("github.pull_request_review.submitted", {"pr": 2}, "github-webhook")
+    db.publish_message("pr.review", {"pr": 1}, "watch_pr_fleet")
+    db.publish_message("bus.registry_changed", {"agent_id": "x"}, "bus")
+
+    rows = db.list_topics()
+    by_topic = {r["topic"]: r for r in rows}
+
+    assert set(by_topic) == {
+        "github.pull_request_review.submitted",
+        "pr.review",
+        "bus.registry_changed",
+    }
+    pr_review = by_topic["github.pull_request_review.submitted"]
+    assert pr_review["count"] == 2
+    assert pr_review["producers"] == ["github-webhook"]
+    # first_fired_at and last_fired_at carry SQLite-formatted timestamps;
+    # we only check shape (non-empty, monotonic) — exact value is wall-
+    # clock-dependent.
+    assert pr_review["first_fired_at"]
+    assert pr_review["last_fired_at"]
+    assert pr_review["first_fired_at"] <= pr_review["last_fired_at"]
+
+
+def test_list_topics_distinct_producers(db):
+    db.publish_message("multi", {}, "agent-a")
+    db.publish_message("multi", {}, "agent-b")
+    db.publish_message("multi", {}, "agent-a")
+
+    rows = db.list_topics()
+    # Distinct via DISTINCT in GROUP_CONCAT, but order is implementation-
+    # defined (usually insertion order in SQLite). Compare as a set so
+    # the test isn't ordering-coupled.
+    assert set(rows[0]["producers"]) == {"agent-a", "agent-b"}
+
+
+def test_list_topics_prefix_filter(db):
+    db.publish_message("github.push", {}, "github-webhook")
+    db.publish_message("github.pull_request.opened", {}, "github-webhook")
+    db.publish_message("pr.review", {}, "watch_pr_fleet")
+    db.publish_message("bus.registry_changed", {}, "bus")
+
+    rows = db.list_topics(prefix="github.")
+    topics = {r["topic"] for r in rows}
+    assert topics == {"github.push", "github.pull_request.opened"}
+
+
+def test_list_topics_orders_by_last_fired_desc(db):
+    """Most recently active topic comes first — useful for live debugging
+    where the operator wants to know what's currently flowing."""
+    import time as _time
+    db.publish_message("old.topic", {}, "s")
+    # SQLite datetime('now') is second-resolution, so sleep enough that
+    # MAX(created_at) on a later publish strictly exceeds the earlier one.
+    _time.sleep(1.05)
+    db.publish_message("new.topic", {}, "s")
+
+    rows = db.list_topics()
+    assert rows[0]["topic"] == "new.topic"
+    assert rows[1]["topic"] == "old.topic"
+
+
+def test_list_topics_limit_caps_rows(db):
+    for i in range(5):
+        db.publish_message(f"topic.{i}", {}, "s")
+    rows = db.list_topics(limit=2)
+    assert len(rows) == 2

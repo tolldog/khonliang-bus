@@ -388,6 +388,66 @@ class BusDB:
                 (subscriber_id, topic, message_id),
             )
 
+    def list_topics(
+        self, prefix: str = "", limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Catalog every topic ever published with summary metadata.
+
+        Mirrors the shape of :meth:`list_skills` / :meth:`list_flows` for
+        the event surface so an MCP caller can introspect what's
+        flowing on the bus without reading source. Closes the
+        introspection-layer gap surfaced in dog_ce53165f and tracked by
+        ``fr_bus_7b2d41d2``.
+
+        Args:
+            prefix: Optional namespace filter (e.g. ``"github."``).
+                Case-sensitive ``LIKE 'prefix%'``. Empty matches all.
+            limit: Cap on rows returned, ordered by ``last_fired_at``
+                DESC so the most recently active topics come first.
+
+        Each row is::
+
+            {
+                "topic": str,
+                "count": int,                   # total messages on this topic
+                "first_fired_at": str,          # earliest created_at
+                "last_fired_at": str,           # most-recent created_at
+                "producers": list[str],         # distinct source values
+            }
+        """
+        with self.conn() as c:
+            sql = """
+                SELECT topic,
+                       COUNT(*) AS count,
+                       MIN(created_at) AS first_fired_at,
+                       MAX(created_at) AS last_fired_at,
+                       GROUP_CONCAT(DISTINCT source) AS producers
+                FROM messages
+                {where}
+                GROUP BY topic
+                ORDER BY last_fired_at DESC
+                LIMIT ?
+            """
+            params: list[Any] = []
+            where = ""
+            if prefix:
+                where = "WHERE topic LIKE ? || '%'"
+                params.append(prefix)
+            params.append(limit)
+            rows = c.execute(sql.format(where=where), params).fetchall()
+            return [
+                {
+                    "topic": r["topic"],
+                    "count": r["count"],
+                    "first_fired_at": r["first_fired_at"],
+                    "last_fired_at": r["last_fired_at"],
+                    "producers": (
+                        [p for p in (r["producers"] or "").split(",") if p]
+                    ),
+                }
+                for r in rows
+            ]
+
     def get_last_acked(self, subscriber_id: str, topic: str) -> int:
         with self.conn() as c:
             r = c.execute(

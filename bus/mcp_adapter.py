@@ -202,6 +202,43 @@ class BusMCPAdapter:
             return "\n".join(lines) if lines else "no flows declared"
 
         @mcp.tool()
+        async def bus_topics(prefix: str = "", limit: int = 200) -> str:
+            """Catalog every topic ever published on the bus.
+
+            Mirrors ``bus_skills`` / ``bus_flows`` for the event
+            surface so a session can discover canonical topic strings
+            for ``bus_wait_for_event`` without reading source. Closes
+            fr_bus_7b2d41d2 (surfaced by dog_ce53165f).
+
+            Args:
+                prefix: Optional namespace filter — case-sensitive
+                    LIKE-style ``prefix%`` (e.g. ``"github."``,
+                    ``"pr."``, ``"bus."``). Empty matches all.
+                limit: Cap on rows returned (default 200), ordered by
+                    last-fired DESC so the most recently active topics
+                    come first.
+
+            Returns one line per topic with
+            ``count``, ``last_fired_at``, and the producer agents that
+            have ever fired it.
+            """
+            params = {"limit": limit}
+            if prefix:
+                params["prefix"] = prefix
+            rows = adapter._get("/v1/topics", params=params) or []
+            if not rows:
+                hint = f" matching prefix={prefix!r}" if prefix else ""
+                return f"no topics{hint}"
+            lines = []
+            for r in rows:
+                producers = ",".join(r.get("producers") or []) or "?"
+                lines.append(
+                    f"  {r['topic']} (n={r['count']}, last={r['last_fired_at']}, "
+                    f"producers=[{producers}])"
+                )
+            return "\n".join(lines)
+
+        @mcp.tool()
         async def bus_wait_for_event(
             topics: str = "",
             subscriber_id: str = "claude-mcp",

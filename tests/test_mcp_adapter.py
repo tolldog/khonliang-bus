@@ -77,6 +77,7 @@ def test_build_registers_bus_tools(adapter):
     # remain because store doesn't have an equivalent yet.
     for bus_tool in (
         "bus_services", "bus_status", "bus_matrix", "bus_flows",
+        "bus_topics",
         "bus_trace", "bus_skills", "bus_feedback",
         "bus_artifact_distill", "bus_artifact_distill_many",
         "bus_start_agent", "bus_stop_agent", "bus_restart_agent",
@@ -121,10 +122,12 @@ def test_build_registers_flow_tools(adapter):
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
-    # 14 bus tools (12 non-artifact + 2 distill) + 3 skills + 1 flow = 18.
-    # The seven read-side bus_artifact_* tools were retired with
-    # khonliang-store Phase 4c (`fr_khonliang-bus_9151395d`).
-    assert len(tools) == 18
+    # 15 bus tools (12 non-artifact + 2 distill + 1 bus_topics) +
+    # 3 skills + 1 flow = 19. The seven read-side bus_artifact_*
+    # tools were retired with khonliang-store Phase 4c
+    # (`fr_khonliang-bus_9151395d`); ``bus_topics`` was added to
+    # close fr_bus_7b2d41d2 (event-surface introspection).
+    assert len(tools) == 19
 
 
 def test_bus_services_tool(adapter):
@@ -166,6 +169,56 @@ def test_bus_skills_tool(adapter):
     text = _extract_text(result)
     assert "find_papers" in text
     assert "read_spec" in text
+
+
+def test_bus_topics_tool_empty_message_when_prefix_matches_nothing(bus_client):
+    """The bus_client fixture registers test agents which fire
+    ``bus.registry_changed`` at fixture time, so a true empty bus is
+    not reachable from this test. Instead, exercise the empty path
+    via a prefix filter that matches nothing — same code path."""
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    mcp = a.build()
+    result = asyncio.run(mcp.call_tool("bus_topics", {"prefix": "no.such.prefix."}))
+    text = _extract_text(result)
+    assert "no topics" in text
+    assert "no.such.prefix." in text  # mention shows the unmatched filter
+
+
+def test_bus_topics_tool_lists_published(bus_client):
+    bus_client.post("/v1/publish", json={
+        "topic": "github.pull_request_review.submitted",
+        "payload": {"pr": 7},
+        "source": "github-webhook",
+    })
+    bus_client.post("/v1/publish", json={
+        "topic": "pr.review",
+        "payload": {"pr": 7},
+        "source": "watch_pr_fleet",
+    })
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    mcp = a.build()
+    result = asyncio.run(mcp.call_tool("bus_topics", {}))
+    text = _extract_text(result)
+    assert "github.pull_request_review.submitted" in text
+    assert "github-webhook" in text
+    assert "pr.review" in text
+    # Counts surface in the per-topic line so a session can spot
+    # high-volume topics at a glance.
+    assert "n=1" in text
+
+
+def test_bus_topics_tool_prefix_filter(bus_client):
+    bus_client.post("/v1/publish", json={"topic": "github.push", "payload": {}, "source": "github-webhook"})
+    bus_client.post("/v1/publish", json={"topic": "pr.review", "payload": {}, "source": "watch_pr_fleet"})
+    a = BusMCPAdapter("http://testserver")
+    a._http = bus_client
+    mcp = a.build()
+    result = asyncio.run(mcp.call_tool("bus_topics", {"prefix": "github."}))
+    text = _extract_text(result)
+    assert "github.push" in text
+    assert "pr.review" not in text
 
 
 def test_artifact_tail_http_route_still_serves(bus_client):

@@ -1605,6 +1605,17 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     def flows():
         return bus.get_validated_flows()
 
+    @app.get("/v1/topics")
+    def topics(prefix: str = "", limit: int = 200):
+        """Introspect the event surface — every topic ever published with
+        per-topic metadata. Mirrors the shape of /v1/skills and /v1/flows.
+
+        Closes fr_bus_7b2d41d2 (surfaced by dog_ce53165f): an MCP
+        session can discover canonical topic strings without reading
+        source.
+        """
+        return bus.db.list_topics(prefix=prefix, limit=limit)
+
     @app.post("/v1/flow")
     async def execute_flow(req: FlowRequest):
         return await bus.execute_flow(req)

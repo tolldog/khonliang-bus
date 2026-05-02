@@ -26,6 +26,34 @@ def test_flows_empty(client):
     assert r == {"available": [], "unavailable": []}
 
 
+def test_topics_endpoint_empty(client):
+    """No publishes → no topics. Closes fr_bus_7b2d41d2."""
+    r = client.get("/v1/topics").json()
+    assert r == []
+
+
+def test_topics_endpoint_summarises_published_topics(client):
+    client.post("/v1/publish", json={"topic": "github.pull_request_review.submitted", "payload": {"pr": 7}, "source": "github-webhook"})
+    client.post("/v1/publish", json={"topic": "pr.review", "payload": {"pr": 7}, "source": "watch_pr_fleet"})
+    client.post("/v1/publish", json={"topic": "github.pull_request_review.submitted", "payload": {"pr": 8}, "source": "github-webhook"})
+
+    rows = client.get("/v1/topics").json()
+    by_topic = {r["topic"]: r for r in rows}
+    assert set(by_topic) == {"github.pull_request_review.submitted", "pr.review"}
+    review = by_topic["github.pull_request_review.submitted"]
+    assert review["count"] == 2
+    assert review["producers"] == ["github-webhook"]
+    assert review["first_fired_at"]
+    assert review["last_fired_at"]
+
+
+def test_topics_endpoint_prefix_filter(client):
+    client.post("/v1/publish", json={"topic": "github.push", "payload": {}, "source": "github-webhook"})
+    client.post("/v1/publish", json={"topic": "pr.review", "payload": {}, "source": "watch_pr_fleet"})
+    rows = client.get("/v1/topics", params={"prefix": "github."}).json()
+    assert [r["topic"] for r in rows] == ["github.push"]
+
+
 def test_flows_available_when_requirements_met(client):
     # Register researcher with version 0.6.4
     register_test_agent(client, "researcher-primary", skills=[{"name": "find_papers"}])
