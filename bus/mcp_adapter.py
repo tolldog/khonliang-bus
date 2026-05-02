@@ -646,13 +646,21 @@ class BusMCPAdapter:
         ``source`` is the spelling used in the warning logs so an operator
         can see which ingress path supplied a bad value (the two spellings
         differ because FastMCP rejects underscore-prefixed kwarg names).
-        Returns None when absent or invalid (adapter default applies)."""
+        Returns None when absent or invalid (adapter default applies).
+
+        Rejects ``nan`` and ``inf`` for parity with ``_resolve_default_timeout``:
+        ``json.loads`` happily parses ``NaN``/``Infinity`` and either would
+        propagate down to ``httpx.Timeout(...)`` with bad consequences
+        (``inf`` effectively disables the cap; ``nan`` raises later)."""
         if raw is None:
             return None
         try:
             value = float(raw)
         except (TypeError, ValueError):
             logger.warning("Invalid %s value (not numeric): %r", source, raw)
+            return None
+        if not math.isfinite(value):
+            logger.warning("Invalid %s value (not finite): %r", source, raw)
             return None
         if value <= 0:
             logger.warning("Invalid %s value (non-positive): %r", source, raw)
@@ -869,7 +877,8 @@ def main():
         type=float,
         default=None,
         help=(
-            "Adapter-level default timeout (seconds) for skill invocations. "
+            "Adapter-level default timeout (seconds) for both skill and "
+            "flow invocations (also used as the +5s-buffered transport cap). "
             "Overrides KHONLIANG_MCP_DEFAULT_TIMEOUT env var. A per-call "
             "override still takes precedence: the top-level ``mcp_timeout`` "
             "kwarg on a skill or flow tool, or the legacy ``_mcp_timeout`` "

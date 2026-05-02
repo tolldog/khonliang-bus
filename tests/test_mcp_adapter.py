@@ -833,6 +833,39 @@ def test_invalid_mcp_timeout_hint_falls_back_silently(adapter):
         assert captured["timeout"] is None
 
 
+def test_coerce_timeout_rejects_non_finite_values():
+    """``_coerce_timeout`` must reject ``nan`` / ``inf`` / ``-inf`` so that
+    a JSON payload carrying ``NaN`` or ``Infinity`` (which ``json.loads``
+    happily parses) cannot disable the timeout cap or crash ``httpx``
+    downstream. Mirrors the CLI ``_resolve_default_timeout`` invariant."""
+    a = BusMCPAdapter("http://testserver")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert a._coerce_timeout(bad) is None
+        assert a._coerce_timeout(bad, "mcp_timeout") is None
+
+
+def test_in_args_timeout_hint_silently_drops_non_finite(adapter):
+    """End-to-end: an ``_mcp_timeout`` hint of ``Infinity`` (parseable by
+    json.loads) must fall back to the adapter default rather than reach
+    ``httpx.Timeout(inf)`` which would silently disable the cap."""
+    captured: dict = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        captured["timeout"] = timeout
+        return {"result": "ok"}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    # ``Infinity`` is non-standard JSON but Python's ``json.loads`` accepts
+    # it by default. Build the args string by hand so the malicious value
+    # survives all the way to ``_coerce_timeout``.
+    asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {"args": '{"query": "q", "_mcp_timeout": Infinity}'},
+    ))
+    assert captured["timeout"] is None
+
+
 def test_skill_timeout_returns_non_empty_error_with_marker(adapter):
     """Regression: when a call exceeds the cap, the MCP response must be a
     non-empty string including ``timed_out=true`` — not the historical
