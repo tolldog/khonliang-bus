@@ -85,11 +85,15 @@ def summarize(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         summary["issue_number"] = issue.get("number")
         summary["issue_title"] = issue.get("title")
 
-    # Review events
+    # Review events. ``review_url`` (the review's html_url) lets a
+    # subscriber dereference the review on GitHub without rebuilding the
+    # URL from pr_number + review id — matches the ``body_url`` field
+    # promised in fr_bus_8179c5bd's payload contract.
     review = payload.get("review") or {}
     if review:
         summary["review_state"] = review.get("state")
         summary["review_author"] = (review.get("user") or {}).get("login")
+        summary["review_url"] = review.get("html_url")
 
     # Push events
     if event_type == "push":
