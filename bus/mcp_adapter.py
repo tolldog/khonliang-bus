@@ -206,6 +206,7 @@ class BusMCPAdapter:
             topics: str = "",
             subscriber_id: str = "claude-mcp",
             timeout: float = 30.0,
+            cursor: str = "",
         ) -> str:
             """Long-poll for the next bus event matching ``topics``.
 
@@ -218,6 +219,14 @@ class BusMCPAdapter:
                 subscriber_id: Stable ID so the bus doesn't re-deliver
                     the same event across wait calls. Default "claude-mcp".
                 timeout: Max seconds to wait (default 30).
+                cursor: Where to start matching from. ``""`` (default)
+                    replays unacked history (legacy semantics — a fresh
+                    subscriber sees retained backlog). ``"now"`` /
+                    ``"latest"`` snapshot the current high-water mark
+                    and only return events published after this call
+                    begins; useful for "wake me when the next thing
+                    happens" without draining backlog one-event-per-call.
+                    Per-call floor; not persisted.
 
             Returns a string describing the event or "timeout".
             """
@@ -232,6 +241,7 @@ class BusMCPAdapter:
                     "subscriber_id": subscriber_id,
                     "timeout": timeout,
                     "ack_on_return": True,
+                    "cursor": cursor,
                 },
                 http_timeout=timeout + 5,
             )

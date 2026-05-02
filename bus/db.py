@@ -397,12 +397,20 @@ class BusDB:
             return r[0] if r else 0
 
     def find_earliest_unacked(
-        self, subscriber_id: str, topics: list[str] | None = None
+        self, subscriber_id: str, topics: list[str] | None = None,
+        min_id: int = 0,
     ) -> dict[str, Any] | None:
         """Return the earliest message the subscriber has not acked.
 
         Single-query replacement for per-topic loops. If ``topics`` is
         non-empty, restricts to those topics. Otherwise matches any.
+
+        ``min_id`` is a per-call floor: the matcher requires
+        ``m.id > MAX(last_acked_id, min_id)``. Used by
+        ``Bus.wait_for_event`` to implement ``cursor='now'`` semantics
+        — a fresh subscriber pinned to the current high-water mark
+        won't replay backlog. Defaults to 0 (no floor) so existing
+        replay-from-ack behaviour is unchanged.
         """
         with self.conn() as c:
             if topics:
@@ -412,21 +420,31 @@ class BusDB:
                     LEFT JOIN subscriptions s
                         ON s.subscriber_id = ? AND s.topic = m.topic
                     WHERE m.topic IN ({placeholders})
-                      AND m.id > COALESCE(s.last_acked_id, 0)
+                      AND m.id > MAX(COALESCE(s.last_acked_id, 0), ?)
                     ORDER BY m.id ASC LIMIT 1
                 """
-                params: list[Any] = [subscriber_id, *topics]
+                params: list[Any] = [subscriber_id, *topics, min_id]
             else:
                 sql = """
                     SELECT m.* FROM messages m
                     LEFT JOIN subscriptions s
                         ON s.subscriber_id = ? AND s.topic = m.topic
-                    WHERE m.id > COALESCE(s.last_acked_id, 0)
+                    WHERE m.id > MAX(COALESCE(s.last_acked_id, 0), ?)
                     ORDER BY m.id ASC LIMIT 1
                 """
-                params = [subscriber_id]
+                params = [subscriber_id, min_id]
             r = c.execute(sql, params).fetchone()
             return _row_to_dict(r) if r else None
+
+    def max_message_id(self) -> int:
+        """Current high-water mark across all topics, or 0 when empty.
+
+        Used by ``Bus.wait_for_event`` to snapshot the floor for
+        ``cursor='now'`` callers so they skip pre-existing backlog.
+        """
+        with self.conn() as c:
+            r = c.execute("SELECT MAX(id) FROM messages").fetchone()
+            return (r[0] or 0) if r else 0
 
     def add_dead_letter(
         self,
