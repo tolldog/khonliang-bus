@@ -113,7 +113,11 @@ def test_summarize_review_event():
     payload = {
         "action": "submitted",
         "pull_request": {"number": 42, "title": "Fix bug"},
-        "review": {"state": "approved", "user": {"login": "reviewer"}},
+        "review": {
+            "state": "approved",
+            "user": {"login": "reviewer"},
+            "html_url": "https://github.com/o/r/pull/42#pullrequestreview-9001",
+        },
         "repository": {"full_name": "r"},
         "sender": {"login": "reviewer"},
     }
@@ -121,6 +125,25 @@ def test_summarize_review_event():
     assert s["review_state"] == "approved"
     assert s["review_author"] == "reviewer"
     assert s["pr_number"] == 42
+    # ``review_url`` (the review's html_url) is the FR's promised
+    # ``body_url`` field — lets a subscriber dereference the review on
+    # GitHub without rebuilding the URL from pr_number + review id.
+    assert s["review_url"] == "https://github.com/o/r/pull/42#pullrequestreview-9001"
+
+
+def test_summarize_review_event_without_html_url():
+    """``review_url`` should be ``None`` when GitHub's payload omits it
+    rather than crashing the summarizer (defensive against future
+    payload shape drift)."""
+    payload = {
+        "action": "submitted",
+        "pull_request": {"number": 42, "title": "t"},
+        "review": {"state": "approved", "user": {"login": "reviewer"}},
+        "repository": {"full_name": "r"},
+        "sender": {"login": "reviewer"},
+    }
+    s = summarize("pull_request_review", payload)
+    assert s["review_url"] is None
 
 
 def test_summarize_check_run():
@@ -186,14 +209,29 @@ def test_webhook_accepts_unsigned_when_opt_in(tmp_path):
 
 
 def test_webhook_publishes_to_bus(unsigned_client):
-    """The webhook should publish an event that bus_wait_for_event can see."""
+    """The webhook should publish an event that bus_wait_for_event can see.
+
+    Asserts the FR-mandated payload contract for ``fr_bus_8179c5bd``:
+    a subscriber to ``github.pull_request_review.submitted`` (the
+    GitHub-native rendering of the FR's ``pr.review.posted`` topic
+    suggestion) receives ``pr_url``, ``review_author``, and
+    ``review_url`` (the FR's ``body_url``) in the summary.
+    """
     client = unsigned_client
     payload = {
         "action": "submitted",
         "repository": {"full_name": "r"},
         "sender": {"login": "reviewer"},
-        "pull_request": {"number": 7, "title": "t"},
-        "review": {"state": "approved", "user": {"login": "reviewer"}},
+        "pull_request": {
+            "number": 7,
+            "title": "t",
+            "html_url": "https://github.com/o/r/pull/7",
+        },
+        "review": {
+            "state": "approved",
+            "user": {"login": "reviewer"},
+            "html_url": "https://github.com/o/r/pull/7#pullrequestreview-9001",
+        },
     }
     client.post(
         "/v1/webhooks/github",
@@ -210,8 +248,12 @@ def test_webhook_publishes_to_bus(unsigned_client):
     assert r["status"] == "matched"
     assert r["event"]["topic"] == "github.pull_request_review.submitted"
     payload_out = r["event"]["payload"]
-    assert payload_out["summary"]["pr_number"] == 7
-    assert payload_out["summary"]["review_state"] == "approved"
+    summary = payload_out["summary"]
+    assert summary["pr_number"] == 7
+    assert summary["pr_url"] == "https://github.com/o/r/pull/7"
+    assert summary["review_state"] == "approved"
+    assert summary["review_author"] == "reviewer"
+    assert summary["review_url"] == "https://github.com/o/r/pull/7#pullrequestreview-9001"
     assert payload_out["github"]["action"] == "submitted"
 
 
