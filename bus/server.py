@@ -1607,8 +1607,12 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.get("/v1/topics")
     def topics(prefix: str = "", limit: int = 200):
-        """Introspect the event surface — every topic ever published with
-        per-topic metadata. Mirrors the shape of /v1/skills and /v1/flows.
+        """Introspect the event surface — every topic ever published
+        with per-topic metadata. Returns a JSON list of topic objects,
+        same shape as ``GET /v1/skills`` (``GET /v1/flows`` returns
+        ``{available, unavailable}`` instead — different envelope, so
+        this endpoint follows the ``/v1/skills`` shape rather than
+        the ``/v1/flows`` one).
 
         Closes fr_bus_7b2d41d2 (surfaced by dog_ce53165f): an MCP
         session can discover canonical topic strings without reading

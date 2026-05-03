@@ -467,29 +467,47 @@ class BusDB:
             limit_int = 200
         clamped_limit = max(1, min(limit_int, self.LIST_TOPICS_LIMIT_CAP))
         sep = self._PRODUCERS_SEPARATOR
-        # SQL parameter for the GROUP_CONCAT separator: pass the
-        # constant in via a placeholder rather than hardcoding
-        # ``char(31)`` so the SQL and Python sides can never silently
-        # diverge if ``_PRODUCERS_SEPARATOR`` is ever changed.
+        # Aggregate per-topic stats and producers in two stages so the
+        # ``producers`` aggregate is built from the DISTINCT source set
+        # only — not from every message on the topic. On a high-volume
+        # topic (millions of messages, few distinct producers) the
+        # earlier ``GROUP_CONCAT(source, sep)`` over the full table
+        # produced a huge intermediate string that the Python layer
+        # then deduped. The CTE narrows the inner aggregate to the
+        # distinct sources first; the per-topic correlated subquery
+        # joins them back. With ``idx_messages_topic_created`` in
+        # place each subquery is an indexed lookup.
         with self.conn() as c:
             sql = """
-                SELECT topic,
-                       COUNT(*) AS count,
-                       MIN(created_at) AS first_fired_at,
-                       MAX(created_at) AS last_fired_at,
-                       GROUP_CONCAT(source, ?) AS producers
-                FROM messages
-                {where}
-                GROUP BY topic
-                ORDER BY last_fired_at DESC
-                LIMIT ?
+                WITH topic_stats AS (
+                    SELECT topic,
+                           COUNT(*) AS count,
+                           MIN(created_at) AS first_fired_at,
+                           MAX(created_at) AS last_fired_at
+                    FROM messages
+                    {where}
+                    GROUP BY topic
+                    ORDER BY last_fired_at DESC
+                    LIMIT ?
+                )
+                SELECT t.topic,
+                       t.count,
+                       t.first_fired_at,
+                       t.last_fired_at,
+                       (SELECT GROUP_CONCAT(s, ?)
+                          FROM (SELECT DISTINCT source AS s
+                                  FROM messages
+                                 WHERE topic = t.topic)) AS producers
+                FROM topic_stats t
+                ORDER BY t.last_fired_at DESC
             """
-            params: list[Any] = [sep]
+            params: list[Any] = []
             where = ""
             if prefix:
                 where = "WHERE topic GLOB ? || '*'"
                 params.append(self._glob_escape(prefix))
             params.append(clamped_limit)
+            params.append(sep)
             rows = c.execute(sql.format(where=where), params).fetchall()
             return [
                 {
