@@ -19,6 +19,16 @@ unsigned requests with `401` once a secret is set; with no secret AND
 no explicit `github_webhook_allow_unsigned: true` in bus config it
 returns `503` (preventing a forged-event footgun in production).
 
+> **Port assumption.** All shell snippets below use port **`8788`**,
+> which is what the canonical systemd unit
+> (`/etc/systemd/system/khonliang-bus.service`) passes to
+> `ExecStart=python -m bus --port 8788`. The bare module
+> (`bus/__main__.py`) defaults to port `8787`, so a fresh-checkout
+> `python -m bus` without the `--port` flag listens on a different
+> socket. Either align your systemd unit to use `--port 8788`
+> (recommended; matches every example here), or substitute your
+> chosen port into each `localhost:8788` reference below.
+
 ## 1. Generate a webhook secret
 
 The secret is a shared string between your bus and GitHub. Generate it
@@ -133,8 +143,10 @@ curl -s -X POST http://localhost:8788/v1/webhooks/github \
 ## 3. Expose the endpoint to the public internet
 
 GitHub posts webhooks from public IPs over HTTPS, so the bus needs a
-reachable URL. By default the bus binds Uvicorn to `0.0.0.0:8788`
-(see `bus/__main__.py`'s `--host` default), which means the
+reachable URL. By default the bus binds Uvicorn to `0.0.0.0` (see
+`bus/__main__.py`'s `--host` default; port is `8788` per the
+runbook's port assumption above, or `8787` if you're running the
+bare module without `--port`). Binding to `0.0.0.0` means the
 unauthenticated control-plane routes — `/v1/register`,
 `/v1/request`, `/v1/publish`, `/v1/install/*`, … — are *already*
 reachable on every interface the host has, including any LAN /
@@ -211,6 +223,24 @@ config (events: `pull_request`, `pull_request_review`,
 to one repo or all `tolldog/khonliang-*` repos at once. It is
 idempotent — installs that already target the resolved URL are
 skipped, not duplicated.
+
+> **Prerequisites for the scripted path:**
+>
+> - `gh` CLI installed (`https://cli.github.com`).
+> - `gh auth login` completed for an account that has admin
+>   access to every repo you intend to install on. Webhook
+>   create / patch requires the `admin:repo_hook` scope —
+>   verify with `gh auth status` (the scope list should
+>   include it). A read-only token will return 403/404 from
+>   `gh api` calls and the script will surface the gh stderr
+>   verbatim.
+> - `python3` available (used for JSON encode/decode).
+> - When `KHONLIANG_WEBHOOK_URL` is unset, `tailscale` must
+>   also be in PATH so the script can resolve your tailnet
+>   hostname.
+>
+> The script's `require_dep` check fires up front and prints
+> these requirements explicitly when something is missing.
 
 > **If you used Option B or C** (cloudflared / ngrok / your own
 > proxy), the local `*.ts.net` hostname won't resolve to the right

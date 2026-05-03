@@ -6,17 +6,24 @@
 #   scripts/install-github-webhook.sh <repo>           # install on tolldog/<repo>
 #   scripts/install-github-webhook.sh <owner/repo>     # install on owner/repo
 #   scripts/install-github-webhook.sh --all-khonliang  # install on every tolldog/khonliang-*
-#   scripts/install-github-webhook.sh --check <repo>   # verify hook + last_response only
+#   scripts/install-github-webhook.sh --check <repo>   # verify hook config + drift + last_response
 #
 # Environment:
 #   KHONLIANG_WEBHOOK_URL   public webhook URL (default reads ts.net hostname)
 #   KHONLIANG_SECRET_FILE   path to env file holding GITHUB_WEBHOOK_SECRET
 #                           (default: /etc/khonliang/webhook-secret.env)
 #
-# Secret handling: the script reads the secret from the env file once,
-# stages it in a mode-0600 tempfile that ``gh api --input`` consumes,
-# then unlinks the tempfile via a RETURN trap. No secret value is
-# echoed to the terminal or persisted to logs by this script.
+# Secret handling: the script reads the secret from the env file
+# once, stages it in a mode-0600 tempfile that ``gh api --input``
+# consumes. Cleanup is guaranteed by an ``EXIT`` trap that walks
+# every tempfile registered via ``register_tmpfile``, so an early
+# abort under ``set -e`` (e.g. mid-write to the body file, or a
+# failed gh api call) doesn't leave secret-bearing tempfiles on
+# disk. The earlier ``RETURN`` trap pattern was removed because
+# bash RETURN traps are shell-global, not function-scoped — once
+# installed they persisted across every later helper-function
+# return and operated on out-of-scope variables. No secret value
+# is echoed to the terminal or persisted to logs by this script.
 #
 # Note: the secret IS transmitted to GitHub as part of the webhook
 # create/patch request body (``config.secret``) — that's how GitHub
@@ -46,6 +53,31 @@ WEBHOOK_PATH="/v1/webhooks/github"
 DEFAULT_OWNER="tolldog"
 DEFAULT_SECRET_FILE="${KHONLIANG_SECRET_FILE:-/etc/khonliang/webhook-secret.env}"
 EVENTS=(pull_request pull_request_review pull_request_review_comment issue_comment push check_run)
+
+# Tempfile registry. Every function that creates a secret-bearing
+# tempfile appends to this array (via ``register_tmpfile``); the
+# EXIT trap below walks the array on any script exit — normal
+# termination, ``set -e`` abort mid-write, ^C, or an uncaught
+# error — so secret-bearing tempfiles never linger on disk.
+TMPFILES=()
+register_tmpfile() {
+    TMPFILES+=("$1")
+}
+cleanup_tmpfiles() {
+    # Always succeed — this runs in an EXIT trap and its exit code
+    # becomes the script's exit code. ``[[ -n "$f" ]] && rm`` would
+    # return 1 on the empty-array iteration (when TMPFILES has no
+    # entries, ``${TMPFILES[@]:-}`` expands to a single empty
+    # string), corrupting normal-success exits to rc=1.
+    local f
+    for f in "${TMPFILES[@]:-}"; do
+        if [[ -n "$f" ]]; then
+            rm -f "$f"
+        fi
+    done
+    return 0
+}
+trap cleanup_tmpfiles EXIT
 
 require_dep() {
     # Surface missing-tool errors up front rather than letting the user
@@ -369,13 +401,18 @@ install_one() {
         #
         # NOTE: bash ``trap RETURN`` is shell-global, not
         # function-scoped — installing one here would persist into
-        # every subsequent function return in this shell, eventually
-        # operating on a $body that no longer exists (and aborting
-        # under ``set -u``). We clean up explicitly before each
-        # return instead.
+        # every subsequent function return in this shell. The
+        # script-wide ``cleanup_tmpfiles`` EXIT trap registered at
+        # module load time walks ``TMPFILES`` on any termination
+        # (success, ``set -e`` abort, ^C), so we register the
+        # tempfile up front and cleanup is guaranteed even if the
+        # function aborts mid-write. The explicit ``rm -f`` on
+        # success paths below just trims the array eagerly so
+        # long-running invocations don't accumulate stale entries.
         local drift="${rest#*:}"
         local body
         body=$(mktemp)
+        register_tmpfile "$body"
         chmod 600 "$body"
         EVENTS_JSON="$events_json" URL="$url" SECRET="$secret" python3 -c '
 import json, os
@@ -407,9 +444,11 @@ print(json.dumps({
 
     local body
     body=$(mktemp)
+    register_tmpfile "$body"
     chmod 600 "$body"
-    # See note in the drift branch above about bash RETURN trap
-    # scoping — explicit ``rm -f`` before every return below.
+    # See note in the drift branch above: cleanup is guaranteed by
+    # the script-wide ``cleanup_tmpfiles`` EXIT trap; the
+    # ``rm -f`` on the success path is eager-trim only.
     EVENTS_JSON="$events_json" URL="$url" SECRET="$secret" python3 -c '
 import json, os
 print(json.dumps({
