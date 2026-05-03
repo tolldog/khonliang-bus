@@ -111,7 +111,14 @@ resolve_secret() {
         exit 2
     fi
     local line
-    line=$(printf '%s\n' "$body" | grep -E '^GITHUB_WEBHOOK_SECRET=' | head -n1 || true)
+    # Use the LAST matching line, not the first. systemd's
+    # ``EnvironmentFile=`` semantics give the last effective
+    # assignment to a duplicated key — if an operator leaves an
+    # old value earlier in the file and a new value below it, the
+    # bus loads the new one. Taking ``head -n1`` here would sign
+    # with the stale value and every signed POST would 401. ``tail``
+    # matches the bus's loaded value.
+    line=$(printf '%s\n' "$body" | grep -E '^GITHUB_WEBHOOK_SECRET=' | tail -n1 || true)
     if [[ -z "$line" ]]; then
         echo "error: $DEFAULT_SECRET_FILE has no GITHUB_WEBHOOK_SECRET= line" >&2
         echo "  See etc/khonliang-bus/webhook-secret.env.example for the shape." >&2
@@ -424,14 +431,27 @@ print(json.dumps({
 }
 
 list_khonliang_repos() {
-    gh repo list "$DEFAULT_OWNER" --limit 200 --json name -q '.[].name' \
-        | grep -E '^khonliang' \
+    # Paginate ``gh repo list``: passing a large ``--limit`` makes
+    # gh internally walk pages until the cap is hit, so a fleet
+    # that grows past 200 repos doesn't get its tail silently
+    # truncated. The match prefix below also requires a
+    # word-boundary (``khonliang-`` rather than just
+    # ``khonliang``) so a future repo named ``khonliang_archive``
+    # or ``khonliang2`` doesn't sneak into the install set —
+    # automation should target the canonical ``khonliang-*``
+    # naming explicitly.
+    gh repo list "$DEFAULT_OWNER" --limit 1000 --json name -q '.[].name' \
+        | grep -E '^khonliang-' \
         | sort
 }
 
 usage() {
+    # ``--help`` / ``-h`` is a successful code path. Returning a
+    # non-zero exit here would break shell-completion harnesses
+    # and CI lint checks that grep ``--help`` for valid
+    # invocations and treat non-zero as a missing-tool failure.
     sed -n '2,18p' "$0"
-    exit 1
+    exit 0
 }
 
 case "${1:-}" in

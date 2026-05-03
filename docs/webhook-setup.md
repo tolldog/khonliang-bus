@@ -45,6 +45,28 @@ The recommended layout for a systemd-supervised prod bus is an
 environment file plus a unit drop-in, so the secret is owned by the
 service user and never lands in committed configuration.
 
+### 2a. Sanity-check the pre-install state (optional)
+
+Before touching anything, confirm the receiver is in the
+"no-secret" state. This step is **only meaningful before the
+install commands in 2b**: once the secret is installed and the
+service has been restarted, the receiver no longer returns 503
+for unsigned posts. Skip if you're upgrading an already-configured
+bus.
+
+```sh
+# Should return HTTP 503 ("webhook receiver not configured") when
+# no secret is set AND github_webhook_allow_unsigned is not in the
+# bus config. Confirms the receiver itself is reachable on
+# localhost:8788 before you start changing anything.
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -X POST http://localhost:8788/v1/webhooks/github \
+  -H 'X-GitHub-Event: ping' -H 'Content-Type: application/json' \
+  -d '{"zen":"pre-install"}'
+```
+
+### 2b. Install the secret + drop-in, then restart
+
 Copy the templates from `etc/khonliang-bus/` into the system locations
 and fill them in:
 
@@ -65,36 +87,38 @@ sudo systemctl daemon-reload
 sudo systemctl restart khonliang-bus.service
 ```
 
-Verify the bus picked up the secret by walking the three states the
-receiver returns:
+### 2c. Verify post-install state
+
+After restart, the receiver should reject unsigned requests with
+`401` and accept properly-signed requests with `200`. Both checks
+are runnable in either order; together they prove the secret was
+loaded and HMAC verification works end-to-end.
 
 ```sh
-# Step 1 — BEFORE installing the secret: should return HTTP 503
-# ("webhook receiver not configured"). If you see 503 after restart,
-# the EnvironmentFile= path is wrong or the file is missing.
+# Unsigned POST → HTTP 401 ("invalid signature"). If you still see
+# 503 here, the EnvironmentFile= path is wrong or the env file is
+# unreadable by the khonliang user — re-check the install commands.
 curl -s -o /dev/null -w '%{http_code}\n' \
   -X POST http://localhost:8788/v1/webhooks/github \
   -H 'X-GitHub-Event: ping' -H 'Content-Type: application/json' \
-  -d '{"zen":"smoke"}'
+  -d '{"zen":"unsigned-smoke"}'
 
-# Step 2 — AFTER restart with the secret in place: should return
-# HTTP 401 ("invalid signature") on an unsigned POST.
-curl -s -o /dev/null -w '%{http_code}\n' \
-  -X POST http://localhost:8788/v1/webhooks/github \
-  -H 'X-GitHub-Event: ping' -H 'Content-Type: application/json' \
-  -d '{"zen":"smoke"}'
-
-# Step 3 — Signed POST with the actual secret: should return HTTP 200
-# ("status: published"). Confirms HMAC verification + bus publish.
+# Signed POST → HTTP 200 ("status: published"). Confirms HMAC
+# verification AND that the bus publish path fires the event.
 #
 # The sed pipeline strips surrounding "double" or 'single' quotes so
 # the signing matches systemd's EnvironmentFile= unquoting behaviour:
 # if the operator wrote GITHUB_WEBHOOK_SECRET="..." in the env file,
 # systemd unquotes it before the bus reads it, so the signature must
 # also be computed against the unquoted value.
+# Use ``tail -n1`` so the smoke command picks the LAST
+# ``GITHUB_WEBHOOK_SECRET=`` line, matching systemd's
+# ``EnvironmentFile=`` semantics — the bus loads the last
+# effective assignment to a duplicated key. ``head -n1`` would
+# read a stale earlier value and every signed POST would 401.
 SECRET=$(sudo cat /etc/khonliang/webhook-secret.env \
   | grep -E '^GITHUB_WEBHOOK_SECRET=' \
-  | head -n1 \
+  | tail -n1 \
   | cut -d= -f2- \
   | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')
 BODY='{"zen":"signed-smoke"}'
