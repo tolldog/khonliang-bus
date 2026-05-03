@@ -366,11 +366,17 @@ install_one() {
         # Drift detected — repair via PATCH so a misconfigured
         # hook (wrong events, inactive, lost secret server-side,
         # …) doesn't stay broken on rerun.
+        #
+        # NOTE: bash ``trap RETURN`` is shell-global, not
+        # function-scoped — installing one here would persist into
+        # every subsequent function return in this shell, eventually
+        # operating on a $body that no longer exists (and aborting
+        # under ``set -u``). We clean up explicitly before each
+        # return instead.
         local drift="${rest#*:}"
         local body
         body=$(mktemp)
         chmod 600 "$body"
-        trap 'rm -f "$body"' RETURN
         EVENTS_JSON="$events_json" URL="$url" SECRET="$secret" python3 -c '
 import json, os
 print(json.dumps({
@@ -383,11 +389,15 @@ print(json.dumps({
         "secret": os.environ["SECRET"],
     },
 }))' > "$body"
-        local patch_result
+        local patch_result patch_rc=0
         if ! patch_result=$(gh api --method PATCH \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "/repos/${repo}/hooks/${hook_id}" --input "$body" 2>&1); then
+            patch_rc=1
+        fi
+        rm -f "$body"
+        if [[ $patch_rc -ne 0 ]]; then
             echo "ERR $repo: PATCH hook $hook_id (drift=$drift) failed: $(printf '%s' "$patch_result" | head -c 300)" >&2
             return 1
         fi
@@ -398,7 +408,8 @@ print(json.dumps({
     local body
     body=$(mktemp)
     chmod 600 "$body"
-    trap 'rm -f "$body"' RETURN
+    # See note in the drift branch above about bash RETURN trap
+    # scoping — explicit ``rm -f`` before every return below.
     EVENTS_JSON="$events_json" URL="$url" SECRET="$secret" python3 -c '
 import json, os
 print(json.dumps({
@@ -413,11 +424,15 @@ print(json.dumps({
     },
 }))' > "$body"
 
-    local result
+    local result result_rc=0
     if ! result=$(gh api --method POST \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         "/repos/${repo}/hooks" --input "$body" 2>&1); then
+        result_rc=1
+    fi
+    rm -f "$body"
+    if [[ $result_rc -ne 0 ]]; then
         echo "ERR $repo: $(printf '%s' "$result" | head -c 300)" >&2
         return 1
     fi

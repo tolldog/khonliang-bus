@@ -133,15 +133,32 @@ curl -s -X POST http://localhost:8788/v1/webhooks/github \
 ## 3. Expose the endpoint to the public internet
 
 GitHub posts webhooks from public IPs over HTTPS, so the bus needs a
-reachable URL. The bus itself stays bound to `localhost:8788`; only the
-single webhook path should be exposed to the outside.
+reachable URL. By default the bus binds Uvicorn to `0.0.0.0:8788`
+(see `bus/__main__.py`'s `--host` default), which means the
+unauthenticated control-plane routes — `/v1/register`,
+`/v1/request`, `/v1/publish`, `/v1/install/*`, … — are *already*
+reachable on every interface the host has, including any LAN /
+VPN / tailnet IP. Adding a path-scoped public proxy alone does
+NOT make those routes private; it just adds a second public
+ingress.
 
-> **Critical:** the bus FastAPI app also serves unauthenticated
-> control-plane routes (`/v1/register`, `/v1/request`, `/v1/publish`,
-> `/v1/install/*`, …) on the same listener. If you point a public
-> proxy or load balancer at the entire `localhost:8788`, those routes
-> become reachable too. Every option below scopes the public surface
-> to **only** `/v1/webhooks/github`. Do not skip that scoping.
+> **Critical — close the host-network exposure first.** Either:
+>
+> 1. **Bind the bus to `127.0.0.1`** by passing `--host 127.0.0.1`
+>    in the systemd `ExecStart`. Recommended for single-host
+>    deployments; the unauthenticated routes are then only reachable
+>    via the tunnel/proxy you set up below, scoped to the webhook
+>    path. After editing the unit, `sudo systemctl daemon-reload &&
+>    sudo systemctl restart khonliang-bus`.
+> 2. **Or accept LAN-side exposure deliberately** (acceptable for a
+>    trusted tailnet where every peer is already an authorized
+>    operator) — but document it; the path-scoped Funnel/proxy
+>    options below only constrain the *internet*-side surface.
+>
+> Every Option below additionally scopes the public ingress to
+> **only** `/v1/webhooks/github`. The path scoping is necessary
+> but not sufficient on its own: it doesn't undo the host-NIC
+> binding.
 
 ### Option A: Tailscale Funnel (recommended for tailnet-managed hosts)
 
