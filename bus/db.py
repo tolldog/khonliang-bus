@@ -398,14 +398,6 @@ class BusDB:
 
     LIST_TOPICS_LIMIT_CAP = 1000
 
-    # ASCII Unit Separator (US, 0x1F) — chosen as the GROUP_CONCAT
-    # separator for the producers aggregate so that comma-bearing
-    # source values don't corrupt the split. 0x1F is reserved for
-    # exactly this purpose in ASCII and never appears in identifier-
-    # like agent / source strings. Held as a class constant so tests
-    # can assert against it without re-deriving the choice.
-    _PRODUCERS_SEPARATOR = "\x1f"
-
     @staticmethod
     def _glob_escape(value: str) -> str:
         """Escape SQLite ``GLOB`` metacharacters in a literal-match
@@ -466,17 +458,24 @@ class BusDB:
         except (TypeError, ValueError):
             limit_int = 200
         clamped_limit = max(1, min(limit_int, self.LIST_TOPICS_LIMIT_CAP))
-        sep = self._PRODUCERS_SEPARATOR
         # Aggregate per-topic stats and producers in two stages so the
         # ``producers`` aggregate is built from the DISTINCT source set
         # only — not from every message on the topic. On a high-volume
-        # topic (millions of messages, few distinct producers) the
-        # earlier ``GROUP_CONCAT(source, sep)`` over the full table
-        # produced a huge intermediate string that the Python layer
-        # then deduped. The CTE narrows the inner aggregate to the
-        # distinct sources first; the per-topic correlated subquery
-        # joins them back. With ``idx_messages_topic_created`` in
-        # place each subquery is an indexed lookup.
+        # topic (millions of messages, few distinct producers) a flat
+        # ``GROUP_CONCAT`` over the full table produced a huge
+        # intermediate string. The CTE narrows the inner aggregate to
+        # the distinct sources first; the per-topic correlated
+        # subquery joins them back. With ``idx_messages_topic_created``
+        # each subquery is an indexed lookup.
+        #
+        # Producers come back as a real JSON array via
+        # ``json_group_array`` rather than a separator-joined string.
+        # That removes any in-band-separator collision risk —
+        # ``PublishRequest.source`` is an unconstrained string, and an
+        # earlier 0x1F-separator design could have corrupted the
+        # producers list if a source value happened to contain that
+        # byte. JSON array encoding sidesteps the entire class of
+        # problem at zero readability cost on the consumer side.
         with self.conn() as c:
             sql = """
                 WITH topic_stats AS (
@@ -494,7 +493,7 @@ class BusDB:
                        t.count,
                        t.first_fired_at,
                        t.last_fired_at,
-                       (SELECT GROUP_CONCAT(s, ?)
+                       (SELECT json_group_array(s)
                           FROM (SELECT DISTINCT source AS s
                                   FROM messages
                                  WHERE topic = t.topic)) AS producers
@@ -507,7 +506,6 @@ class BusDB:
                 where = "WHERE topic GLOB ? || '*'"
                 params.append(self._glob_escape(prefix))
             params.append(clamped_limit)
-            params.append(sep)
             rows = c.execute(sql.format(where=where), params).fetchall()
             return [
                 {
@@ -515,9 +513,9 @@ class BusDB:
                     "count": r["count"],
                     "first_fired_at": r["first_fired_at"],
                     "last_fired_at": r["last_fired_at"],
-                    "producers": sorted({
-                        p for p in (r["producers"] or "").split(sep) if p
-                    }),
+                    "producers": sorted(
+                        json.loads(r["producers"]) if r["producers"] else []
+                    ),
                 }
                 for r in rows
             ]
