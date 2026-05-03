@@ -276,7 +276,12 @@ check_one() {
         echo >&2
         return 1
     fi
-    HOOK_ID="$hook_id" REPO="$repo" python3 -c '
+    # Treat non-2xx ``last_response.code`` as audit failure: a hook
+    # whose deliveries are returning 404/500/timeout is silently
+    # broken even though the config-shape match is fine. ``code: null``
+    # ("unused") is acceptable — that just means GitHub hasn't
+    # delivered yet (e.g. fresh hook with no events fired).
+    if ! HOOK_ID="$hook_id" REPO="$repo" python3 -c '
 import json, os, sys
 target_id = int(os.environ["HOOK_ID"])
 repo = os.environ["REPO"]
@@ -300,9 +305,19 @@ for h in hooks:
         events = h.get("events")
         code = lr.get("code")
         status = lr.get("status")
-        print(f"  {repo}: hook={target_id}  events={events}  last_response={code} {status}")
+        line_out = f"  {repo}: hook={target_id}  events={events}  last_response={code} {status}"
+        # ``code is None`` means GitHub has not posted a delivery
+        # yet (status is "unused"). Counts as healthy. Anything
+        # else outside 2xx is a delivery failure that automation
+        # should treat as a failed audit.
+        if isinstance(code, int) and not (200 <= code < 300):
+            print(line_out + "  DELIVERY-FAILED")
+            sys.exit(2)
+        print(line_out)
         break
-' <<<"$json"
+' <<<"$json"; then
+        return 2
+    fi
     return 0
 }
 

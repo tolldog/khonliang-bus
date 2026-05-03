@@ -210,7 +210,24 @@ For repos outside the `tolldog/khonliang-*` fleet, in
 | Content type | `application/json` |
 | Secret | the **unquoted** value from `webhook-secret.env` (see note below) |
 | SSL verification | enabled |
-| Events | at minimum `Pull request reviews`; usually also `Pull requests`, `Check runs`, `Pushes` |
+| Events | the canonical set the scripted path uses (see below) |
+
+To match the scripted install (``scripts/install-github-webhook.sh``)
+and the topic table later in this document, select these six events
+under "Let me select individual events":
+
+- `Pull requests`
+- `Pull request reviews`
+- `Pull request review comments`
+- `Issue comments`
+- `Pushes`
+- `Check runs`
+
+Manually-configured repos that omit any of these will silently never
+fire the corresponding bus topics, so a subscriber listening on (say)
+`github.issue_comment.created` will get nothing — which looks
+identical to "no comment was posted" and is hard to debug. The
+script enforces all six; the UI table above mirrors that contract.
 
 > **Quoting:** `EnvironmentFile=` allows `GITHUB_WEBHOOK_SECRET="..."`
 > and `GITHUB_WEBHOOK_SECRET='...'` and unquotes the value before the
