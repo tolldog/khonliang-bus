@@ -60,17 +60,40 @@ MCP_TIMEOUT_ARG: str = "_mcp_timeout"
 class BusMCPAdapter:
     """Translates between MCP (stdio, Claude-facing) and the bus (HTTP).
 
-    Timeout precedence (high → low) for skill invocations:
+    Per-call timeout precedence (high → low). When set, ``mcp_timeout``
+    or the legacy in-args hint applies symmetrically: it caps the
+    adapter→bus transport AND is forwarded as ``FlowRequest.timeout``
+    on flow calls / the bus's per-request ``timeout`` field on skill
+    calls, so the bus-side cap matches the adapter-side cap.
 
-    1. Per-call hint in skill args (``_mcp_timeout``, seconds as int/float).
+    1. Top-level ``mcp_timeout`` kwarg on the auto-generated MCP tool
+       (visible in the tool's JSON schema, so Claude can discover it
+       without prior knowledge of the in-args hint). FastMCP rejects
+       parameter names starting with ``_``, so the schema-level kwarg
+       drops the underscore that the in-args hint and the library
+       constant still carry.
+    2. Per-call ``_mcp_timeout`` hint inside the skill-or-flow JSON
+       ``args`` string (legacy / undiscoverable but still honored).
        Stripped before forwarding to the skill handler.
-    2. Adapter default set at construction (``default_timeout_s``), normally
-       resolved from ``KHONLIANG_MCP_DEFAULT_TIMEOUT`` env var in ``main()``.
-    3. Library fallback (``DEFAULT_MCP_TIMEOUT_S`` = 60s).
 
-    A per-skill default from the ``Skill`` descriptor is a deliberate future
-    extension (would require a bus-lib + registry schema change) tracked
-    separately; today the per-call hint covers slow skills.
+    When NO per-call override is supplied, the adapter default
+    (``default_timeout_s``) and library fallback only cap the
+    adapter→bus transport, NOT the server-side execution:
+
+    3. Adapter default set at construction (``default_timeout_s``),
+       normally resolved from ``KHONLIANG_MCP_DEFAULT_TIMEOUT`` env
+       var in ``main()``. Skill calls pass it as the bus's per-request
+       ``timeout`` field too. **Flow calls do not** — without an
+       override, ``FlowRequest.timeout`` is omitted and the engine
+       falls back to its own built-in per-step cap, so the adapter
+       default acts purely as the transport-side ceiling on flows.
+    4. Library fallback (``DEFAULT_MCP_TIMEOUT_S`` = 60s) — same
+       caveat as (3) for flows.
+
+    A per-skill default from the ``Skill`` descriptor is a deliberate
+    future extension (would require a bus-lib + registry schema
+    change) tracked separately; today the per-call hint covers slow
+    skills.
     """
 
     def __init__(self, bus_url: str, default_timeout_s: float | None = None):
@@ -541,10 +564,21 @@ class BusMCPAdapter:
                 break
 
         # Dynamic tool — takes kwargs as JSON string since we don't know
-        # the schema at generation time (progressive disclosure).
+        # the schema at generation time (progressive disclosure). The
+        # explicit ``mcp_timeout`` kwarg is part of the schema so Claude
+        # can override the default cap without prior knowledge of the
+        # legacy in-args hint convention. FastMCP forbids underscore-
+        # prefixed parameter names, so the schema-level kwarg drops the
+        # underscore that the in-args hint still carries.
         @self.mcp.tool(name=tool_name, description=description or f"{agent_id} skill: {skill_name}")
-        async def _skill_proxy(args: str = "{}") -> str:
-            """Route to bus agent. Pass args as JSON string."""
+        async def _skill_proxy(args: str = "{}", mcp_timeout: int | None = None) -> str:
+            """Route to bus agent. Pass args as JSON string.
+
+            ``mcp_timeout`` (seconds): override the adapter's default
+            request timeout for this single call. Use it for skills that
+            legitimately run >60s (long ingest, deep distill, slow review).
+            Wins over an ``_mcp_timeout`` value embedded in ``args``.
+            """
             try:
                 parsed_args = json.loads(args) if isinstance(args, str) else args
             except json.JSONDecodeError:
@@ -552,7 +586,7 @@ class BusMCPAdapter:
             if not isinstance(parsed_args, dict):
                 return "error: args must be a JSON object"
             budget = extract_response_budget(parsed_args)
-            timeout = adapter._pop_timeout_hint(parsed_args)
+            timeout = adapter._resolve_timeout(mcp_timeout, parsed_args)
 
             result = await adapter._async_request(
                 agent_id, skill_name, parsed_args, timeout=timeout,
@@ -582,16 +616,16 @@ class BusMCPAdapter:
         description = flow.get("description", "") or f"Collaborative flow: {flow_name}"
 
         @self.mcp.tool(name=flow_name, description=description)
-        async def _flow_proxy(args: str = "{}") -> str:
+        async def _flow_proxy(args: str = "{}", mcp_timeout: int | None = None) -> str:
             """Execute a collaborative flow. Pass args as JSON string.
 
-            The ``_mcp_timeout`` control-plane hint (if present in ``args``)
-            is threaded end-to-end: it caps the adapter→bus transport AND is
-            forwarded to ``FlowRequest.timeout`` so ``FlowEngine._call_agent``
+            ``mcp_timeout`` (seconds): caps the adapter→bus transport AND
+            is forwarded to ``FlowRequest.timeout`` so ``FlowEngine._call_agent``
             uses it as the per-step cap rather than its built-in 30s default.
             Without that plumbing, a flow whose inner agent step takes >30s
             would be truncated inside the engine even when the outer MCP
-            timeout is generous.
+            timeout is generous. Wins over an ``_mcp_timeout`` value
+            embedded in ``args``.
             """
             try:
                 parsed_args = json.loads(args) if isinstance(args, str) else args
@@ -600,7 +634,7 @@ class BusMCPAdapter:
             if not isinstance(parsed_args, dict):
                 return "error: args must be a JSON object"
             budget = extract_response_budget(parsed_args)
-            timeout = adapter._pop_timeout_hint(parsed_args)
+            timeout = adapter._resolve_timeout(mcp_timeout, parsed_args)
 
             flow_body: dict[str, Any] = {"flow_id": flow_name, "args": parsed_args}
             if timeout is not None:
@@ -622,22 +656,55 @@ class BusMCPAdapter:
 
     # -- Control-plane helpers --
 
-    def _pop_timeout_hint(self, args: dict) -> float | None:
-        """Extract and remove the ``_mcp_timeout`` control-plane hint from
-        skill args so it isn't forwarded to the skill handler. Returns None
-        when absent or invalid (adapter default applies)."""
-        raw = args.pop(MCP_TIMEOUT_ARG, None)
+    def _coerce_timeout(self, raw: Any, source: str = MCP_TIMEOUT_ARG) -> float | None:
+        """Validate a raw timeout value from either the top-level
+        ``mcp_timeout`` kwarg or the legacy in-args ``_mcp_timeout`` hint.
+        ``source`` is the spelling used in the warning logs so an operator
+        can see which ingress path supplied a bad value (the two spellings
+        differ because FastMCP rejects underscore-prefixed kwarg names).
+        Returns None when absent or invalid (adapter default applies).
+
+        Rejects ``nan`` and ``inf`` for parity with ``_resolve_default_timeout``:
+        ``json.loads`` happily parses ``NaN``/``Infinity`` and either would
+        propagate down to ``httpx.Timeout(...)`` with bad consequences
+        (``inf`` effectively disables the cap; ``nan`` raises later)."""
         if raw is None:
             return None
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            logger.warning("Invalid %s hint (not numeric): %r", MCP_TIMEOUT_ARG, raw)
+            logger.warning("Invalid %s value (not numeric): %r", source, raw)
+            return None
+        if not math.isfinite(value):
+            logger.warning("Invalid %s value (not finite): %r", source, raw)
             return None
         if value <= 0:
-            logger.warning("Invalid %s hint (non-positive): %r", MCP_TIMEOUT_ARG, raw)
+            logger.warning("Invalid %s value (non-positive): %r", source, raw)
             return None
         return value
+
+    def _pop_timeout_hint(self, args: dict) -> float | None:
+        """Extract and remove the ``_mcp_timeout`` control-plane hint from
+        skill args so it isn't forwarded to the skill handler. Returns None
+        when absent or invalid (adapter default applies)."""
+        return self._coerce_timeout(args.pop(MCP_TIMEOUT_ARG, None), MCP_TIMEOUT_ARG)
+
+    def _resolve_timeout(
+        self, top_level: int | float | None, args: dict
+    ) -> float | None:
+        """Pick the effective per-call timeout for a skill or flow call.
+
+        Top-level ``mcp_timeout`` kwarg (visible in the tool's JSON schema)
+        wins over the legacy ``_mcp_timeout`` hint (hidden inside the args
+        JSON string). Either path strips the hint from ``args`` so the
+        skill handler never sees it. Invalid values silently fall through
+        to the next tier; warning logs label the bad value with the source
+        spelling so it's clear which ingress was supplied."""
+        # Always pop the in-args hint to keep it out of the forwarded args,
+        # even when the top-level kwarg ultimately wins.
+        in_args = self._pop_timeout_hint(args)
+        top = self._coerce_timeout(top_level, "mcp_timeout")
+        return top if top is not None else in_args
 
     def _format_error(self, result: dict) -> str:
         """Render a bus error dict as a non-empty MCP string. Preserves the
@@ -826,9 +893,18 @@ def main():
         type=float,
         default=None,
         help=(
-            "Adapter-level default timeout (seconds) for skill invocations. "
-            "Overrides KHONLIANG_MCP_DEFAULT_TIMEOUT env var. Per-call "
-            "_mcp_timeout hints in skill args still take precedence."
+            "Adapter-level default timeout (seconds). For skill calls, "
+            "applies symmetrically to the adapter→bus transport AND the "
+            "bus's per-request timeout field. For flow calls, applies "
+            "only to the +5s-buffered transport cap; "
+            "``FlowRequest.timeout`` is omitted when no per-call "
+            "override is supplied, and in that omitted case the engine "
+            "falls back to its built-in per-step cap (the adapter "
+            "default does NOT propagate to per-step). Overrides "
+            "KHONLIANG_MCP_DEFAULT_TIMEOUT env var. A per-call override "
+            "is symmetric on both surfaces: the top-level "
+            "``mcp_timeout`` kwarg on a skill or flow tool, or the legacy "
+            "``_mcp_timeout`` hint embedded in the ``args`` JSON string."
         ),
     )
     args = parser.parse_args()

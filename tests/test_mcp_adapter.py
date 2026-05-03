@@ -721,6 +721,99 @@ def test_per_call_mcp_timeout_hint_overrides_default(adapter):
     assert captured["args"] == {"query": "q"}
 
 
+def test_skill_proxy_exposes_mcp_timeout_in_schema(adapter):
+    """``fr_bus_4a1f21c8``: the auto-generated skill-proxy tool's input
+    schema must surface ``mcp_timeout`` as a top-level optional integer
+    so callers can discover the override without prior knowledge of the
+    in-args hint convention. (FastMCP rejects underscore-prefixed
+    parameter names, so the schema-level kwarg drops the leading
+    underscore that the in-args hint still carries.)"""
+    mcp = adapter.build()
+    tools = asyncio.run(mcp.list_tools())
+    skill_tools = [t for t in tools if t.name == "researcher-primary.find_papers"]
+    assert skill_tools, "expected the skill-proxy tool to be registered"
+    schema = skill_tools[0].inputSchema
+    props = schema.get("properties", {})
+    assert "mcp_timeout" in props, (
+        f"mcp_timeout missing from skill-proxy schema: {sorted(props)}"
+    )
+    # Required must remain empty for the skill-proxy — both args and
+    # mcp_timeout are optional.
+    assert "mcp_timeout" not in schema.get("required", [])
+
+
+def test_per_call_mcp_timeout_kwarg_overrides_default(adapter):
+    """Top-level ``mcp_timeout`` kwarg on the skill-proxy tool wins
+    over the adapter default and is not forwarded into the skill args."""
+    captured: dict = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        captured["timeout"] = timeout
+        captured["args"] = dict(args)
+        return {"result": "ok"}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {"args": json.dumps({"query": "q"}), "mcp_timeout": 250},
+    ))
+    assert captured["timeout"] == 250.0
+    assert "_mcp_timeout" not in captured["args"]
+    assert captured["args"] == {"query": "q"}
+
+
+def test_per_call_mcp_timeout_kwarg_wins_over_in_args_hint(adapter):
+    """When both the top-level kwarg and the in-args hint are supplied,
+    the kwarg wins (it's the discoverable surface). Either path strips
+    the in-args copy from the forwarded args."""
+    captured: dict = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        captured["timeout"] = timeout
+        captured["args"] = dict(args)
+        return {"result": "ok"}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {
+            "args": json.dumps({"query": "q", "_mcp_timeout": 100}),
+            "mcp_timeout": 300,
+        },
+    ))
+    assert captured["timeout"] == 300.0
+    assert "_mcp_timeout" not in captured["args"]
+    assert captured["args"] == {"query": "q"}
+
+
+def test_invalid_mcp_timeout_kwarg_falls_back_to_in_args_hint(adapter):
+    """An invalid top-level kwarg must fall through to the in-args hint
+    rather than poisoning the call. Mirrors the existing in-args
+    silent-fallback contract."""
+    captured: dict = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        captured["timeout"] = timeout
+        return {"result": "ok"}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    # FastMCP validates the kwarg as int at the schema layer, so non-numeric
+    # values never reach our handler. We exercise the silent-fallback path
+    # with numeric-but-non-positive values that survive parameter validation.
+    for bad in (-5, 0):
+        asyncio.run(mcp.call_tool(
+            "researcher-primary.find_papers",
+            {
+                "args": json.dumps({"query": "q", "_mcp_timeout": 120}),
+                "mcp_timeout": bad,
+            },
+        ))
+        assert captured["timeout"] == 120.0
+
+
 def test_invalid_mcp_timeout_hint_falls_back_silently(adapter):
     """Non-numeric / non-positive hints must not crash; adapter default
     applies instead."""
@@ -738,6 +831,39 @@ def test_invalid_mcp_timeout_hint_falls_back_silently(adapter):
             {"args": json.dumps({"query": "q", "_mcp_timeout": bad})},
         ))
         assert captured["timeout"] is None
+
+
+def test_coerce_timeout_rejects_non_finite_values():
+    """``_coerce_timeout`` must reject ``nan`` / ``inf`` / ``-inf`` so that
+    a JSON payload carrying ``NaN`` or ``Infinity`` (which ``json.loads``
+    happily parses) cannot disable the timeout cap or crash ``httpx``
+    downstream. Mirrors the CLI ``_resolve_default_timeout`` invariant."""
+    a = BusMCPAdapter("http://testserver")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert a._coerce_timeout(bad) is None
+        assert a._coerce_timeout(bad, "mcp_timeout") is None
+
+
+def test_in_args_timeout_hint_silently_drops_non_finite(adapter):
+    """End-to-end: an ``_mcp_timeout`` hint of ``Infinity`` (parseable by
+    json.loads) must fall back to the adapter default rather than reach
+    ``httpx.Timeout(inf)`` which would silently disable the cap."""
+    captured: dict = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        captured["timeout"] = timeout
+        return {"result": "ok"}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    # ``Infinity`` is non-standard JSON but Python's ``json.loads`` accepts
+    # it by default. Build the args string by hand so the malicious value
+    # survives all the way to ``_coerce_timeout``.
+    asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {"args": '{"query": "q", "_mcp_timeout": Infinity}'},
+    ))
+    assert captured["timeout"] is None
 
 
 def test_skill_timeout_returns_non_empty_error_with_marker(adapter):
@@ -922,3 +1048,51 @@ def test_flow_proxy_omits_timeout_when_not_supplied():
         {"args": json.dumps({"path": "/x.md"})},
     ))
     assert "timeout" not in captured["body"]
+
+
+def test_flow_proxy_exposes_mcp_timeout_in_schema():
+    """``fr_bus_4a1f21c8``: parity with skill-proxy — the flow-proxy
+    schema must also surface ``mcp_timeout`` so the discoverable
+    surface is uniform across both auto-generated tool families."""
+    a = BusMCPAdapter("http://testserver")
+    a._get = lambda path, params=None: (
+        {"available": [{"name": "evaluate_spec", "description": "fake"}]}
+        if path == "/v1/flows"
+        else None
+    )
+    mcp = a.build()
+    tools = asyncio.run(mcp.list_tools())
+    flow_tools = [t for t in tools if t.name == "evaluate_spec"]
+    assert flow_tools, "expected the flow-proxy tool to be registered"
+    props = flow_tools[0].inputSchema.get("properties", {})
+    assert "mcp_timeout" in props, (
+        f"mcp_timeout missing from flow-proxy schema: {sorted(props)}"
+    )
+
+
+def test_flow_proxy_kwarg_threads_into_flow_request_timeout():
+    """Top-level ``mcp_timeout`` kwarg on a flow-proxy invocation must
+    feed both the FlowRequest.timeout field and the +5s transport cap,
+    matching the existing in-args hint plumbing."""
+    a = BusMCPAdapter("http://testserver")
+    captured: dict = {}
+
+    async def mock_post(path, body, http_timeout=None):
+        captured["body"] = body
+        captured["http_timeout"] = http_timeout
+        return {"result": "ok"}
+
+    a._get = lambda path, params=None: (
+        {"available": [{"name": "evaluate_spec", "description": "fake"}]}
+        if path == "/v1/flows"
+        else None
+    )
+    a._async_post = mock_post
+    mcp = a.build()
+    asyncio.run(mcp.call_tool(
+        "evaluate_spec",
+        {"args": json.dumps({"path": "/x.md"}), "mcp_timeout": 240},
+    ))
+    assert captured["body"]["timeout"] == 240.0
+    assert captured["body"]["args"] == {"path": "/x.md"}
+    assert captured["http_timeout"] == 245.0
