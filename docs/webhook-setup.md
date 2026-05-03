@@ -86,7 +86,17 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 # Step 3 — Signed POST with the actual secret: should return HTTP 200
 # ("status: published"). Confirms HMAC verification + bus publish.
-SECRET=$(sudo cat /etc/khonliang/webhook-secret.env | grep -E '^GITHUB_WEBHOOK_SECRET=' | cut -d= -f2-)
+#
+# The sed pipeline strips surrounding "double" or 'single' quotes so
+# the signing matches systemd's EnvironmentFile= unquoting behaviour:
+# if the operator wrote GITHUB_WEBHOOK_SECRET="..." in the env file,
+# systemd unquotes it before the bus reads it, so the signature must
+# also be computed against the unquoted value.
+SECRET=$(sudo cat /etc/khonliang/webhook-secret.env \
+  | grep -E '^GITHUB_WEBHOOK_SECRET=' \
+  | head -n1 \
+  | cut -d= -f2- \
+  | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')
 BODY='{"zen":"signed-smoke"}'
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^[^=]*= */sha256=/')
 curl -s -X POST http://localhost:8788/v1/webhooks/github \
@@ -207,10 +217,19 @@ For repos outside the `tolldog/khonliang-*` fleet, in
 After saving (either option), GitHub fires a `ping` event. Verify it on the bus:
 
 ```sh
-# Long-poll for any github.* event for up to 30s.
+# Long-poll for the next github.ping. ``cursor=now`` pins the
+# subscriber to the current high-water mark so a ping from a
+# previously-configured repo doesn't false-positive this check on a
+# long-lived bus. (cursor=now ships in fr_bus_3db58f0b / PR #29; on
+# older bus builds, replace with a unique subscriber_id you've
+# never used before AND verify the returned event's
+# ``payload.summary.delivery_id`` matches the GitHub-side
+# ``X-GitHub-Delivery`` header for THIS save — visible under
+# ``Settings → Webhooks → <hook> → Recent Deliveries`` in the
+# GitHub UI.)
 curl -s -X POST http://localhost:8788/v1/wait \
   -H 'Content-Type: application/json' \
-  -d '{"topics":["github.ping"],"subscriber_id":"setup-smoke","timeout":30}' \
+  -d '{"topics":["github.ping"],"subscriber_id":"setup-smoke","timeout":30,"cursor":"now"}' \
   | python -m json.tool
 ```
 

@@ -95,7 +95,28 @@ resolve_secret() {
         echo "  See etc/khonliang-bus/webhook-secret.env.example for the shape." >&2
         exit 2
     fi
-    printf '%s\n' "${line#GITHUB_WEBHOOK_SECRET=}"
+    local val="${line#GITHUB_WEBHOOK_SECRET=}"
+    # ``EnvironmentFile=`` allows quoted values: ``KEY="..."`` and
+    # ``KEY='...'`` are both unquoted by systemd before the variable
+    # reaches the bus process. Match that semantic here so the script
+    # signs requests with the same value the bus is verifying against;
+    # otherwise an operator who quoted the secret in the env file
+    # would see the bus 401 every signed POST.
+    if [[ "${#val}" -ge 2 ]]; then
+        local first="${val:0:1}"
+        local last="${val: -1}"
+        if { [[ "$first" == '"' && "$last" == '"' ]] \
+             || [[ "$first" == "'" && "$last" == "'" ]]; }; then
+            val="${val:1:${#val}-2}"
+        fi
+    fi
+    if [[ -z "$val" ]]; then
+        echo "error: GITHUB_WEBHOOK_SECRET is empty in $DEFAULT_SECRET_FILE" >&2
+        echo "  Generate one with 'python -c \"import secrets; print(secrets.token_urlsafe(48))\"'" >&2
+        echo "  and write it back to the env file." >&2
+        exit 2
+    fi
+    printf '%s\n' "$val"
 }
 
 normalize_repo() {
@@ -107,25 +128,36 @@ normalize_repo() {
     fi
 }
 
-existing_hook_id() {
-    # ``gh api --paginate`` walks all pages of /hooks and emits the
-    # concatenated array, so a repo with more than one page of hooks
-    # doesn't fool the idempotency check into creating a duplicate.
-    # The python sink wraps the multi-page stream into a single list.
-    # Errors from gh (auth, missing scope, missing repo) are NOT
-    # swallowed — surface them so an operator can diagnose.
-    local repo="$1" url="$2" json
+existing_hook_match() {
+    # Returns one of:
+    #   ""                               — no matching hook on this URL
+    #   "<id>:ok"                        — hook exists AND config matches
+    #   "<id>:drift:<field1>,<field2>"   — hook exists but config drifted
+    #
+    # Drift detection covers the fields the script writes:
+    #   - events: the canonical EVENTS list
+    #   - active: must be true
+    #   - content_type: must be "json"
+    #   - insecure_ssl: must be "0"
+    # The hook's stored secret is intentionally NOT compared (GitHub
+    # never returns the value, just a "secret is set" indicator), but
+    # we DO check the secret-set flag so an operator can spot a hook
+    # that lost its secret server-side.
+    #
+    # ``gh api --paginate`` walks all pages so a repo with many hooks
+    # doesn't fool this check. gh errors are NOT swallowed.
+    local repo="$1" url="$2" expected_events="$3" json
     if ! json=$(gh api --paginate "/repos/${repo}/hooks" 2>&1); then
         echo "error: gh api /repos/${repo}/hooks failed:" >&2
         printf '%s\n' "$json" | head -c 300 >&2
         echo >&2
         return 1
     fi
-    TARGET="$url" python3 -c '
+    TARGET="$url" EXPECTED_EVENTS="$expected_events" python3 -c '
 import json, os, sys
 target = os.environ["TARGET"]
+expected_events = set(json.loads(os.environ["EXPECTED_EVENTS"]))
 text = sys.stdin.read()
-# --paginate emits one JSON value per page; collect into a single list.
 hooks: list = []
 for line in text.splitlines():
     line = line.strip()
@@ -134,17 +166,37 @@ for line in text.splitlines():
     try:
         chunk = json.loads(line)
     except json.JSONDecodeError:
-        # Single-page output is one JSON array spanning multiple lines;
-        # fall back to parsing the whole stream as one value.
         chunk = json.loads(text)
         hooks = chunk if isinstance(chunk, list) else []
         break
     if isinstance(chunk, list):
         hooks.extend(chunk)
 for h in hooks:
-    if (h.get("config") or {}).get("url", "") == target:
-        print(h["id"])
-        break
+    cfg = h.get("config") or {}
+    if cfg.get("url", "") != target:
+        continue
+    drift = []
+    if not h.get("active", False):
+        drift.append("active")
+    actual_events = set(h.get("events") or [])
+    if actual_events != expected_events:
+        drift.append("events")
+    if cfg.get("content_type") != "json":
+        drift.append("content_type")
+    if cfg.get("insecure_ssl") != "0":
+        drift.append("insecure_ssl")
+    # GitHub redacts the secret in responses but exposes a presence
+    # bit. A hook that lost its secret server-side reports
+    # ``cfg["secret"]`` absent or empty.
+    if not cfg.get("secret"):
+        drift.append("secret_missing")
+    hid = h["id"]
+    if drift:
+        drift_str = ",".join(drift)
+        print(f"{hid}:drift:{drift_str}")
+    else:
+        print(f"{hid}:ok")
+    break
 ' <<<"$json"
 }
 
@@ -204,10 +256,50 @@ install_one() {
         exit 2
     fi
 
-    local existing
-    existing=$(existing_hook_id "$repo" "$url")
-    if [[ -n "$existing" ]]; then
-        echo "skip $repo: hook $existing already targets $url"
+    local events_json
+    events_json=$(printf '"%s",' "${EVENTS[@]}"); events_json="[${events_json%,}]"
+
+    local match
+    if ! match=$(existing_hook_match "$repo" "$url" "$events_json"); then
+        return 1
+    fi
+    if [[ -n "$match" ]]; then
+        local hook_id="${match%%:*}"
+        local rest="${match#*:}"
+        local kind="${rest%%:*}"
+        if [[ "$kind" == "ok" ]]; then
+            echo "skip $repo: hook $hook_id already targets $url with matching config"
+            return 0
+        fi
+        # Drift detected — repair via PATCH so a misconfigured
+        # hook (wrong events, inactive, lost secret server-side,
+        # …) doesn't stay broken on rerun.
+        local drift="${rest#*:}"
+        local body
+        body=$(mktemp)
+        chmod 600 "$body"
+        trap 'rm -f "$body"' RETURN
+        EVENTS_JSON="$events_json" URL="$url" SECRET="$secret" python3 -c '
+import json, os
+print(json.dumps({
+    "active": True,
+    "events": json.loads(os.environ["EVENTS_JSON"]),
+    "config": {
+        "url": os.environ["URL"],
+        "content_type": "json",
+        "insecure_ssl": "0",
+        "secret": os.environ["SECRET"],
+    },
+}))' > "$body"
+        local patch_result
+        if ! patch_result=$(gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${repo}/hooks/${hook_id}" --input "$body" 2>&1); then
+            echo "ERR $repo: PATCH hook $hook_id (drift=$drift) failed: $(printf '%s' "$patch_result" | head -c 300)" >&2
+            return 1
+        fi
+        echo "REPAIR $repo: hook $hook_id (drift=$drift) → reconfigured"
         return 0
     fi
 
@@ -215,8 +307,7 @@ install_one() {
     body=$(mktemp)
     chmod 600 "$body"
     trap 'rm -f "$body"' RETURN
-    EVENTS_JSON=$(printf '"%s",' "${EVENTS[@]}"); EVENTS_JSON="[${EVENTS_JSON%,}]"
-    EVENTS_JSON="$EVENTS_JSON" URL="$url" SECRET="$secret" python3 -c '
+    EVENTS_JSON="$events_json" URL="$url" SECRET="$secret" python3 -c '
 import json, os
 print(json.dumps({
     "name": "web",
@@ -261,7 +352,22 @@ usage() {
 case "${1:-}" in
     "" | -h | --help) usage ;;
     --all-khonliang)
-        for r in $(list_khonliang_repos); do install_one "$r" || true; done
+        # Track per-repo outcome. Continue past failures so a single
+        # repo's auth/scope/network issue doesn't abort the rest of
+        # the fleet, but exit non-zero at the end if anything failed
+        # — fleet rollouts must report partial-failure honestly to
+        # automation. Earlier ``|| true`` swallowed every error and
+        # made the command always look successful.
+        all_failed=()
+        for r in $(list_khonliang_repos); do
+            if ! install_one "$r"; then
+                all_failed+=("$r")
+            fi
+        done
+        if [[ ${#all_failed[@]} -gt 0 ]]; then
+            echo "FAILED on ${#all_failed[@]} repo(s): ${all_failed[*]}" >&2
+            exit 1
+        fi
         ;;
     --check)
         shift
