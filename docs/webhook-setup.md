@@ -126,13 +126,24 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 # ``EnvironmentFile=`` semantics — the bus loads the last
 # effective assignment to a duplicated key. ``head -n1`` would
 # read a stale earlier value and every signed POST would 401.
-SECRET=$(sudo cat /etc/khonliang/webhook-secret.env \
+# Compute the HMAC signature in python3, feeding the secret via
+# stdin rather than the openssl command line. ``openssl dgst -hmac
+# "$SECRET"`` would put the secret on argv where /proc/<pid>/cmdline
+# (and ``ps`` for any local user during the few-millisecond openssl
+# lifetime) makes it readable. Reading from stdin keeps the secret
+# out of argv and the process environment.
+BODY='{"zen":"signed-smoke"}'
+SIG=$(sudo cat /etc/khonliang/webhook-secret.env \
   | grep -E '^GITHUB_WEBHOOK_SECRET=' \
   | tail -n1 \
   | cut -d= -f2- \
-  | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')
-BODY='{"zen":"signed-smoke"}'
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^[^=]*= */sha256=/')
+  | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/' \
+  | BODY="$BODY" python3 -c '
+import hashlib, hmac, os, sys
+secret = sys.stdin.readline().rstrip("\n").encode()
+body = os.environ["BODY"].encode()
+print("sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest())
+')
 curl -s -X POST http://localhost:8788/v1/webhooks/github \
   -H "X-GitHub-Event: ping" \
   -H "X-Hub-Signature-256: $SIG" \

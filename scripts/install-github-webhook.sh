@@ -340,11 +340,15 @@ check_one() {
         echo >&2
         return 1
     fi
-    # Treat non-2xx ``last_response.code`` as audit failure: a hook
-    # whose deliveries are returning 404/500/timeout is silently
-    # broken even though the config-shape match is fine. ``code: null``
-    # ("unused") is acceptable — that just means GitHub hasn't
-    # delivered yet (e.g. fresh hook with no events fired).
+    # Print ``last_response.code`` as a human-readable health hint;
+    # do NOT treat non-2xx as audit failure. ``last_response`` only
+    # holds the most-recent historical delivery — no time bound, so
+    # a transient outage that has since recovered cannot be
+    # distinguished from an ongoing delivery failure. A non-2xx
+    # surfaces as ``DELIVERY-FAILED-RECENT (warning)`` for manual
+    # operator escalation; the audit return value is owned by
+    # config-shape drift detection earlier in this function, which
+    # is the actually-stable signal.
     if ! HOOK_ID="$hook_id" REPO="$repo" python3 -c '
 import json, os, sys
 target_id = int(os.environ["HOOK_ID"])
@@ -450,8 +454,17 @@ install_one() {
         body=$(mktemp)
         register_tmpfile "$body"
         chmod 600 "$body"
-        EVENTS_JSON="$events_json" URL="$url" SECRET="$secret" python3 -c '
-import json, os
+        # Feed the secret via stdin, not the environment. Linux
+        # exposes ``/proc/<pid>/environ`` to the same UID, so a
+        # ``SECRET=... python3 -c ...`` invocation makes the
+        # webhook secret observable to any process running as the
+        # operator's account during the few-millisecond python3
+        # lifetime. Stdin is not in /proc once consumed and is not
+        # in argv. EVENTS_JSON / URL stay on env since they aren't
+        # secret.
+        printf '%s' "$secret" | EVENTS_JSON="$events_json" URL="$url" python3 -c '
+import json, os, sys
+secret = sys.stdin.read()
 print(json.dumps({
     "active": True,
     "events": json.loads(os.environ["EVENTS_JSON"]),
@@ -459,7 +472,7 @@ print(json.dumps({
         "url": os.environ["URL"],
         "content_type": "json",
         "insecure_ssl": "0",
-        "secret": os.environ["SECRET"],
+        "secret": secret,
     },
 }))' > "$body"
         local patch_result patch_rc=0
@@ -485,8 +498,12 @@ print(json.dumps({
     # See note in the drift branch above: cleanup is guaranteed by
     # the script-wide ``cleanup_tmpfiles`` EXIT trap; the
     # ``rm -f`` on the success path is eager-trim only.
-    EVENTS_JSON="$events_json" URL="$url" SECRET="$secret" python3 -c '
-import json, os
+    # Same stdin-not-env pattern as the drift-repair branch above;
+    # see the comment block there for the /proc/<pid>/environ
+    # exposure rationale.
+    printf '%s' "$secret" | EVENTS_JSON="$events_json" URL="$url" python3 -c '
+import json, os, sys
+secret = sys.stdin.read()
 print(json.dumps({
     "name": "web",
     "active": True,
@@ -495,7 +512,7 @@ print(json.dumps({
         "url": os.environ["URL"],
         "content_type": "json",
         "insecure_ssl": "0",
-        "secret": os.environ["SECRET"],
+        "secret": secret,
     },
 }))' > "$body"
 
