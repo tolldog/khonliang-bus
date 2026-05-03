@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Install (or list) the canonical GitHub webhook on a khonliang-* repo
-# so its events flow into the bus via Tailscale Funnel.
+# Install / repair / audit the canonical GitHub webhook on a
+# khonliang-* repo so its events flow into the bus via Tailscale
+# Funnel (or any HTTPS proxy via KHONLIANG_WEBHOOK_URL).
 #
 # Usage:
-#   scripts/install-github-webhook.sh <repo>           # install on tolldog/<repo>
-#   scripts/install-github-webhook.sh <owner/repo>     # install on owner/repo
-#   scripts/install-github-webhook.sh --all-khonliang  # install on every tolldog/khonliang-*
-#   scripts/install-github-webhook.sh --check <repo>   # verify hook config + drift + last_response
+#   scripts/install-github-webhook.sh <repo>                       # install on tolldog/<repo>
+#   scripts/install-github-webhook.sh <owner/repo>                 # install on owner/repo
+#   scripts/install-github-webhook.sh --all-khonliang              # install on every tolldog/khonliang-*
+#   scripts/install-github-webhook.sh --check <repo> [<repo>...]   # audit one-or-more repos
+#   scripts/install-github-webhook.sh --check --all-khonliang      # audit the whole khonliang-* fleet
+#   scripts/install-github-webhook.sh --help                       # this message
 #
 # Environment:
 #   KHONLIANG_WEBHOOK_URL   public webhook URL (default reads ts.net hostname)
@@ -557,7 +560,7 @@ usage() {
     # non-zero exit here would break shell-completion harnesses
     # and CI lint checks that grep ``--help`` for valid
     # invocations and treat non-zero as a missing-tool failure.
-    sed -n '2,18p' "$0"
+    sed -n '2,20p' "$0"
     exit 0
 }
 

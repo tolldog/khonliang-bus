@@ -13,11 +13,13 @@ endpoint actually fire end-to-end:
 3. Make the bus reachable from the public internet.
 4. Configure each GitHub repo to point its webhooks at that URL.
 
-The endpoint itself is implemented in `bus/webhooks.py` and registered at
-`bus/server.py` (`POST /v1/webhooks/github`). The receiver rejects
-unsigned requests with `401` once a secret is set; with no secret AND
-no explicit `github_webhook_allow_unsigned: true` in bus config it
-returns `503` (preventing a forged-event footgun in production).
+The FastAPI handler for `POST /v1/webhooks/github` lives in
+`bus/server.py`; HMAC verification, topic derivation, and payload
+summarisation helpers (`verify_signature`, `build_topic`,
+`summarize`) live in `bus/webhooks.py`. The receiver rejects
+unsigned requests with `401` once a secret is set; with no secret
+AND no explicit `github_webhook_allow_unsigned: true` in bus config
+it returns `503` (preventing a forged-event footgun in production).
 
 > **Port assumption.** All shell snippets below use port **`8788`**,
 > which is what the canonical systemd unit
@@ -144,11 +146,19 @@ secret = sys.stdin.readline().rstrip("\n").encode()
 body = os.environ["BODY"].encode()
 print("sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest())
 ')
-curl -s -X POST http://localhost:8788/v1/webhooks/github \
+curl -s -o /tmp/sig-smoke.body -w 'HTTP %{http_code}\n' -X POST \
+  http://localhost:8788/v1/webhooks/github \
   -H "X-GitHub-Event: ping" \
   -H "X-Hub-Signature-256: $SIG" \
   -H 'Content-Type: application/json' \
   --data-binary "$BODY"
+# Expected: ``HTTP 200``. A 401 here means the bus's loaded secret
+# disagrees with the env file (rotation drift, quote handling, or
+# trailing-newline in the file). A 503 means the bus has no secret
+# loaded yet — re-read step 2c. Cat /tmp/sig-smoke.body for the
+# response body if the status-code line shows anything other than
+# 200.
+cat /tmp/sig-smoke.body
 ```
 
 ## 3. Expose the endpoint to the public internet
@@ -201,8 +211,16 @@ tailscale funnel --bg --https=443 \
 ```
 
 Your public webhook URL is then
-`https://<host>.<tailnet>.ts.net/v1/webhooks/github`. The rest of
-`localhost:8788` stays private; only this exact path is reachable.
+`https://<host>.<tailnet>.ts.net/v1/webhooks/github`. Funnel only
+publishes the `/v1/webhooks/github` path to the public internet —
+no other route on the bus is exposed via Funnel. **However**, the
+bus still binds to `0.0.0.0` by default (see `bus/__main__.py`'s
+`--host` default), so every other REST route remains reachable on
+the host's LAN / VPN / tailnet interfaces unless the operator also
+rebinds Uvicorn to `127.0.0.1` per the "Critical — close the
+host-network exposure first" callout in section 3 below.
+"Funnel-only protected" describes the public-internet attack
+surface, not the LAN attack surface.
 
 ### Option B: cloudflared / ngrok / any HTTPS tunnel
 
