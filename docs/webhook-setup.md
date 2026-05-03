@@ -208,25 +208,57 @@ For repos outside the `tolldog/khonliang-*` fleet, in
 | --- | --- |
 | Payload URL | `https://<your-public-host>/v1/webhooks/github` |
 | Content type | `application/json` |
-| Secret | (paste the value from `webhook-secret.env`) |
+| Secret | the **unquoted** value from `webhook-secret.env` (see note below) |
 | SSL verification | enabled |
 | Events | at minimum `Pull request reviews`; usually also `Pull requests`, `Check runs`, `Pushes` |
+
+> **Quoting:** `EnvironmentFile=` allows `GITHUB_WEBHOOK_SECRET="..."`
+> and `GITHUB_WEBHOOK_SECRET='...'` and unquotes the value before the
+> bus reads it. Whatever you paste into GitHub's *Secret* field must
+> be the **unquoted** value, not the literal characters of the env
+> file line. If your env file reads `GITHUB_WEBHOOK_SECRET="abc123"`,
+> paste `abc123` into the GitHub UI — pasting `"abc123"` (with
+> surrounding quotes) will make the bus 401 every signed delivery.
 
 ### Verify the ping arrived on the bus
 
 After saving (either option), GitHub fires a `ping` event. Verify it on the bus:
 
+Two pitfalls to avoid in this verification:
+
+1. **Backlog replay.** ``/v1/wait`` defaults to replaying every
+   unacked event for a fresh subscriber, so a ``github.ping`` from a
+   previously-configured repo will satisfy the call even if the
+   webhook you just saved never reached the bus. Pair the wait with
+   a delivery-id cross-check.
+2. **No-op extra fields.** FastAPI silently ignores keys that
+   ``WaitRequest`` doesn't declare; ``cursor=now`` is a real field
+   only after `fr_bus_3db58f0b` ships, so on an older bus build it's
+   accepted-and-ignored without error.
+
+Both pitfalls are dodged by giving the wait a never-used
+``subscriber_id`` and asserting the returned event's
+``payload.summary.delivery_id`` against the *exact* delivery id
+GitHub recorded for the save (visible under
+``Settings → Webhooks → <hook> → Recent Deliveries``):
+
 ```sh
-# Long-poll for the next github.ping. ``cursor=now`` pins the
-# subscriber to the current high-water mark so a ping from a
-# previously-configured repo doesn't false-positive this check on a
-# long-lived bus. (cursor=now ships in fr_bus_3db58f0b / PR #29; on
-# older bus builds, replace with a unique subscriber_id you've
-# never used before AND verify the returned event's
-# ``payload.summary.delivery_id`` matches the GitHub-side
-# ``X-GitHub-Delivery`` header for THIS save — visible under
-# ``Settings → Webhooks → <hook> → Recent Deliveries`` in the
-# GitHub UI.)
+# Use a fresh subscriber_id so the ack-pointer is at zero AND
+# verify the returned delivery_id matches THIS save's id.
+SETUP_SUB="setup-smoke-$(date +%s)"
+curl -s -X POST http://localhost:8788/v1/wait \
+  -H 'Content-Type: application/json' \
+  -d "{\"topics\":[\"github.ping\"],\"subscriber_id\":\"$SETUP_SUB\",\"timeout\":30}" \
+  | python -m json.tool
+```
+
+After the bus running this branch picks up `fr_bus_3db58f0b` (PR #29
+in the bus repo), an even cleaner form is available — pass
+``"cursor": "now"`` in the body and the wait pins to the current
+high-water mark instead of replaying backlog at all:
+
+```sh
+# Once the bus is on the cursor=now build:
 curl -s -X POST http://localhost:8788/v1/wait \
   -H 'Content-Type: application/json' \
   -d '{"topics":["github.ping"],"subscriber_id":"setup-smoke","timeout":30,"cursor":"now"}' \

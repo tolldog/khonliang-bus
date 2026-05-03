@@ -13,13 +13,32 @@
 #   KHONLIANG_SECRET_FILE   path to env file holding GITHUB_WEBHOOK_SECRET
 #                           (default: /etc/khonliang/webhook-secret.env)
 #
-# Secret never leaves disk: the script reads it once, builds a temp body
-# file with mode 600, posts via gh, then removes the body. No secret ever
-# echoes to the terminal or logs.
+# Secret handling: the script reads the secret from the env file once,
+# stages it in a mode-0600 tempfile that ``gh api --input`` consumes,
+# then unlinks the tempfile via a RETURN trap. No secret value is
+# echoed to the terminal or persisted to logs by this script.
 #
-# Idempotency: GitHub's webhook API does NOT dedupe. Running this twice
-# creates two hooks. The script auto-paginates the existing-hook check
-# so it correctly skips on repos with more than one page of hooks.
+# Note: the secret IS transmitted to GitHub as part of the webhook
+# create/patch request body (``config.secret``) — that's how GitHub
+# stores the value it later uses to HMAC-sign deliveries. The
+# transmission goes over TLS to the GitHub API; the secret is not
+# logged or copied anywhere else, but it does leave this host. Treat
+# this as a credential-sharing operation, not a local-only one.
+#
+# Idempotency / drift detection: GitHub's webhook API does NOT dedupe.
+# The script auto-paginates the existing-hook check (handles repos
+# with multi-page hook lists) and compares the full canonical config
+# (events, active flag, content_type, insecure_ssl, secret-presence).
+# An exact-config match skips; a drifted match is repaired via PATCH;
+# the no-match case creates a fresh hook. Multi-hook repos (two hooks
+# pointing at the same URL — would deliver every event twice) are
+# detected and reported as an error so an operator can collapse them
+# manually.
+#
+# Exit status: ``--all-khonliang`` returns non-zero when any per-repo
+# step fails (so automation can detect partial-fleet failures);
+# ``--check`` returns non-zero when any audited repo is missing the
+# webhook or has a config drift.
 
 set -euo pipefail
 
@@ -131,8 +150,16 @@ normalize_repo() {
 existing_hook_match() {
     # Returns one of:
     #   ""                               — no matching hook on this URL
-    #   "<id>:ok"                        — hook exists AND config matches
-    #   "<id>:drift:<field1>,<field2>"   — hook exists but config drifted
+    #   "<id>:ok"                        — single hook on URL, config matches
+    #   "<id>:drift:<field1>,<field2>"   — single hook on URL, config drifted
+    #   "duplicate:<id1>,<id2>,..."      — TWO OR MORE hooks share this URL
+    #
+    # Duplicate-URL detection: GitHub doesn't dedupe webhooks, so a
+    # repo can end up with two hooks pointing at the same URL — each
+    # delivery fires twice, doubling bus event volume and HMAC work.
+    # The script reports duplicates as an error; the operator must
+    # collapse them manually (the safer path is to delete extras
+    # rather than have the installer guess which to keep).
     #
     # Drift detection covers the fields the script writes:
     #   - events: the canonical EVENTS list
@@ -171,32 +198,36 @@ for line in text.splitlines():
         break
     if isinstance(chunk, list):
         hooks.extend(chunk)
-for h in hooks:
-    cfg = h.get("config") or {}
-    if cfg.get("url", "") != target:
-        continue
-    drift = []
-    if not h.get("active", False):
-        drift.append("active")
-    actual_events = set(h.get("events") or [])
-    if actual_events != expected_events:
-        drift.append("events")
-    if cfg.get("content_type") != "json":
-        drift.append("content_type")
-    if cfg.get("insecure_ssl") != "0":
-        drift.append("insecure_ssl")
-    # GitHub redacts the secret in responses but exposes a presence
-    # bit. A hook that lost its secret server-side reports
-    # ``cfg["secret"]`` absent or empty.
-    if not cfg.get("secret"):
-        drift.append("secret_missing")
-    hid = h["id"]
-    if drift:
-        drift_str = ",".join(drift)
-        print(f"{hid}:drift:{drift_str}")
-    else:
-        print(f"{hid}:ok")
-    break
+matches = [h for h in hooks if (h.get("config") or {}).get("url", "") == target]
+if not matches:
+    sys.exit(0)
+if len(matches) > 1:
+    ids = ",".join(str(h["id"]) for h in matches)
+    print(f"duplicate:{ids}")
+    sys.exit(0)
+h = matches[0]
+cfg = h.get("config") or {}
+drift = []
+if not h.get("active", False):
+    drift.append("active")
+actual_events = set(h.get("events") or [])
+if actual_events != expected_events:
+    drift.append("events")
+if cfg.get("content_type") != "json":
+    drift.append("content_type")
+if cfg.get("insecure_ssl") != "0":
+    drift.append("insecure_ssl")
+# GitHub redacts the secret in responses but exposes a presence bit.
+# A hook that lost its secret server-side reports ``cfg["secret"]``
+# absent or empty.
+if not cfg.get("secret"):
+    drift.append("secret_missing")
+hid = h["id"]
+if drift:
+    drift_str = ",".join(drift)
+    print(f"{hid}:drift:{drift_str}")
+else:
+    print(f"{hid}:ok")
 ' <<<"$json"
 }
 
@@ -213,6 +244,11 @@ check_one() {
         echo >&2
         return 1
     fi
+    # Exit non-zero on the cases that automation needs to act on
+    # (no hook configured, or duplicate hooks delivering twice).
+    # ``--check`` was previously always-success, which made fleet
+    # health audits useless: a repo silently missing the webhook
+    # still showed ``exit 0``.
     TARGET="$url" REPO="$repo" python3 -c '
 import json, os, sys
 target = os.environ["TARGET"]
@@ -234,14 +270,18 @@ for line in text.splitlines():
 matches = [h for h in hooks if (h.get("config") or {}).get("url", "") == target]
 if not matches:
     print(f"  {repo}: NO matching hook for {target}")
-    sys.exit(0)
-for h in matches:
-    lr = h.get("last_response") or {}
-    hid = h.get("id")
-    events = h.get("events")
-    code = lr.get("code")
-    status = lr.get("status")
-    print(f"  {repo}: hook={hid}  events={events}  last_response={code} {status}")
+    sys.exit(2)
+if len(matches) > 1:
+    ids = ",".join(str(h["id"]) for h in matches)
+    print(f"  {repo}: DUPLICATE hooks for {target} (ids={ids}) — collapse manually")
+    sys.exit(2)
+h = matches[0]
+lr = h.get("last_response") or {}
+hid = h.get("id")
+events = h.get("events")
+code = lr.get("code")
+status = lr.get("status")
+print(f"  {repo}: hook={hid}  events={events}  last_response={code} {status}")
 ' <<<"$json"
 }
 
@@ -264,6 +304,15 @@ install_one() {
         return 1
     fi
     if [[ -n "$match" ]]; then
+        # Duplicate-URL hooks: every event delivers twice. Refuse to
+        # patch — collapsing duplicates safely is an operator decision
+        # (which to keep, what last_response history matters), not
+        # something the script should guess.
+        if [[ "$match" == duplicate:* ]]; then
+            local ids="${match#duplicate:}"
+            echo "ERR $repo: multiple hooks point at $url (ids=$ids); collapse manually before re-running" >&2
+            return 1
+        fi
         local hook_id="${match%%:*}"
         local rest="${match#*:}"
         local kind="${rest%%:*}"
@@ -371,10 +420,23 @@ case "${1:-}" in
         ;;
     --check)
         shift
+        # Track per-repo outcome so the audit path (single repo or
+        # whole fleet) returns non-zero when any repo is missing the
+        # hook or has duplicates. Earlier behaviour was always-zero
+        # and made fleet health audits useless in automation.
+        check_failed=()
         if [[ "${1:-}" == "--all-khonliang" ]]; then
-            for r in $(list_khonliang_repos); do check_one "$r"; done
+            for r in $(list_khonliang_repos); do
+                check_one "$r" || check_failed+=("$r")
+            done
         else
-            for r in "$@"; do check_one "$r"; done
+            for r in "$@"; do
+                check_one "$r" || check_failed+=("$r")
+            done
+        fi
+        if [[ ${#check_failed[@]} -gt 0 ]]; then
+            echo "FAILED check on ${#check_failed[@]} repo(s): ${check_failed[*]}" >&2
+            exit 2
         fi
         ;;
     *)
