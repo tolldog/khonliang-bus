@@ -91,12 +91,20 @@ class WaitRequest(BaseModel):
     - ``timeout``: max seconds to wait before returning empty.
     - ``ack_on_return``: if true (default), advance the subscriber's ack
       pointer to the returned event so the next wait call skips it.
+    - ``cursor``: where to start matching from. Default ``""`` replays
+      unacked history (legacy semantics — a fresh subscriber sees every
+      retained event). ``"now"`` / ``"latest"`` snapshot the current
+      max message id and only return events published *after* that
+      point, so a fresh subscriber doesn't drain days-old backlog one
+      event per call. Per-call only — the snapshot is taken at the
+      start of this wait and not persisted.
     """
 
     topics: list[str] = []
     subscriber_id: str = ""
     timeout: float = 30.0
     ack_on_return: bool = True
+    cursor: str = ""
 
 
 class AckRequest(BaseModel):
@@ -668,6 +676,14 @@ class BusServer:
         Returns the first unacked event that matches a subscribed topic. If
         no match exists, waits up to ``timeout`` seconds for a new publish.
         Advances the subscriber's ack pointer if ``ack_on_return`` is true.
+
+        ``req.cursor`` controls the starting point for matching:
+          - ``""`` (default) — match from the subscriber's last-acked
+            id (replays retained backlog for a fresh subscriber).
+          - ``"now"`` / ``"latest"`` — snapshot the current high-water
+            mark and require ``m.id > snapshot``. A fresh subscriber
+            only sees events published after the wait begins. Per-call
+            floor; not persisted into the subscriptions table.
         """
         # Lazy-init so there's always a current event object
         if self._publish_notify is None:
@@ -677,9 +693,16 @@ class BusServer:
         subscriber_id = req.subscriber_id or f"waiter-{uuid.uuid4().hex[:8]}"
         deadline = time.monotonic() + max(0.0, float(req.timeout))
 
+        # Cursor='now'|'latest' pins the matcher's floor at the current
+        # max message id so this wait only sees forward-going publishes.
+        # Anything else (including legacy "" / unset) falls back to the
+        # subscriber's ack pointer alone.
+        cursor = (req.cursor or "").strip().lower()
+        min_id = self.db.max_message_id() if cursor in ("now", "latest") else 0
+
         while True:
             # Check each subscribed topic for unacked messages
-            match = self._find_next_matching(subscriber_id, topics)
+            match = self._find_next_matching(subscriber_id, topics, min_id)
             if match is not None:
                 if req.ack_on_return:
                     self.db.ack_message(subscriber_id, match["topic"], match["id"])
@@ -710,16 +733,18 @@ class BusServer:
             # Loop and re-check — a publish fired, there may be a match now
 
     def _find_next_matching(
-        self, subscriber_id: str, topics: list[str]
+        self, subscriber_id: str, topics: list[str], min_id: int = 0,
     ) -> dict | None:
         """Return the earliest unacked message matching any of ``topics``
         for ``subscriber_id``, or None.
 
         If ``topics`` is empty, match any topic on the bus.
-        Delegates to :meth:`BusDB.find_earliest_unacked` — a single
-        indexed query instead of per-topic round-trips.
+        ``min_id`` is the per-call floor used by ``cursor='now'``; 0 keeps
+        the legacy replay-from-ack behaviour. Delegates to
+        :meth:`BusDB.find_earliest_unacked` — a single indexed query
+        instead of per-topic round-trips.
         """
-        return self.db.find_earliest_unacked(subscriber_id, topics or None)
+        return self.db.find_earliest_unacked(subscriber_id, topics or None, min_id)
 
     async def _push_to_subscribers(self, topic: str, msg_id: int) -> None:
         msgs = self.db.get_messages(topic, after_id=msg_id - 1, limit=1)

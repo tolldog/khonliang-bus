@@ -138,3 +138,165 @@ def test_wait_multiple_topics_returns_earliest(client):
     }).json()
     assert r["status"] == "matched"
     assert r["event"]["topic"] == "topic.b"
+
+
+def test_wait_cursor_now_skips_existing_backlog(client):
+    """``cursor='now'`` pins a fresh subscriber to the current high-water
+    mark, so retained backlog isn't replayed one-event-per-call. Closes
+    fr_bus_3db58f0b — surfaced by dog_ce53165f."""
+    # Seed three events that a fresh subscriber would otherwise drain.
+    client.post("/v1/publish", json={"topic": "old.topic", "payload": {"n": 1}, "source": "s"})
+    client.post("/v1/publish", json={"topic": "old.topic", "payload": {"n": 2}, "source": "s"})
+    client.post("/v1/publish", json={"topic": "old.topic", "payload": {"n": 3}, "source": "s"})
+
+    # Fresh subscriber + cursor='now' + short timeout: there are no
+    # forward-going events, so this must time out instead of returning
+    # the seeded backlog.
+    r = client.post("/v1/wait", json={
+        "topics": ["old.topic"],
+        "subscriber_id": "fresh-now",
+        "timeout": 0.2,
+        "cursor": "now",
+    }).json()
+    assert r["status"] == "timeout"
+
+    # Default cursor on a *different* fresh subscriber DOES see the
+    # backlog. (Using a different ``subscriber_id`` keeps each
+    # assertion trivially independent — neither subscriber affects
+    # the other's matcher state. ``wait_for_event`` only writes a
+    # subscription row on a matched-and-acked return, so even reusing
+    # ``fresh-now`` would have worked here, but a separate id makes
+    # the contract under test obvious.) The point of the assertion
+    # is that cursor controls whether backlog replays for a fresh
+    # subscriber.
+    r = client.post("/v1/wait", json={
+        "topics": ["old.topic"],
+        "subscriber_id": "fresh-default",
+        "timeout": 1.0,
+    }).json()
+    assert r["status"] == "matched"
+    assert r["event"]["payload"] == {"n": 1}
+
+
+def test_wait_cursor_latest_is_synonym_for_now(client):
+    """Both spellings are honored so a caller that mentally maps to
+    'latest' (e.g. coming from Kafka conventions) doesn't trip up."""
+    client.post("/v1/publish", json={"topic": "t", "payload": {"n": 1}, "source": "s"})
+    r = client.post("/v1/wait", json={
+        "topics": ["t"],
+        "subscriber_id": "fresh-latest",
+        "timeout": 0.2,
+        "cursor": "LATEST",  # case-insensitive
+    }).json()
+    assert r["status"] == "timeout"
+
+
+def test_wait_cursor_now_returns_event_published_after_call(tmp_path):
+    """``cursor='now'`` does NOT silence forward events — only backlog.
+    A publish that happens after the wait begins must wake the waiter.
+
+    Tested directly against ``BusServer`` (same pattern as
+    ``test_wait_wakes_on_new_publish``) rather than via TestClient +
+    ``run_in_executor`` — this file already notes that TestClient
+    can't do concurrent HTTP calls cleanly, and the run_in_executor
+    pattern was flagged as flaky on shared loops.
+    """
+    import asyncio
+    from bus.db import BusDB
+    from bus.server import BusServer, PublishRequest, WaitRequest
+
+    db = BusDB(str(tmp_path / "cursor-now-wake.db"))
+    bus = BusServer(db, config={"bus_url": "http://localhost:9999"})
+
+    async def scenario():
+        # Seed pre-existing backlog the cursor='now' must skip.
+        for n in range(3):
+            await bus.publish(PublishRequest(
+                topic="live", payload={"n": n}, source="s",
+            ))
+
+        # Start a cursor='now' waiter; ack pointer doesn't yet exist
+        # for ``wake-now``, so default cursor would have replayed
+        # backlog. cursor='now' pins the floor at the current
+        # high-water mark.
+        wait_task = asyncio.create_task(bus.wait_for_event(WaitRequest(
+            topics=["live"],
+            subscriber_id="wake-now",
+            timeout=5.0,
+            cursor="now",
+        )))
+
+        # Give the waiter a moment to park on the asyncio Event.
+        await asyncio.sleep(0.1)
+        assert not wait_task.done(), "waiter should be blocked on cursor='now'"
+
+        # Publish a fresh event AFTER the wait is active. Must wake
+        # the waiter — the snapshot was taken when wait_for_event
+        # entered, so this id is strictly above the floor.
+        await bus.publish(PublishRequest(
+            topic="live", payload={"n": 99}, source="s",
+        ))
+        return await asyncio.wait_for(wait_task, timeout=2.0)
+
+    r = asyncio.run(scenario())
+    assert r["status"] == "matched"
+    # Must be the post-wait publish, not seeded backlog n=0..2.
+    assert r["event"]["payload"] == {"n": 99}
+
+
+def test_wait_cursor_unknown_value_falls_back_to_default(client):
+    """Misspelled / unknown cursor strings must not silently drop
+    backlog — they fall through to the legacy replay-from-ack
+    behaviour. Prevents a typo (`cursor='latests'`) from accidentally
+    making a fresh subscriber miss retained backlog they wanted."""
+    client.post("/v1/publish", json={"topic": "t", "payload": {"n": 1}, "source": "s"})
+    r = client.post("/v1/wait", json={
+        "topics": ["t"],
+        "subscriber_id": "typo",
+        "timeout": 1.0,
+        "cursor": "latests",  # typo — unknown value
+    }).json()
+    assert r["status"] == "matched"
+    assert r["event"]["payload"] == {"n": 1}
+
+
+def test_wait_cursor_now_with_floor_above_ack_pointer(client):
+    """floor > ack: a subscriber whose ack pointer is below the
+    cursor='now' snapshot does NOT get backwards delivery to the
+    intervening events — the floor wins.
+
+    The "ack > floor" direction is impossible by construction:
+    floor = ``max_message_id`` taken at wait time and the ack pointer
+    is always ≤ max_message_id, so floor ≥ ack always holds. The
+    floor == ack case is uninteresting (threshold is the same value
+    either way). Only the floor > ack case has distinct
+    observable behaviour, so it's the only direction tested here."""
+    # Seed three events; subscriber 'sub' acks the first two via two
+    # default-cursor waits.
+    client.post("/v1/publish", json={"topic": "t", "payload": {"n": 1}, "source": "s"})
+    client.post("/v1/publish", json={"topic": "t", "payload": {"n": 2}, "source": "s"})
+    for expected in (1, 2):
+        r = client.post("/v1/wait", json={
+            "topics": ["t"], "subscriber_id": "sub", "timeout": 1.0,
+        }).json()
+        assert r["event"]["payload"] == {"n": expected}
+
+    # Publish a third event; cursor='now' AT this point snapshots above
+    # event 3, so the wait should time out (nothing forward-going yet).
+    client.post("/v1/publish", json={"topic": "t", "payload": {"n": 3}, "source": "s"})
+    r = client.post("/v1/wait", json={
+        "topics": ["t"],
+        "subscriber_id": "sub",
+        "timeout": 0.2,
+        "cursor": "now",
+    }).json()
+    assert r["status"] == "timeout"
+
+    # Without cursor=now, the same subscriber still sees event n=3
+    # (its ack pointer is at id=2, event 3 is unacked).
+    r = client.post("/v1/wait", json={
+        "topics": ["t"], "subscriber_id": "sub", "timeout": 1.0,
+    }).json()
+    assert r["event"]["payload"] == {"n": 3}
+
+
