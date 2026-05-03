@@ -161,12 +161,14 @@ def test_wait_cursor_now_skips_existing_backlog(client):
     assert r["status"] == "timeout"
 
     # Default cursor on a *different* fresh subscriber DOES see the
-    # backlog. ``fresh-now`` already has an ack pointer from its
-    # cursor='now' wait above; ``fresh-default`` is a brand-new
-    # subscriber so it exercises the no-prior-history default-cursor
-    # path. The point of the assertion is that cursor controls whether
-    # backlog replays for a fresh subscriber, NOT that the same
-    # subscriber sees both behaviours within one session.
+    # backlog. (Using a different ``subscriber_id`` keeps each
+    # assertion trivially independent — neither subscriber affects
+    # the other's matcher state. ``wait_for_event`` only writes a
+    # subscription row on a matched-and-acked return, so even reusing
+    # ``fresh-now`` would have worked here, but a separate id makes
+    # the contract under test obvious.) The point of the assertion
+    # is that cursor controls whether backlog replays for a fresh
+    # subscriber.
     r = client.post("/v1/wait", json={
         "topics": ["old.topic"],
         "subscriber_id": "fresh-default",
@@ -192,46 +194,51 @@ def test_wait_cursor_latest_is_synonym_for_now(client):
 def test_wait_cursor_now_returns_event_published_after_call(tmp_path):
     """``cursor='now'`` does NOT silence forward events — only backlog.
     A publish that happens after the wait begins must wake the waiter.
+
+    Tested directly against ``BusServer`` (same pattern as
+    ``test_wait_wakes_on_new_publish``) rather than via TestClient +
+    ``run_in_executor`` — this file already notes that TestClient
+    can't do concurrent HTTP calls cleanly, and the run_in_executor
+    pattern was flagged as flaky on shared loops.
     """
-    # Need a real concurrent client+publisher; reuse the dedicated
-    # concurrent harness from test_wait_wakes_on_new_publish.
     import asyncio
-    from bus.server import create_app
-    from fastapi.testclient import TestClient
+    from bus.db import BusDB
+    from bus.server import BusServer, PublishRequest, WaitRequest
 
-    app = create_app(db_path=str(tmp_path / "cursor-now-wake.db"))
+    db = BusDB(str(tmp_path / "cursor-now-wake.db"))
+    bus = BusServer(db, config={"bus_url": "http://localhost:9999"})
 
-    async def run():
-        with TestClient(app) as c:
-            # Seed pre-existing backlog the cursor='now' must skip.
-            for n in range(3):
-                c.post("/v1/publish", json={"topic": "live", "payload": {"n": n}, "source": "s"})
+    async def scenario():
+        # Seed pre-existing backlog the cursor='now' must skip.
+        for n in range(3):
+            await bus.publish(PublishRequest(
+                topic="live", payload={"n": n}, source="s",
+            ))
 
-            wait_done = asyncio.Event()
-            result_holder = {}
+        # Start a cursor='now' waiter; ack pointer doesn't yet exist
+        # for ``wake-now``, so default cursor would have replayed
+        # backlog. cursor='now' pins the floor at the current
+        # high-water mark.
+        wait_task = asyncio.create_task(bus.wait_for_event(WaitRequest(
+            topics=["live"],
+            subscriber_id="wake-now",
+            timeout=5.0,
+            cursor="now",
+        )))
 
-            async def waiter():
-                # Block in a thread so the TestClient's sync POST can run.
-                loop = asyncio.get_running_loop()
-                def _do():
-                    return c.post("/v1/wait", json={
-                        "topics": ["live"],
-                        "subscriber_id": "wake-now",
-                        "timeout": 3.0,
-                        "cursor": "now",
-                    }).json()
-                result_holder["r"] = await loop.run_in_executor(None, _do)
-                wait_done.set()
+        # Give the waiter a moment to park on the asyncio Event.
+        await asyncio.sleep(0.1)
+        assert not wait_task.done(), "waiter should be blocked on cursor='now'"
 
-            task = asyncio.create_task(waiter())
-            await asyncio.sleep(0.1)
-            # Publish a fresh event AFTER the wait is active.
-            c.post("/v1/publish", json={"topic": "live", "payload": {"n": 99}, "source": "s"})
-            await asyncio.wait_for(wait_done.wait(), timeout=4.0)
-            await task
-            return result_holder["r"]
+        # Publish a fresh event AFTER the wait is active. Must wake
+        # the waiter — the snapshot was taken when wait_for_event
+        # entered, so this id is strictly above the floor.
+        await bus.publish(PublishRequest(
+            topic="live", payload={"n": 99}, source="s",
+        ))
+        return await asyncio.wait_for(wait_task, timeout=2.0)
 
-    r = asyncio.run(run())
+    r = asyncio.run(scenario())
     assert r["status"] == "matched"
     # Must be the post-wait publish, not seeded backlog n=0..2.
     assert r["event"]["payload"] == {"n": 99}
