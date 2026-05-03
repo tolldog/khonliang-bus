@@ -3,10 +3,10 @@
 # so its events flow into the bus via Tailscale Funnel.
 #
 # Usage:
-#   bin/install-github-webhook.sh <repo>           # install on tolldog/<repo>
-#   bin/install-github-webhook.sh <owner/repo>     # install on owner/repo
-#   bin/install-github-webhook.sh --all-khonliang  # install on every tolldog/khonliang-*
-#   bin/install-github-webhook.sh --check <repo>   # verify hook + last_response only
+#   scripts/install-github-webhook.sh <repo>           # install on tolldog/<repo>
+#   scripts/install-github-webhook.sh <owner/repo>     # install on owner/repo
+#   scripts/install-github-webhook.sh --all-khonliang  # install on every tolldog/khonliang-*
+#   scripts/install-github-webhook.sh --check <repo>   # verify hook + last_response only
 #
 # Environment:
 #   KHONLIANG_WEBHOOK_URL   public webhook URL (default reads ts.net hostname)
@@ -18,8 +18,8 @@
 # echoes to the terminal or logs.
 #
 # Idempotency: GitHub's webhook API does NOT dedupe. Running this twice
-# creates two hooks. Use --check first; only POST if no matching URL hook
-# already exists.
+# creates two hooks. The script auto-paginates the existing-hook check
+# so it correctly skips on repos with more than one page of hooks.
 
 set -euo pipefail
 
@@ -68,16 +68,34 @@ resolve_url() {
 }
 
 resolve_secret() {
-    if [[ ! -r "$DEFAULT_SECRET_FILE" ]]; then
-        # Try sudo as a fallback for the prod 0640 root-readable layout.
-        if sudo -n test -r "$DEFAULT_SECRET_FILE" 2>/dev/null; then
-            sudo cat "$DEFAULT_SECRET_FILE" | grep -E '^GITHUB_WEBHOOK_SECRET=' | head -1 | cut -d= -f2-
-            return
-        fi
-        echo "error: cannot read $DEFAULT_SECRET_FILE (set KHONLIANG_SECRET_FILE)" >&2
+    # Read the env file's body once via whichever path works, then
+    # extract the GITHUB_WEBHOOK_SECRET line in pure bash so a missing
+    # key surfaces as an actionable error rather than aborting under
+    # ``set -euo pipefail`` when ``grep | head | cut`` returns
+    # non-zero.
+    local body
+    if [[ -r "$DEFAULT_SECRET_FILE" ]]; then
+        body=$(cat "$DEFAULT_SECRET_FILE")
+    elif sudo -n test -r "$DEFAULT_SECRET_FILE" 2>/dev/null; then
+        body=$(sudo cat "$DEFAULT_SECRET_FILE")
+    else
+        echo "error: cannot read $DEFAULT_SECRET_FILE" >&2
+        echo "  Either set KHONLIANG_SECRET_FILE to a readable path or" >&2
+        echo "  add your account to the file's owning group (typically" >&2
+        echo "  'khonliang' on the prod layout — 'sudo usermod -aG" >&2
+        echo "  khonliang \"\$USER\"' followed by a fresh login)." >&2
+        echo "  As a one-off you can run this script via 'sudo -E' so" >&2
+        echo "  the cat fallback can read the 0640 file directly." >&2
         exit 2
     fi
-    grep -E '^GITHUB_WEBHOOK_SECRET=' "$DEFAULT_SECRET_FILE" | head -1 | cut -d= -f2-
+    local line
+    line=$(printf '%s\n' "$body" | grep -E '^GITHUB_WEBHOOK_SECRET=' | head -n1 || true)
+    if [[ -z "$line" ]]; then
+        echo "error: $DEFAULT_SECRET_FILE has no GITHUB_WEBHOOK_SECRET= line" >&2
+        echo "  See etc/khonliang-bus/webhook-secret.env.example for the shape." >&2
+        exit 2
+    fi
+    printf '%s\n' "${line#GITHUB_WEBHOOK_SECRET=}"
 }
 
 normalize_repo() {
@@ -90,28 +108,77 @@ normalize_repo() {
 }
 
 existing_hook_id() {
-    local repo="$1" url="$2"
-    gh api "/repos/${repo}/hooks" 2>/dev/null \
-        | python3 -c 'import json,sys
-hooks = json.load(sys.stdin)
-target = sys.argv[1]
+    # ``gh api --paginate`` walks all pages of /hooks and emits the
+    # concatenated array, so a repo with more than one page of hooks
+    # doesn't fool the idempotency check into creating a duplicate.
+    # The python sink wraps the multi-page stream into a single list.
+    # Errors from gh (auth, missing scope, missing repo) are NOT
+    # swallowed — surface them so an operator can diagnose.
+    local repo="$1" url="$2" json
+    if ! json=$(gh api --paginate "/repos/${repo}/hooks" 2>&1); then
+        echo "error: gh api /repos/${repo}/hooks failed:" >&2
+        printf '%s\n' "$json" | head -c 300 >&2
+        echo >&2
+        return 1
+    fi
+    TARGET="$url" python3 -c '
+import json, os, sys
+target = os.environ["TARGET"]
+text = sys.stdin.read()
+# --paginate emits one JSON value per page; collect into a single list.
+hooks: list = []
+for line in text.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        chunk = json.loads(line)
+    except json.JSONDecodeError:
+        # Single-page output is one JSON array spanning multiple lines;
+        # fall back to parsing the whole stream as one value.
+        chunk = json.loads(text)
+        hooks = chunk if isinstance(chunk, list) else []
+        break
+    if isinstance(chunk, list):
+        hooks.extend(chunk)
 for h in hooks:
-    if (h.get("config") or {}).get("url","") == target:
+    if (h.get("config") or {}).get("url", "") == target:
         print(h["id"])
-        break' "$url"
+        break
+' <<<"$json"
 }
 
 check_one() {
-    local repo
+    local repo url json
     repo=$(normalize_repo "$1")
-    local url
     url=$(resolve_url)
-    gh api "/repos/${repo}/hooks" 2>/dev/null \
-        | TARGET="$url" REPO="$repo" python3 -c '
+    # --paginate handles multi-page hook lists. gh errors are surfaced
+    # explicitly (auth, missing scope, missing repo, …) so the audit
+    # path is actually trustworthy in automation/runbooks.
+    if ! json=$(gh api --paginate "/repos/${repo}/hooks" 2>&1); then
+        echo "  $repo: error from gh api /repos/${repo}/hooks:" >&2
+        printf '%s\n' "$json" | head -c 300 >&2
+        echo >&2
+        return 1
+    fi
+    TARGET="$url" REPO="$repo" python3 -c '
 import json, os, sys
 target = os.environ["TARGET"]
 repo = os.environ["REPO"]
-hooks = json.load(sys.stdin)
+text = sys.stdin.read()
+hooks: list = []
+for line in text.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        chunk = json.loads(line)
+    except json.JSONDecodeError:
+        chunk = json.loads(text)
+        hooks = chunk if isinstance(chunk, list) else []
+        break
+    if isinstance(chunk, list):
+        hooks.extend(chunk)
 matches = [h for h in hooks if (h.get("config") or {}).get("url", "") == target]
 if not matches:
     print(f"  {repo}: NO matching hook for {target}")
@@ -123,7 +190,7 @@ for h in matches:
     code = lr.get("code")
     status = lr.get("status")
     print(f"  {repo}: hook={hid}  events={events}  last_response={code} {status}")
-'
+' <<<"$json"
 }
 
 install_one() {

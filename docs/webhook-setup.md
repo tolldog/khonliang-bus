@@ -65,21 +65,49 @@ sudo systemctl daemon-reload
 sudo systemctl restart khonliang-bus.service
 ```
 
-Verify the bus picked up the secret:
+Verify the bus picked up the secret by walking the three states the
+receiver returns:
 
 ```sh
-# Should now return HTTP 401 (signature missing) — NOT 503 (no secret).
+# Step 1 — BEFORE installing the secret: should return HTTP 503
+# ("webhook receiver not configured"). If you see 503 after restart,
+# the EnvironmentFile= path is wrong or the file is missing.
 curl -s -o /dev/null -w '%{http_code}\n' \
   -X POST http://localhost:8788/v1/webhooks/github \
   -H 'X-GitHub-Event: ping' -H 'Content-Type: application/json' \
   -d '{"zen":"smoke"}'
+
+# Step 2 — AFTER restart with the secret in place: should return
+# HTTP 401 ("invalid signature") on an unsigned POST.
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -X POST http://localhost:8788/v1/webhooks/github \
+  -H 'X-GitHub-Event: ping' -H 'Content-Type: application/json' \
+  -d '{"zen":"smoke"}'
+
+# Step 3 — Signed POST with the actual secret: should return HTTP 200
+# ("status: published"). Confirms HMAC verification + bus publish.
+SECRET=$(sudo cat /etc/khonliang/webhook-secret.env | grep -E '^GITHUB_WEBHOOK_SECRET=' | cut -d= -f2-)
+BODY='{"zen":"signed-smoke"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^[^=]*= */sha256=/')
+curl -s -X POST http://localhost:8788/v1/webhooks/github \
+  -H "X-GitHub-Event: ping" \
+  -H "X-Hub-Signature-256: $SIG" \
+  -H 'Content-Type: application/json' \
+  --data-binary "$BODY"
 ```
 
 ## 3. Expose the endpoint to the public internet
 
 GitHub posts webhooks from public IPs over HTTPS, so the bus needs a
 reachable URL. The bus itself stays bound to `localhost:8788`; only the
-single webhook path is exposed to the outside.
+single webhook path should be exposed to the outside.
+
+> **Critical:** the bus FastAPI app also serves unauthenticated
+> control-plane routes (`/v1/register`, `/v1/request`, `/v1/publish`,
+> `/v1/install/*`, …) on the same listener. If you point a public
+> proxy or load balancer at the entire `localhost:8788`, those routes
+> become reachable too. Every option below scopes the public surface
+> to **only** `/v1/webhooks/github`. Do not skip that scoping.
 
 ### Option A: Tailscale Funnel (recommended for tailnet-managed hosts)
 
@@ -105,15 +133,20 @@ Your public webhook URL is then
 ### Option B: cloudflared / ngrok / any HTTPS tunnel
 
 The bus doesn't care which tunnel you use — it just needs to receive
-the POST on `localhost:8788/v1/webhooks/github`. cloudflared with a
-named tunnel and an `Ingress` block scoped to the webhook path is a
-fine substitute.
+the POST on `localhost:8788/v1/webhooks/github`. Scope the tunnel
+config to that exact path so the rest of the bus's REST surface
+(`/v1/register`, `/v1/request`, `/v1/publish`, etc. — all
+unauthenticated) does NOT become public. For cloudflared that's an
+`Ingress` block with `path: /v1/webhooks/github`; for a generic
+reverse proxy, restrict the upstream `location` block.
 
 ### Option C: real public endpoint
 
 If the bus host already has a real public hostname with TLS in front
 of it (caddy / nginx / cloud LB), point the webhook URL at that and
-skip the tunnel.
+skip the tunnel — but configure the proxy to forward **only**
+`/v1/webhooks/github` upstream. A blanket forward exposes the
+unauthenticated control plane.
 
 ## 4. Configure each repo's GitHub webhook
 
@@ -121,11 +154,19 @@ skip the tunnel.
 
 `scripts/install-github-webhook.sh` reads the secret from
 `/etc/khonliang/webhook-secret.env`, derives the public URL from the
-local Tailscale hostname, and POSTs the canonical config (events:
-`pull_request`, `pull_request_review`, `pull_request_review_comment`,
-`issue_comment`, `push`, `check_run`) to one repo or all
-`tolldog/khonliang-*` repos at once. It is idempotent — installs that
-already target the resolved URL are skipped, not duplicated.
+local Tailscale hostname (Option A above), and POSTs the canonical
+config (events: `pull_request`, `pull_request_review`,
+`pull_request_review_comment`, `issue_comment`, `push`, `check_run`)
+to one repo or all `tolldog/khonliang-*` repos at once. It is
+idempotent — installs that already target the resolved URL are
+skipped, not duplicated.
+
+> **If you used Option B or C** (cloudflared / ngrok / your own
+> proxy), the local `*.ts.net` hostname won't resolve to the right
+> URL. Set `KHONLIANG_WEBHOOK_URL` to the full public webhook URL
+> (e.g. `https://hooks.example.com/v1/webhooks/github`) before
+> running the script, otherwise it will install the wrong URL on
+> every repo.
 
 ```sh
 # Install on a single repo (defaults to owner=tolldog if no slash)
@@ -138,6 +179,10 @@ scripts/install-github-webhook.sh --all-khonliang
 # Verify last_response across one or many repos without making changes
 scripts/install-github-webhook.sh --check khonliang-bus khonliang-developer
 scripts/install-github-webhook.sh --check --all-khonliang
+
+# Non-Funnel deployments must override the URL explicitly
+KHONLIANG_WEBHOOK_URL=https://hooks.example.com/v1/webhooks/github \
+  scripts/install-github-webhook.sh --all-khonliang
 ```
 
 The script never echoes the secret, never writes it to a persistent
