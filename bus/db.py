@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic, sequence);
 
+-- Supports list_topics()'s GROUP BY topic + MIN/MAX(created_at) +
+-- ORDER BY last_fired_at DESC. Without this, GET /v1/topics scans
+-- the entire ``messages`` table and slows down as the bus runs
+-- longer (no pruning of old messages exists). Covering both columns
+-- lets SQLite satisfy the per-topic min/max from the index alone.
+CREATE INDEX IF NOT EXISTS idx_messages_topic_created
+    ON messages(topic, created_at);
+
 -- Persistent: subscriber ack tracking
 CREATE TABLE IF NOT EXISTS subscriptions (
     subscriber_id TEXT NOT NULL,
@@ -387,6 +395,130 @@ class BusDB:
                 "INSERT OR REPLACE INTO subscriptions (subscriber_id, topic, last_acked_id) VALUES (?, ?, ?)",
                 (subscriber_id, topic, message_id),
             )
+
+    LIST_TOPICS_LIMIT_CAP = 1000
+
+    @staticmethod
+    def _glob_escape(value: str) -> str:
+        """Escape SQLite ``GLOB`` metacharacters in a literal-match
+        prefix. ``GLOB`` treats ``*``, ``?``, and ``[`` specially;
+        bracket-escape each so the prefix matches verbatim. ``[`` is
+        bracket-quoted as ``[[]`` so it doesn't open a character
+        class. ``GLOB`` has no ``ESCAPE`` clause (unlike ``LIKE``),
+        so this is the standard escape strategy."""
+        out = []
+        for c in value:
+            if c in "*?[":
+                out.append(f"[{c}]")
+            else:
+                out.append(c)
+        return "".join(out)
+
+    def list_topics(
+        self, prefix: str = "", limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Catalog every topic ever published with summary metadata.
+
+        Mirrors the shape of the bus's other read surfaces
+        (:meth:`get_skills` / :meth:`get_flows`, exposed on the
+        server as ``GET /v1/skills`` / ``GET /v1/flows``) for the
+        event surface so an MCP caller can introspect what's flowing
+        on the bus without reading source. Closes the introspection-
+        layer gap surfaced in dog_ce53165f and tracked by
+        ``fr_bus_7b2d41d2``.
+
+        Args:
+            prefix: Optional namespace filter (e.g. ``"github."``).
+                Case-sensitive literal-match — implemented with
+                SQLite ``GLOB`` (case-sensitive without any global
+                pragma) plus bracket-escaping of ``GLOB``
+                metacharacters (``*``, ``?``, ``[``) so a prefix
+                containing those characters matches verbatim rather
+                than as a glob pattern. Empty matches all.
+            limit: Cap on rows returned, ordered by ``last_fired_at``
+                DESC so the most recently active topics come first.
+                Clamped to ``[1, LIST_TOPICS_LIMIT_CAP]`` (1000) so the
+                public ``GET /v1/topics`` endpoint can't be coerced
+                into an unbounded scan via a very large or negative
+                value (``LIMIT -1`` disables the limit in SQLite —
+                explicitly defended against here).
+
+        Each row is::
+
+            {
+                "topic": str,
+                "count": int,                   # total messages on this topic
+                "first_fired_at": str,          # earliest created_at
+                "last_fired_at": str,           # most-recent created_at
+                "producers": list[str],         # distinct source values, deduped
+            }
+        """
+        try:
+            limit_int = int(limit)
+        except (TypeError, ValueError):
+            limit_int = 200
+        clamped_limit = max(1, min(limit_int, self.LIST_TOPICS_LIMIT_CAP))
+        # Aggregate per-topic stats and producers in two stages so the
+        # ``producers`` aggregate is built from the DISTINCT source set
+        # only — not from every message on the topic. On a high-volume
+        # topic (millions of messages, few distinct producers) a flat
+        # ``GROUP_CONCAT`` over the full table produced a huge
+        # intermediate string. The CTE narrows the inner aggregate to
+        # the distinct sources first; the per-topic correlated
+        # subquery joins them back. With ``idx_messages_topic_created``
+        # each subquery is an indexed lookup.
+        #
+        # Producers come back as a real JSON array via
+        # ``json_group_array`` rather than a separator-joined string.
+        # That removes any in-band-separator collision risk —
+        # ``PublishRequest.source`` is an unconstrained string, and an
+        # earlier 0x1F-separator design could have corrupted the
+        # producers list if a source value happened to contain that
+        # byte. JSON array encoding sidesteps the entire class of
+        # problem at zero readability cost on the consumer side.
+        with self.conn() as c:
+            sql = """
+                WITH topic_stats AS (
+                    SELECT topic,
+                           COUNT(*) AS count,
+                           MIN(created_at) AS first_fired_at,
+                           MAX(created_at) AS last_fired_at
+                    FROM messages
+                    {where}
+                    GROUP BY topic
+                    ORDER BY last_fired_at DESC
+                    LIMIT ?
+                )
+                SELECT t.topic,
+                       t.count,
+                       t.first_fired_at,
+                       t.last_fired_at,
+                       (SELECT json_group_array(s)
+                          FROM (SELECT DISTINCT source AS s
+                                  FROM messages
+                                 WHERE topic = t.topic)) AS producers
+                FROM topic_stats t
+                ORDER BY t.last_fired_at DESC
+            """
+            params: list[Any] = []
+            where = ""
+            if prefix:
+                where = "WHERE topic GLOB ? || '*'"
+                params.append(self._glob_escape(prefix))
+            params.append(clamped_limit)
+            rows = c.execute(sql.format(where=where), params).fetchall()
+            return [
+                {
+                    "topic": r["topic"],
+                    "count": r["count"],
+                    "first_fired_at": r["first_fired_at"],
+                    "last_fired_at": r["last_fired_at"],
+                    "producers": sorted(
+                        json.loads(r["producers"]) if r["producers"] else []
+                    ),
+                }
+                for r in rows
+            ]
 
     def get_last_acked(self, subscriber_id: str, topic: str) -> int:
         with self.conn() as c:

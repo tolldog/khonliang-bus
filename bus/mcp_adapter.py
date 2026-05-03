@@ -225,6 +225,58 @@ class BusMCPAdapter:
             return "\n".join(lines) if lines else "no flows declared"
 
         @mcp.tool()
+        async def bus_topics(prefix: str = "", limit: int = 200) -> str:
+            """Catalog every topic ever published on the bus.
+
+            Mirrors ``bus_skills`` / ``bus_flows`` for the event
+            surface so a session can discover canonical topic strings
+            for ``bus_wait_for_event`` without reading source. Closes
+            fr_bus_7b2d41d2 (surfaced by dog_ce53165f).
+
+            Args:
+                prefix: Optional namespace filter — case-sensitive
+                    literal-match prefix (e.g. ``"github."``,
+                    ``"pr."``, ``"bus."``). Glob metacharacters in
+                    the prefix are bracket-escaped before the SQL
+                    runs, so a prefix containing ``*`` / ``?`` /
+                    ``[`` matches verbatim rather than as a pattern.
+                    Empty matches all.
+                limit: Cap on rows returned (default 200), ordered by
+                    last-fired DESC so the most recently active topics
+                    come first.
+
+            Returns one line per topic with
+            ``count``, ``last_fired_at``, and the producer agents that
+            have ever fired it.
+            """
+            params = {"limit": limit}
+            if prefix:
+                params["prefix"] = prefix
+            rows = adapter._get("/v1/topics", params=params) or []
+            if not rows:
+                hint = f" matching prefix={prefix!r}" if prefix else ""
+                return f"no topics{hint}"
+            lines = []
+            for r in rows:
+                # ``producers`` may contain comma-bearing values
+                # (sources are unconstrained strings; the DB layer
+                # round-trips them as a JSON array via
+                # ``json_group_array`` so any byte is preserved
+                # without separator collision risk). Render each
+                # entry quoted via ``json.dumps`` so the human-
+                # facing output is also unambiguous — a producer
+                # like ``agent,with,commas`` shows as
+                # ``["agent,with,commas"]`` instead of being
+                # mistaken for three producers.
+                producers_list = r.get("producers") or []
+                producers = json.dumps(producers_list) if producers_list else "[]"
+                lines.append(
+                    f"  {r['topic']} (n={r['count']}, last={r['last_fired_at']}, "
+                    f"producers={producers})"
+                )
+            return "\n".join(lines)
+
+        @mcp.tool()
         async def bus_wait_for_event(
             topics: str = "",
             subscriber_id: str = "claude-mcp",

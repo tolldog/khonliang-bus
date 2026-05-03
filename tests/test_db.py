@@ -162,3 +162,174 @@ def test_trace_lifecycle(db):
     assert len(trace) == 1
     assert trace[0]["status"] == "ok"
     assert trace[0]["duration_ms"] == 150
+
+
+def test_list_topics_empty_returns_empty_list(db):
+    assert db.list_topics() == []
+
+
+def test_list_topics_summarises_per_topic(db):
+    db.publish_message("github.pull_request_review.submitted", {"pr": 1}, "github-webhook")
+    db.publish_message("github.pull_request_review.submitted", {"pr": 2}, "github-webhook")
+    db.publish_message("pr.review", {"pr": 1}, "watch_pr_fleet")
+    db.publish_message("bus.registry_changed", {"agent_id": "x"}, "bus")
+
+    rows = db.list_topics()
+    by_topic = {r["topic"]: r for r in rows}
+
+    assert set(by_topic) == {
+        "github.pull_request_review.submitted",
+        "pr.review",
+        "bus.registry_changed",
+    }
+    pr_review = by_topic["github.pull_request_review.submitted"]
+    assert pr_review["count"] == 2
+    assert pr_review["producers"] == ["github-webhook"]
+    # first_fired_at and last_fired_at carry SQLite-formatted timestamps;
+    # we only check shape (non-empty, monotonic) — exact value is wall-
+    # clock-dependent.
+    assert pr_review["first_fired_at"]
+    assert pr_review["last_fired_at"]
+    assert pr_review["first_fired_at"] <= pr_review["last_fired_at"]
+
+
+def test_list_topics_distinct_producers(db):
+    db.publish_message("multi", {}, "agent-a")
+    db.publish_message("multi", {}, "agent-b")
+    db.publish_message("multi", {}, "agent-a")
+
+    rows = db.list_topics()
+    # Distinct via DISTINCT in GROUP_CONCAT, but order is implementation-
+    # defined (usually insertion order in SQLite). Compare as a set so
+    # the test isn't ordering-coupled.
+    assert set(rows[0]["producers"]) == {"agent-a", "agent-b"}
+
+
+def test_list_topics_prefix_filter(db):
+    db.publish_message("github.push", {}, "github-webhook")
+    db.publish_message("github.pull_request.opened", {}, "github-webhook")
+    db.publish_message("pr.review", {}, "watch_pr_fleet")
+    db.publish_message("bus.registry_changed", {}, "bus")
+
+    rows = db.list_topics(prefix="github.")
+    topics = {r["topic"] for r in rows}
+    assert topics == {"github.push", "github.pull_request.opened"}
+
+
+def test_list_topics_orders_by_last_fired_desc(db):
+    """Most recently active topic comes first — useful for live debugging
+    where the operator wants to know what's currently flowing.
+
+    Avoids ``time.sleep`` (which was 1+ seconds and flaky on busy
+    CI) by inserting both rows then back-dating one of them with an
+    explicit UPDATE so the timestamp ordering is deterministic."""
+    db.publish_message("new.topic", {}, "s")
+    db.publish_message("old.topic", {}, "s")
+    with db.conn() as c:
+        c.execute(
+            "UPDATE messages SET created_at = '2020-01-01 00:00:00' "
+            "WHERE topic = 'old.topic'"
+        )
+
+    rows = db.list_topics()
+    assert rows[0]["topic"] == "new.topic"
+    assert rows[1]["topic"] == "old.topic"
+
+
+def test_list_topics_limit_caps_rows(db):
+    for i in range(5):
+        db.publish_message(f"topic.{i}", {}, "s")
+    rows = db.list_topics(limit=2)
+    assert len(rows) == 2
+
+
+def test_list_topics_prefix_is_case_sensitive(db):
+    """``GLOB`` is case-sensitive in SQLite (``LIKE`` is not, by
+    default — without ``PRAGMA case_sensitive_like=ON``). The
+    docstring promises case-sensitive prefix matching, so a lower-
+    case prefix must NOT match an upper-case topic."""
+    db.publish_message("Github.push", {}, "s")
+    db.publish_message("github.push", {}, "s")
+    rows = db.list_topics(prefix="github.")
+    assert {r["topic"] for r in rows} == {"github.push"}
+    rows = db.list_topics(prefix="Github.")
+    assert {r["topic"] for r in rows} == {"Github.push"}
+
+
+def test_list_topics_limit_clamped_against_negative_value(db):
+    """``LIMIT -1`` disables the limit in SQLite, so without clamping
+    a public endpoint could return the entire ``messages`` table.
+    The helper coerces negative values to the floor (1)."""
+    for i in range(5):
+        db.publish_message(f"topic.{i}", {}, "s")
+    rows = db.list_topics(limit=-1)
+    assert len(rows) == 1
+
+
+def test_list_topics_limit_clamped_against_huge_value(db, monkeypatch):
+    """A very large ``limit`` is clamped at ``LIST_TOPICS_LIMIT_CAP``
+    so the public endpoint can't be coerced into a heavy scan via a
+    large operator-supplied value. Verified by lowering the cap to a
+    small test value and seeding more topics than the cap, so the
+    clamp is the only thing that bounds the returned row count."""
+    # Lower the cap for the duration of this test rather than seed
+    # 1000+ rows in a unit test. The clamp logic is independent of
+    # the cap value, so testing at cap=3 proves the same invariant.
+    monkeypatch.setattr(BusDB, "LIST_TOPICS_LIMIT_CAP", 3)
+    for i in range(7):
+        db.publish_message(f"topic.{i}", {}, "s")
+    # Ask for many more rows than the cap; expect exactly 3 back.
+    rows = db.list_topics(limit=100_000)
+    assert len(rows) == 3
+
+
+def test_list_topics_limit_invalid_value_falls_back_to_default(db):
+    """A non-numeric limit falls back to the default (200) rather
+    than raising — defensive against bad operator input on the
+    public endpoint."""
+    for i in range(3):
+        db.publish_message(f"topic.{i}", {}, "s")
+    rows = db.list_topics(limit="not-a-number")  # type: ignore[arg-type]
+    assert len(rows) == 3  # data-bounded, not limit-bounded
+
+
+def test_list_topics_prefix_escapes_glob_metacharacters(db):
+    """``GLOB`` treats ``*``, ``?``, ``[`` specially. A literal-match
+    prefix containing those characters must NOT behave as a glob
+    pattern — the helper bracket-escapes them before passing to
+    SQL."""
+    db.publish_message("foo*bar.x", {}, "s")
+    db.publish_message("foo123.x", {}, "s")  # would match foo*. without escape
+    db.publish_message("foo?bar.x", {}, "s")
+    db.publish_message("foo[bar].x", {}, "s")
+
+    # Without escaping, prefix='foo*' would match all four; with
+    # escaping it should match only the literal-asterisk topic.
+    rows = db.list_topics(prefix="foo*")
+    assert {r["topic"] for r in rows} == {"foo*bar.x"}
+
+    rows = db.list_topics(prefix="foo?")
+    assert {r["topic"] for r in rows} == {"foo?bar.x"}
+
+    # ``[`` is bracket-escaped as ``[[]`` so it doesn't open a
+    # character class.
+    rows = db.list_topics(prefix="foo[")
+    assert {r["topic"] for r in rows} == {"foo[bar].x"}
+
+
+def test_list_topics_producers_handle_comma_in_source(db):
+    """``PublishRequest.source`` is unconstrained, so a value
+    containing a literal comma must NOT be split across multiple
+    producers in the result. The helper aggregates producers as a
+    JSON array via ``json_group_array``, which side-steps any
+    in-band-separator collision risk."""
+    db.publish_message("t", {}, "agent,with,commas")
+    db.publish_message("t", {}, "plain-agent")
+    rows = db.list_topics(prefix="t")
+    assert {r["topic"] for r in rows} == {"t"}
+    producers = set(rows[0]["producers"])
+    # The comma-bearing source survives as a single producer entry
+    # (not three).
+    assert "agent,with,commas" in producers
+    assert "plain-agent" in producers
+    assert len(producers) == 2
