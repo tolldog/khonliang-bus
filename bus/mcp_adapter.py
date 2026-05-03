@@ -212,8 +212,12 @@ class BusMCPAdapter:
 
             Args:
                 prefix: Optional namespace filter — case-sensitive
-                    LIKE-style ``prefix%`` (e.g. ``"github."``,
-                    ``"pr."``, ``"bus."``). Empty matches all.
+                    literal-match prefix (e.g. ``"github."``,
+                    ``"pr."``, ``"bus."``). Glob metacharacters in
+                    the prefix are bracket-escaped before the SQL
+                    runs, so a prefix containing ``*`` / ``?`` /
+                    ``[`` matches verbatim rather than as a pattern.
+                    Empty matches all.
                 limit: Cap on rows returned (default 200), ordered by
                     last-fired DESC so the most recently active topics
                     come first.

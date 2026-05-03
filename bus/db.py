@@ -390,25 +390,51 @@ class BusDB:
 
     LIST_TOPICS_LIMIT_CAP = 1000
 
+    # ASCII Unit Separator (US, 0x1F) — chosen as the GROUP_CONCAT
+    # separator for the producers aggregate so that comma-bearing
+    # source values don't corrupt the split. 0x1F is reserved for
+    # exactly this purpose in ASCII and never appears in identifier-
+    # like agent / source strings. Held as a class constant so tests
+    # can assert against it without re-deriving the choice.
+    _PRODUCERS_SEPARATOR = "\x1f"
+
+    @staticmethod
+    def _glob_escape(value: str) -> str:
+        """Escape SQLite ``GLOB`` metacharacters in a literal-match
+        prefix. ``GLOB`` treats ``*``, ``?``, and ``[`` specially;
+        bracket-escape each so the prefix matches verbatim. ``[`` is
+        bracket-quoted as ``[[]`` so it doesn't open a character
+        class. ``GLOB`` has no ``ESCAPE`` clause (unlike ``LIKE``),
+        so this is the standard escape strategy."""
+        out = []
+        for c in value:
+            if c in "*?[":
+                out.append(f"[{c}]")
+            else:
+                out.append(c)
+        return "".join(out)
+
     def list_topics(
         self, prefix: str = "", limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Catalog every topic ever published with summary metadata.
 
-        Mirrors the shape of :meth:`list_skills` / :meth:`list_flows` for
-        the event surface so an MCP caller can introspect what's
-        flowing on the bus without reading source. Closes the
-        introspection-layer gap surfaced in dog_ce53165f and tracked by
+        Mirrors the shape of the bus's other read surfaces
+        (:meth:`get_skills` / :meth:`get_flows`, exposed on the
+        server as ``GET /v1/skills`` / ``GET /v1/flows``) for the
+        event surface so an MCP caller can introspect what's flowing
+        on the bus without reading source. Closes the introspection-
+        layer gap surfaced in dog_ce53165f and tracked by
         ``fr_bus_7b2d41d2``.
 
         Args:
             prefix: Optional namespace filter (e.g. ``"github."``).
-                Case-sensitive — implemented with SQLite ``GLOB`` to
-                avoid ``LIKE``'s default case-insensitive ASCII
-                matching (without ``PRAGMA case_sensitive_like=ON``,
-                which is global to the connection and would change
-                behaviour of every other ``LIKE`` query). Empty
-                matches all.
+                Case-sensitive literal-match — implemented with
+                SQLite ``GLOB`` (case-sensitive without any global
+                pragma) plus bracket-escaping of ``GLOB``
+                metacharacters (``*``, ``?``, ``[``) so a prefix
+                containing those characters matches verbatim rather
+                than as a glob pattern. Empty matches all.
             limit: Cap on rows returned, ordered by ``last_fired_at``
                 DESC so the most recently active topics come first.
                 Clamped to ``[1, LIST_TOPICS_LIMIT_CAP]`` (1000) so the
@@ -424,7 +450,7 @@ class BusDB:
                 "count": int,                   # total messages on this topic
                 "first_fired_at": str,          # earliest created_at
                 "last_fired_at": str,           # most-recent created_at
-                "producers": list[str],         # distinct source values
+                "producers": list[str],         # distinct source values, deduped
             }
         """
         try:
@@ -433,12 +459,18 @@ class BusDB:
             limit_int = 200
         clamped_limit = max(1, min(limit_int, self.LIST_TOPICS_LIMIT_CAP))
         with self.conn() as c:
+            # ``GROUP_CONCAT(source, char(N))`` uses our 0x1F
+            # separator so a comma-bearing ``source`` value never
+            # corrupts the producer list. SQLite's
+            # ``GROUP_CONCAT(DISTINCT col, sep)`` is not portable
+            # across older builds — we drop DISTINCT in SQL and
+            # dedupe in Python below so the per-row work stays O(n).
             sql = """
                 SELECT topic,
                        COUNT(*) AS count,
                        MIN(created_at) AS first_fired_at,
                        MAX(created_at) AS last_fired_at,
-                       GROUP_CONCAT(DISTINCT source) AS producers
+                       GROUP_CONCAT(source, char(31)) AS producers
                 FROM messages
                 {where}
                 GROUP BY topic
@@ -448,22 +480,20 @@ class BusDB:
             params: list[Any] = []
             where = ""
             if prefix:
-                # GLOB is case-sensitive in SQLite (LIKE is not, by
-                # default). Prefix-only match needs just the ``*``
-                # wildcard.
                 where = "WHERE topic GLOB ? || '*'"
-                params.append(prefix)
+                params.append(self._glob_escape(prefix))
             params.append(clamped_limit)
             rows = c.execute(sql.format(where=where), params).fetchall()
+            sep = self._PRODUCERS_SEPARATOR
             return [
                 {
                     "topic": r["topic"],
                     "count": r["count"],
                     "first_fired_at": r["first_fired_at"],
                     "last_fired_at": r["last_fired_at"],
-                    "producers": (
-                        [p for p in (r["producers"] or "").split(",") if p]
-                    ),
+                    "producers": sorted({
+                        p for p in (r["producers"] or "").split(sep) if p
+                    }),
                 }
                 for r in rows
             ]

@@ -218,13 +218,18 @@ def test_list_topics_prefix_filter(db):
 
 def test_list_topics_orders_by_last_fired_desc(db):
     """Most recently active topic comes first — useful for live debugging
-    where the operator wants to know what's currently flowing."""
-    import time as _time
-    db.publish_message("old.topic", {}, "s")
-    # SQLite datetime('now') is second-resolution, so sleep enough that
-    # MAX(created_at) on a later publish strictly exceeds the earlier one.
-    _time.sleep(1.05)
+    where the operator wants to know what's currently flowing.
+
+    Avoids ``time.sleep`` (which was 1+ seconds and flaky on busy
+    CI) by inserting both rows then back-dating one of them with an
+    explicit UPDATE so the timestamp ordering is deterministic."""
     db.publish_message("new.topic", {}, "s")
+    db.publish_message("old.topic", {}, "s")
+    with db.conn() as c:
+        c.execute(
+            "UPDATE messages SET created_at = '2020-01-01 00:00:00' "
+            "WHERE topic = 'old.topic'"
+        )
 
     rows = db.list_topics()
     assert rows[0]["topic"] == "new.topic"
@@ -286,3 +291,44 @@ def test_list_topics_limit_invalid_value_falls_back_to_default(db):
         db.publish_message(f"topic.{i}", {}, "s")
     rows = db.list_topics(limit="not-a-number")  # type: ignore[arg-type]
     assert len(rows) == 3  # data-bounded, not limit-bounded
+
+
+def test_list_topics_prefix_escapes_glob_metacharacters(db):
+    """``GLOB`` treats ``*``, ``?``, ``[`` specially. A literal-match
+    prefix containing those characters must NOT behave as a glob
+    pattern — the helper bracket-escapes them before passing to
+    SQL."""
+    db.publish_message("foo*bar.x", {}, "s")
+    db.publish_message("foo123.x", {}, "s")  # would match foo*. without escape
+    db.publish_message("foo?bar.x", {}, "s")
+    db.publish_message("foo[bar].x", {}, "s")
+
+    # Without escaping, prefix='foo*' would match all four; with
+    # escaping it should match only the literal-asterisk topic.
+    rows = db.list_topics(prefix="foo*")
+    assert {r["topic"] for r in rows} == {"foo*bar.x"}
+
+    rows = db.list_topics(prefix="foo?")
+    assert {r["topic"] for r in rows} == {"foo?bar.x"}
+
+    # ``[`` is bracket-escaped as ``[[]`` so it doesn't open a
+    # character class.
+    rows = db.list_topics(prefix="foo[")
+    assert {r["topic"] for r in rows} == {"foo[bar].x"}
+
+
+def test_list_topics_producers_handle_comma_in_source(db):
+    """``PublishRequest.source`` is unconstrained, so a value
+    containing a literal comma must NOT be split across multiple
+    producers in the result. The helper uses ASCII Unit Separator
+    (0x1F) as the GROUP_CONCAT separator."""
+    db.publish_message("t", {}, "agent,with,commas")
+    db.publish_message("t", {}, "plain-agent")
+    rows = db.list_topics(prefix="t")
+    assert {r["topic"] for r in rows} == {"t"}
+    producers = set(rows[0]["producers"])
+    # The comma-bearing source survives as a single producer entry
+    # (not three).
+    assert "agent,with,commas" in producers
+    assert "plain-agent" in producers
+    assert len(producers) == 2
