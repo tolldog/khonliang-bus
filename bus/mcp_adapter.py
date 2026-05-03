@@ -237,12 +237,14 @@ class BusMCPAdapter:
             for r in rows:
                 # ``producers`` may contain comma-bearing values
                 # (sources are unconstrained strings; the DB layer
-                # explicitly preserves them via a 0x1F separator).
-                # Render each entry quoted via ``json.dumps`` so the
-                # output is unambiguous regardless of the value's
-                # contents — a producer like ``agent,with,commas``
-                # shows as ``["agent,with,commas"]`` instead of
-                # being mistaken for three producers.
+                # round-trips them as a JSON array via
+                # ``json_group_array`` so any byte is preserved
+                # without separator collision risk). Render each
+                # entry quoted via ``json.dumps`` so the human-
+                # facing output is also unambiguous — a producer
+                # like ``agent,with,commas`` shows as
+                # ``["agent,with,commas"]`` instead of being
+                # mistaken for three producers.
                 producers_list = r.get("producers") or []
                 producers = json.dumps(producers_list) if producers_list else "[]"
                 lines.append(

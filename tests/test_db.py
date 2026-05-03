@@ -320,8 +320,9 @@ def test_list_topics_prefix_escapes_glob_metacharacters(db):
 def test_list_topics_producers_handle_comma_in_source(db):
     """``PublishRequest.source`` is unconstrained, so a value
     containing a literal comma must NOT be split across multiple
-    producers in the result. The helper uses ASCII Unit Separator
-    (0x1F) as the GROUP_CONCAT separator."""
+    producers in the result. The helper aggregates producers as a
+    JSON array via ``json_group_array``, which side-steps any
+    in-band-separator collision risk."""
     db.publish_message("t", {}, "agent,with,commas")
     db.publish_message("t", {}, "plain-agent")
     rows = db.list_topics(prefix="t")
