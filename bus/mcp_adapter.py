@@ -235,10 +235,19 @@ class BusMCPAdapter:
                 return f"no topics{hint}"
             lines = []
             for r in rows:
-                producers = ",".join(r.get("producers") or []) or "?"
+                # ``producers`` may contain comma-bearing values
+                # (sources are unconstrained strings; the DB layer
+                # explicitly preserves them via a 0x1F separator).
+                # Render each entry quoted via ``json.dumps`` so the
+                # output is unambiguous regardless of the value's
+                # contents — a producer like ``agent,with,commas``
+                # shows as ``["agent,with,commas"]`` instead of
+                # being mistaken for three producers.
+                producers_list = r.get("producers") or []
+                producers = json.dumps(producers_list) if producers_list else "[]"
                 lines.append(
                     f"  {r['topic']} (n={r['count']}, last={r['last_fired_at']}, "
-                    f"producers=[{producers}])"
+                    f"producers={producers})"
                 )
             return "\n".join(lines)
 

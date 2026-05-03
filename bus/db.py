@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic, sequence);
 
+-- Supports list_topics()'s GROUP BY topic + MIN/MAX(created_at) +
+-- ORDER BY last_fired_at DESC. Without this, GET /v1/topics scans
+-- the entire ``messages`` table and slows down as the bus runs
+-- longer (no pruning of old messages exists). Covering both columns
+-- lets SQLite satisfy the per-topic min/max from the index alone.
+CREATE INDEX IF NOT EXISTS idx_messages_topic_created
+    ON messages(topic, created_at);
+
 -- Persistent: subscriber ack tracking
 CREATE TABLE IF NOT EXISTS subscriptions (
     subscriber_id TEXT NOT NULL,
@@ -458,33 +466,31 @@ class BusDB:
         except (TypeError, ValueError):
             limit_int = 200
         clamped_limit = max(1, min(limit_int, self.LIST_TOPICS_LIMIT_CAP))
+        sep = self._PRODUCERS_SEPARATOR
+        # SQL parameter for the GROUP_CONCAT separator: pass the
+        # constant in via a placeholder rather than hardcoding
+        # ``char(31)`` so the SQL and Python sides can never silently
+        # diverge if ``_PRODUCERS_SEPARATOR`` is ever changed.
         with self.conn() as c:
-            # ``GROUP_CONCAT(source, char(N))`` uses our 0x1F
-            # separator so a comma-bearing ``source`` value never
-            # corrupts the producer list. SQLite's
-            # ``GROUP_CONCAT(DISTINCT col, sep)`` is not portable
-            # across older builds — we drop DISTINCT in SQL and
-            # dedupe in Python below so the per-row work stays O(n).
             sql = """
                 SELECT topic,
                        COUNT(*) AS count,
                        MIN(created_at) AS first_fired_at,
                        MAX(created_at) AS last_fired_at,
-                       GROUP_CONCAT(source, char(31)) AS producers
+                       GROUP_CONCAT(source, ?) AS producers
                 FROM messages
                 {where}
                 GROUP BY topic
                 ORDER BY last_fired_at DESC
                 LIMIT ?
             """
-            params: list[Any] = []
+            params: list[Any] = [sep]
             where = ""
             if prefix:
                 where = "WHERE topic GLOB ? || '*'"
                 params.append(self._glob_escape(prefix))
             params.append(clamped_limit)
             rows = c.execute(sql.format(where=where), params).fetchall()
-            sep = self._PRODUCERS_SEPARATOR
             return [
                 {
                     "topic": r["topic"],
