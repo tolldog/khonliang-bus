@@ -160,7 +160,13 @@ def test_wait_cursor_now_skips_existing_backlog(client):
     }).json()
     assert r["status"] == "timeout"
 
-    # Default cursor on the same fresh subscriber DOES see the backlog.
+    # Default cursor on a *different* fresh subscriber DOES see the
+    # backlog. ``fresh-now`` already has an ack pointer from its
+    # cursor='now' wait above; ``fresh-default`` is a brand-new
+    # subscriber so it exercises the no-prior-history default-cursor
+    # path. The point of the assertion is that cursor controls whether
+    # backlog replays for a fresh subscriber, NOT that the same
+    # subscriber sees both behaviours within one session.
     r = client.post("/v1/wait", json={
         "topics": ["old.topic"],
         "subscriber_id": "fresh-default",
@@ -206,7 +212,6 @@ def test_wait_cursor_now_returns_event_published_after_call(tmp_path):
 
             async def waiter():
                 # Block in a thread so the TestClient's sync POST can run.
-                import functools
                 loop = asyncio.get_running_loop()
                 def _do():
                     return c.post("/v1/wait", json={
@@ -248,11 +253,17 @@ def test_wait_cursor_unknown_value_falls_back_to_default(client):
     assert r["event"]["payload"] == {"n": 1}
 
 
-def test_wait_cursor_now_with_existing_subscriber_history(client):
-    """If a subscriber has acked through id=2 and cursor='now' snapshots
-    above that, the floor wins (no backwards delivery). And vice
-    versa — if the subscriber has acked past the snapshot, the ack
-    pointer wins. Confirms the MAX(ack, floor) semantic."""
+def test_wait_cursor_now_with_floor_above_ack_pointer(client):
+    """floor > ack: a subscriber whose ack pointer is below the
+    cursor='now' snapshot does NOT get backwards delivery to the
+    intervening events — the floor wins.
+
+    The "ack > floor" direction is impossible by construction:
+    floor = ``max_message_id`` taken at wait time and the ack pointer
+    is always ≤ max_message_id, so floor ≥ ack always holds. The
+    floor == ack case is uninteresting (threshold is the same value
+    either way). Only the floor > ack case has distinct
+    observable behaviour, so it's the only direction tested here."""
     # Seed three events; subscriber 'sub' acks the first two via two
     # default-cursor waits.
     client.post("/v1/publish", json={"topic": "t", "payload": {"n": 1}, "source": "s"})
@@ -280,3 +291,5 @@ def test_wait_cursor_now_with_existing_subscriber_history(client):
         "topics": ["t"], "subscriber_id": "sub", "timeout": 1.0,
     }).json()
     assert r["event"]["payload"] == {"n": 3}
+
+
