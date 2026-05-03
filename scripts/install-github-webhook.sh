@@ -107,15 +107,27 @@ require_dep() {
 
 resolve_url() {
     if [[ -n "${KHONLIANG_WEBHOOK_URL:-}" ]]; then
-        # Validate the override looks plausible: HTTPS scheme, host
-        # present, path ending in /v1/webhooks/github. A typo like a
-        # missing path segment would otherwise be pushed verbatim to
-        # every repo — GitHub would happily accept the malformed URL,
-        # POST deliveries would 404, and the installer would still
-        # report success across the fleet. Loud rejection up front
-        # beats a silent fleet-wide misconfiguration.
-        if [[ "$KHONLIANG_WEBHOOK_URL" != https://*${WEBHOOK_PATH} ]]; then
-            echo "error: KHONLIANG_WEBHOOK_URL=$KHONLIANG_WEBHOOK_URL must be HTTPS and end in '$WEBHOOK_PATH'" >&2
+        # Validate the override looks plausible: HTTPS scheme,
+        # NON-EMPTY host, path ending in /v1/webhooks/github. A
+        # typo like ``https:///v1/webhooks/github`` (missing host)
+        # or a missing path segment would otherwise be pushed
+        # verbatim to every repo — GitHub would happily accept the
+        # malformed URL, POST deliveries would 404, and the
+        # installer would still report success across the fleet.
+        # Loud rejection up front beats a silent fleet-wide
+        # misconfiguration.
+        if ! KHONLIANG_WEBHOOK_URL="$KHONLIANG_WEBHOOK_URL" \
+            EXPECTED_PATH="$WEBHOOK_PATH" \
+            python3 -c '
+import os, sys
+from urllib.parse import urlparse
+url = os.environ["KHONLIANG_WEBHOOK_URL"]
+expected_path = os.environ["EXPECTED_PATH"]
+parsed = urlparse(url)
+if parsed.scheme != "https" or not parsed.hostname or parsed.path != expected_path:
+    sys.exit(1)
+' 2>/dev/null; then
+            echo "error: KHONLIANG_WEBHOOK_URL=$KHONLIANG_WEBHOOK_URL must be HTTPS, have a host, and end in '$WEBHOOK_PATH'" >&2
             echo "  example: https://hooks.example.com$WEBHOOK_PATH" >&2
             exit 2
         fi
@@ -232,9 +244,15 @@ existing_hook_match() {
     # doesn't fool this check. gh errors are NOT swallowed.
     local repo="$1" url="$2" expected_events="$3" json
     if ! json=$(gh api --paginate "/repos/${repo}/hooks" 2>&1); then
-        echo "error: gh api /repos/${repo}/hooks failed:" >&2
-        printf '%s\n' "$json" | head -c 300 >&2
-        echo >&2
+        # Truncate via bash parameter expansion, NOT
+        # ``printf | head -c 300``: under ``set -o pipefail``
+        # ``head`` closes the pipe early once 300 bytes flow,
+        # ``printf`` gets SIGPIPE, the pipeline exits non-zero,
+        # and the whole shell aborts before ``return 1`` runs.
+        # ``${json:0:300}`` is pure shell — no pipe, no SIGPIPE
+        # hazard, no dependency on whether the caller wants
+        # ``set -e`` semantics.
+        echo "error: gh api /repos/${repo}/hooks failed: ${json:0:300}" >&2
         return 1
     fi
     TARGET="$url" EXPECTED_EVENTS="$expected_events" python3 -c '
@@ -338,9 +356,9 @@ check_one() {
     # confirmation. The audit succeeds.
     local json hid_re events lr_code lr_status
     if ! json=$(gh api --paginate "/repos/${repo}/hooks" 2>&1); then
-        echo "  $repo: error from gh api /repos/${repo}/hooks:" >&2
-        printf '%s\n' "$json" | head -c 300 >&2
-        echo >&2
+        # Pure-bash truncation; see SIGPIPE rationale at the
+        # earlier ``${json:0:300}`` site in existing_hook_match.
+        echo "  $repo: error from gh api /repos/${repo}/hooks: ${json:0:300}" >&2
         return 1
     fi
     # Print ``last_response.code`` as a human-readable health hint;
@@ -487,7 +505,9 @@ print(json.dumps({
         fi
         rm -f "$body"
         if [[ $patch_rc -ne 0 ]]; then
-            echo "ERR $repo: PATCH hook $hook_id (drift=$drift) failed: $(printf '%s' "$patch_result" | head -c 300)" >&2
+            # Pure-bash truncation (see existing_hook_match for the
+            # ``set -o pipefail`` SIGPIPE rationale).
+            echo "ERR $repo: PATCH hook $hook_id (drift=$drift) failed: ${patch_result:0:300}" >&2
             return 1
         fi
         echo "REPAIR $repo: hook $hook_id (drift=$drift) → reconfigured"
@@ -528,13 +548,15 @@ print(json.dumps({
     fi
     rm -f "$body"
     if [[ $result_rc -ne 0 ]]; then
-        echo "ERR $repo: $(printf '%s' "$result" | head -c 300)" >&2
+        # Pure-bash truncation (SIGPIPE-safe; see existing_hook_match).
+        echo "ERR $repo: ${result:0:300}" >&2
         return 1
     fi
     local hook_id
     hook_id=$(printf '%s' "$result" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("id",""))' 2>/dev/null || true)
     if [[ -z "$hook_id" ]]; then
-        echo "ERR $repo: no id in response: $(printf '%s' "$result" | head -c 300)" >&2
+        # Pure-bash truncation (SIGPIPE-safe; see existing_hook_match).
+        echo "ERR $repo: no id in response: ${result:0:300}" >&2
         return 1
     fi
     echo "OK $repo → hook $hook_id"
@@ -578,13 +600,29 @@ case "${1:-}" in
         # Capture the target list up front so an empty fleet — gh
         # auth scoped to the wrong account, the org rename in
         # progress, or genuinely zero matching repos — is treated as
-        # an actionable failure rather than silently exiting 0. An
-        # earlier shape ran the for-loop directly over the
-        # subshell, so ``rollout to 0 repos`` looked identical to
-        # ``rollout to 11 repos succeeded``.
-        mapfile -t all_targets < <(list_khonliang_repos)
+        # an actionable failure rather than silently exiting 0.
+        #
+        # Use command substitution (NOT ``mapfile -t < <(...)``):
+        # bash does NOT propagate process-substitution exit status
+        # to ``mapfile``, so a failed ``gh repo list`` would return
+        # an empty array AND mapfile's own success status, masking
+        # the API/auth error as "matched 0 repos". Command
+        # substitution captures stdout AND exits non-zero when the
+        # subshell fails, letting the explicit ``if !`` branch
+        # surface the underlying gh error.
+        local repo_list
+        if ! repo_list=$(list_khonliang_repos); then
+            echo "error: --all-khonliang: 'gh repo list' failed under '$DEFAULT_OWNER'" >&2
+            echo "  Check 'gh auth status' and network reachability to api.github.com." >&2
+            exit 1
+        fi
+        local all_targets=()
+        if [[ -n "$repo_list" ]]; then
+            mapfile -t all_targets <<<"$repo_list"
+        fi
         if [[ ${#all_targets[@]} -eq 0 ]]; then
             echo "error: --all-khonliang matched 0 repos under '$DEFAULT_OWNER'" >&2
+            echo "  'gh repo list' succeeded but returned no '^khonliang-' matches." >&2
             echo "  Check 'gh auth status' — the active account may not see" >&2
             echo "  the canonical fleet, or the prefix may have moved." >&2
             exit 1
@@ -630,12 +668,24 @@ case "${1:-}" in
         check_failed=()
         if [[ "${1:-}" == "--all-khonliang" ]]; then
             # Same empty-fleet-is-a-failure semantics as the install
-            # path: a clean audit on zero repos is indistinguishable
-            # from a clean audit on the real fleet, which silently
-            # masks gh-auth scope errors.
-            mapfile -t check_targets < <(list_khonliang_repos)
+            # path. Use command substitution so ``gh repo list``
+            # auth/network failures surface as explicit errors
+            # instead of being silently masked as "matched 0 repos"
+            # (mapfile from process substitution does not propagate
+            # subshell exit status — see install path for details).
+            local repo_list
+            if ! repo_list=$(list_khonliang_repos); then
+                echo "error: --check --all-khonliang: 'gh repo list' failed under '$DEFAULT_OWNER'" >&2
+                echo "  Check 'gh auth status' and network reachability to api.github.com." >&2
+                exit 2
+            fi
+            local check_targets=()
+            if [[ -n "$repo_list" ]]; then
+                mapfile -t check_targets <<<"$repo_list"
+            fi
             if [[ ${#check_targets[@]} -eq 0 ]]; then
                 echo "error: --check --all-khonliang matched 0 repos under '$DEFAULT_OWNER'" >&2
+                echo "  'gh repo list' succeeded but returned no '^khonliang-' matches." >&2
                 echo "  Check 'gh auth status' — the active account may not see" >&2
                 echo "  the canonical fleet, or the prefix may have moved." >&2
                 exit 2
