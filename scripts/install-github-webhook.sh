@@ -64,8 +64,11 @@ require_dep() {
     fi
 }
 
-require_dep gh python3
-[[ -n "${KHONLIANG_WEBHOOK_URL:-}" ]] || require_dep tailscale
+# NOTE: dep checks deliberately deferred until after the help-vs-real-
+# command dispatch below. Running them at module-load time aborts
+# ``--help`` on a fresh machine that doesn't have ``gh`` / ``python3``
+# / ``tailscale`` installed yet — defeating the point of help being
+# the first thing operators read.
 
 resolve_url() {
     if [[ -n "${KHONLIANG_WEBHOOK_URL:-}" ]]; then
@@ -232,26 +235,50 @@ else:
 }
 
 check_one() {
-    local repo url json
+    # Audit a single repo against the canonical config. Exits
+    # non-zero on missing, duplicate, or DRIFTED hooks — drift
+    # detection mirrors install_one's repair criteria so the audit
+    # contract matches the install contract (events, active flag,
+    # content_type, insecure_ssl, secret-presence). Earlier
+    # behaviour only flagged missing/duplicate, so a repo with the
+    # right URL but wrong events still passed audit even though
+    # ``install_one`` would have PATCHed it.
+    local repo url events_json match
     repo=$(normalize_repo "$1")
     url=$(resolve_url)
-    # --paginate handles multi-page hook lists. gh errors are surfaced
-    # explicitly (auth, missing scope, missing repo, …) so the audit
-    # path is actually trustworthy in automation/runbooks.
+    events_json=$(printf '"%s",' "${EVENTS[@]}"); events_json="[${events_json%,}]"
+    if ! match=$(existing_hook_match "$repo" "$url" "$events_json"); then
+        return 1  # gh api error; existing_hook_match already logged
+    fi
+    if [[ -z "$match" ]]; then
+        echo "  $repo: NO matching hook for $url"
+        return 2
+    fi
+    if [[ "$match" == duplicate:* ]]; then
+        local ids="${match#duplicate:}"
+        echo "  $repo: DUPLICATE hooks for $url (ids=$ids) — collapse manually"
+        return 2
+    fi
+    local hook_id="${match%%:*}"
+    local rest="${match#*:}"
+    local kind="${rest%%:*}"
+    if [[ "$kind" == "drift" ]]; then
+        local fields="${rest#*:}"
+        echo "  $repo: hook=$hook_id DRIFT fields=$fields (run install to repair)"
+        return 2
+    fi
+    # OK path — surface last_response / events for human-readable
+    # confirmation. The audit succeeds.
+    local json hid_re events lr_code lr_status
     if ! json=$(gh api --paginate "/repos/${repo}/hooks" 2>&1); then
         echo "  $repo: error from gh api /repos/${repo}/hooks:" >&2
         printf '%s\n' "$json" | head -c 300 >&2
         echo >&2
         return 1
     fi
-    # Exit non-zero on the cases that automation needs to act on
-    # (no hook configured, or duplicate hooks delivering twice).
-    # ``--check`` was previously always-success, which made fleet
-    # health audits useless: a repo silently missing the webhook
-    # still showed ``exit 0``.
-    TARGET="$url" REPO="$repo" python3 -c '
+    HOOK_ID="$hook_id" REPO="$repo" python3 -c '
 import json, os, sys
-target = os.environ["TARGET"]
+target_id = int(os.environ["HOOK_ID"])
 repo = os.environ["REPO"]
 text = sys.stdin.read()
 hooks: list = []
@@ -267,22 +294,16 @@ for line in text.splitlines():
         break
     if isinstance(chunk, list):
         hooks.extend(chunk)
-matches = [h for h in hooks if (h.get("config") or {}).get("url", "") == target]
-if not matches:
-    print(f"  {repo}: NO matching hook for {target}")
-    sys.exit(2)
-if len(matches) > 1:
-    ids = ",".join(str(h["id"]) for h in matches)
-    print(f"  {repo}: DUPLICATE hooks for {target} (ids={ids}) — collapse manually")
-    sys.exit(2)
-h = matches[0]
-lr = h.get("last_response") or {}
-hid = h.get("id")
-events = h.get("events")
-code = lr.get("code")
-status = lr.get("status")
-print(f"  {repo}: hook={hid}  events={events}  last_response={code} {status}")
+for h in hooks:
+    if h.get("id") == target_id:
+        lr = h.get("last_response") or {}
+        events = h.get("events")
+        code = lr.get("code")
+        status = lr.get("status")
+        print(f"  {repo}: hook={target_id}  events={events}  last_response={code} {status}")
+        break
 ' <<<"$json"
+    return 0
 }
 
 install_one() {
@@ -399,8 +420,16 @@ usage() {
 }
 
 case "${1:-}" in
-    "" | -h | --help) usage ;;
+    "" | -h | --help)
+        # Don't run dep checks here — operators on a fresh machine
+        # need ``--help`` to work even before they've installed
+        # ``gh`` / ``python3`` / ``tailscale``. Dep checks fire on
+        # the action paths below.
+        usage
+        ;;
     --all-khonliang)
+        require_dep gh python3
+        [[ -n "${KHONLIANG_WEBHOOK_URL:-}" ]] || require_dep tailscale
         # Track per-repo outcome. Continue past failures so a single
         # repo's auth/scope/network issue doesn't abort the rest of
         # the fleet, but exit non-zero at the end if anything failed
@@ -419,11 +448,26 @@ case "${1:-}" in
         fi
         ;;
     --check)
+        require_dep gh python3
+        [[ -n "${KHONLIANG_WEBHOOK_URL:-}" ]] || require_dep tailscale
         shift
+        # Refuse to run with no targets so a typo in automation
+        # (``--check`` with the repo name forgotten, or
+        # ``--check`` mistyped after a flag) doesn't silently
+        # report success on an empty audit set. Earlier behaviour
+        # was an always-success no-op.
+        if [[ $# -eq 0 ]]; then
+            echo "error: --check requires at least one repo argument or --all-khonliang" >&2
+            echo "  examples:" >&2
+            echo "    scripts/install-github-webhook.sh --check khonliang-bus" >&2
+            echo "    scripts/install-github-webhook.sh --check --all-khonliang" >&2
+            exit 2
+        fi
         # Track per-repo outcome so the audit path (single repo or
-        # whole fleet) returns non-zero when any repo is missing the
-        # hook or has duplicates. Earlier behaviour was always-zero
-        # and made fleet health audits useless in automation.
+        # whole fleet) returns non-zero when any repo is missing,
+        # has duplicate hooks, or has DRIFTED config (events /
+        # active / content_type / insecure_ssl / secret-presence
+        # diverging from the canonical set).
         check_failed=()
         if [[ "${1:-}" == "--all-khonliang" ]]; then
             for r in $(list_khonliang_repos); do
@@ -440,6 +484,8 @@ case "${1:-}" in
         fi
         ;;
     *)
+        require_dep gh python3
+        [[ -n "${KHONLIANG_WEBHOOK_URL:-}" ]] || require_dep tailscale
         for r in "$@"; do install_one "$r"; done
         ;;
 esac
