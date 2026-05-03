@@ -60,7 +60,11 @@ MCP_TIMEOUT_ARG: str = "_mcp_timeout"
 class BusMCPAdapter:
     """Translates between MCP (stdio, Claude-facing) and the bus (HTTP).
 
-    Timeout precedence (high → low) for skill and flow invocations:
+    Per-call timeout precedence (high → low). When set, ``mcp_timeout``
+    or the legacy in-args hint applies symmetrically: it caps the
+    adapter→bus transport AND is forwarded as ``FlowRequest.timeout``
+    on flow calls / the bus's per-request ``timeout`` field on skill
+    calls, so the bus-side cap matches the adapter-side cap.
 
     1. Top-level ``mcp_timeout`` kwarg on the auto-generated MCP tool
        (visible in the tool's JSON schema, so Claude can discover it
@@ -71,13 +75,25 @@ class BusMCPAdapter:
     2. Per-call ``_mcp_timeout`` hint inside the skill-or-flow JSON
        ``args`` string (legacy / undiscoverable but still honored).
        Stripped before forwarding to the skill handler.
-    3. Adapter default set at construction (``default_timeout_s``), normally
-       resolved from ``KHONLIANG_MCP_DEFAULT_TIMEOUT`` env var in ``main()``.
-    4. Library fallback (``DEFAULT_MCP_TIMEOUT_S`` = 60s).
 
-    A per-skill default from the ``Skill`` descriptor is a deliberate future
-    extension (would require a bus-lib + registry schema change) tracked
-    separately; today the per-call hint covers slow skills.
+    When NO per-call override is supplied, the adapter default
+    (``default_timeout_s``) and library fallback only cap the
+    adapter→bus transport, NOT the server-side execution:
+
+    3. Adapter default set at construction (``default_timeout_s``),
+       normally resolved from ``KHONLIANG_MCP_DEFAULT_TIMEOUT`` env
+       var in ``main()``. Skill calls pass it as the bus's per-request
+       ``timeout`` field too. **Flow calls do not** — without an
+       override, ``FlowRequest.timeout`` is omitted and the engine
+       falls back to its own built-in per-step cap, so the adapter
+       default acts purely as the transport-side ceiling on flows.
+    4. Library fallback (``DEFAULT_MCP_TIMEOUT_S`` = 60s) — same
+       caveat as (3) for flows.
+
+    A per-skill default from the ``Skill`` descriptor is a deliberate
+    future extension (would require a bus-lib + registry schema
+    change) tracked separately; today the per-call hint covers slow
+    skills.
     """
 
     def __init__(self, bus_url: str, default_timeout_s: float | None = None):
@@ -877,12 +893,16 @@ def main():
         type=float,
         default=None,
         help=(
-            "Adapter-level default timeout (seconds) for both skill and "
-            "flow invocations (also used as the +5s-buffered transport cap). "
+            "Adapter-level default timeout (seconds). For skill calls, "
+            "applies symmetrically to the adapter→bus transport AND the "
+            "bus's per-request timeout field. For flow calls, applies "
+            "only to the +5s-buffered transport cap; ``FlowRequest.timeout`` "
+            "is omitted unless the caller supplies a per-call override, in "
+            "which case the engine falls back to its built-in per-step cap. "
             "Overrides KHONLIANG_MCP_DEFAULT_TIMEOUT env var. A per-call "
-            "override still takes precedence: the top-level ``mcp_timeout`` "
-            "kwarg on a skill or flow tool, or the legacy ``_mcp_timeout`` "
-            "hint embedded in the ``args`` JSON string."
+            "override is symmetric on both surfaces: the top-level "
+            "``mcp_timeout`` kwarg on a skill or flow tool, or the legacy "
+            "``_mcp_timeout`` hint embedded in the ``args`` JSON string."
         ),
     )
     args = parser.parse_args()
