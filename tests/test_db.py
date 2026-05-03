@@ -236,3 +236,53 @@ def test_list_topics_limit_caps_rows(db):
         db.publish_message(f"topic.{i}", {}, "s")
     rows = db.list_topics(limit=2)
     assert len(rows) == 2
+
+
+def test_list_topics_prefix_is_case_sensitive(db):
+    """``GLOB`` is case-sensitive in SQLite (``LIKE`` is not, by
+    default — without ``PRAGMA case_sensitive_like=ON``). The
+    docstring promises case-sensitive prefix matching, so a lower-
+    case prefix must NOT match an upper-case topic."""
+    db.publish_message("Github.push", {}, "s")
+    db.publish_message("github.push", {}, "s")
+    rows = db.list_topics(prefix="github.")
+    assert {r["topic"] for r in rows} == {"github.push"}
+    rows = db.list_topics(prefix="Github.")
+    assert {r["topic"] for r in rows} == {"Github.push"}
+
+
+def test_list_topics_limit_clamped_against_negative_value(db):
+    """``LIMIT -1`` disables the limit in SQLite, so without clamping
+    a public endpoint could return the entire ``messages`` table.
+    The helper coerces negative values to the floor (1)."""
+    for i in range(5):
+        db.publish_message(f"topic.{i}", {}, "s")
+    rows = db.list_topics(limit=-1)
+    assert len(rows) == 1
+
+
+def test_list_topics_limit_clamped_against_huge_value(db, monkeypatch):
+    """A very large ``limit`` is clamped at ``LIST_TOPICS_LIMIT_CAP``
+    so the public endpoint can't be coerced into a heavy scan via a
+    large operator-supplied value. Verified by lowering the cap to a
+    small test value and seeding more topics than the cap, so the
+    clamp is the only thing that bounds the returned row count."""
+    # Lower the cap for the duration of this test rather than seed
+    # 1000+ rows in a unit test. The clamp logic is independent of
+    # the cap value, so testing at cap=3 proves the same invariant.
+    monkeypatch.setattr(BusDB, "LIST_TOPICS_LIMIT_CAP", 3)
+    for i in range(7):
+        db.publish_message(f"topic.{i}", {}, "s")
+    # Ask for many more rows than the cap; expect exactly 3 back.
+    rows = db.list_topics(limit=100_000)
+    assert len(rows) == 3
+
+
+def test_list_topics_limit_invalid_value_falls_back_to_default(db):
+    """A non-numeric limit falls back to the default (200) rather
+    than raising — defensive against bad operator input on the
+    public endpoint."""
+    for i in range(3):
+        db.publish_message(f"topic.{i}", {}, "s")
+    rows = db.list_topics(limit="not-a-number")  # type: ignore[arg-type]
+    assert len(rows) == 3  # data-bounded, not limit-bounded

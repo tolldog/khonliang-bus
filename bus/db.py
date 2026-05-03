@@ -388,6 +388,8 @@ class BusDB:
                 (subscriber_id, topic, message_id),
             )
 
+    LIST_TOPICS_LIMIT_CAP = 1000
+
     def list_topics(
         self, prefix: str = "", limit: int = 200,
     ) -> list[dict[str, Any]]:
@@ -401,9 +403,19 @@ class BusDB:
 
         Args:
             prefix: Optional namespace filter (e.g. ``"github."``).
-                Case-sensitive ``LIKE 'prefix%'``. Empty matches all.
+                Case-sensitive — implemented with SQLite ``GLOB`` to
+                avoid ``LIKE``'s default case-insensitive ASCII
+                matching (without ``PRAGMA case_sensitive_like=ON``,
+                which is global to the connection and would change
+                behaviour of every other ``LIKE`` query). Empty
+                matches all.
             limit: Cap on rows returned, ordered by ``last_fired_at``
                 DESC so the most recently active topics come first.
+                Clamped to ``[1, LIST_TOPICS_LIMIT_CAP]`` (1000) so the
+                public ``GET /v1/topics`` endpoint can't be coerced
+                into an unbounded scan via a very large or negative
+                value (``LIMIT -1`` disables the limit in SQLite —
+                explicitly defended against here).
 
         Each row is::
 
@@ -415,6 +427,11 @@ class BusDB:
                 "producers": list[str],         # distinct source values
             }
         """
+        try:
+            limit_int = int(limit)
+        except (TypeError, ValueError):
+            limit_int = 200
+        clamped_limit = max(1, min(limit_int, self.LIST_TOPICS_LIMIT_CAP))
         with self.conn() as c:
             sql = """
                 SELECT topic,
@@ -431,9 +448,12 @@ class BusDB:
             params: list[Any] = []
             where = ""
             if prefix:
-                where = "WHERE topic LIKE ? || '%'"
+                # GLOB is case-sensitive in SQLite (LIKE is not, by
+                # default). Prefix-only match needs just the ``*``
+                # wildcard.
+                where = "WHERE topic GLOB ? || '*'"
                 params.append(prefix)
-            params.append(limit)
+            params.append(clamped_limit)
             rows = c.execute(sql.format(where=where), params).fetchall()
             return [
                 {
