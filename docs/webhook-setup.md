@@ -266,8 +266,14 @@ KHONLIANG_WEBHOOK_URL=https://hooks.example.com/v1/webhooks/github \
   scripts/install-github-webhook.sh --all-khonliang
 ```
 
-The script never echoes the secret, never writes it to a persistent
-location, and uses a `mode 0600` tempfile for the POST body. Override
+The script does not echo the secret to the terminal, does not log it,
+and stages it only in a `mode 0600` tempfile that an `EXIT` trap
+unconditionally cleans up — under `set -e` aborts as well as the
+normal path. It DOES transmit the secret to GitHub as `config.secret`
+on every webhook create / patch (over TLS to the GitHub API) so
+GitHub can store it for HMAC-signing future deliveries; that is the
+intended credential-sharing operation, not a leak. Treat installation
+as a credential-distribution event, not a local-only one. Override
 either input via `KHONLIANG_WEBHOOK_URL` or `KHONLIANG_SECRET_FILE`.
 
 ### Option B: GitHub UI (one repo at a time)
@@ -337,20 +343,27 @@ GitHub recorded for the save (visible under
 # Settings → Webhooks → <hook> → Recent Deliveries → <click row>;
 # it's the GUID under the "Headers" tab as ``X-GitHub-Delivery``.
 SETUP_SUB="setup-smoke-$(date +%s)"
-EXPECTED_DELIVERY_ID="paste-the-guid-here"
+export EXPECTED_DELIVERY_ID="paste-the-guid-here"   # ``export`` so python3 -c sees it
 curl -s -X POST http://localhost:8788/v1/wait \
   -H 'Content-Type: application/json' \
   -d "{\"topics\":[\"github.ping\"],\"subscriber_id\":\"$SETUP_SUB\",\"timeout\":30}" \
   | python3 -c "
 import json, os, sys
-event = json.load(sys.stdin)
-got = (event.get('payload', {}).get('summary', {}) or {}).get('delivery_id', '')
+# /v1/wait returns ``{event: {topic, payload: {...}, ...}, subscriber_id, status}``;
+# the matched message lives under the top-level ``event`` key, NOT directly
+# at the response root. Reading ``response['payload']`` here would silently
+# return None and report a false negative even on a real delivery.
+response = json.load(sys.stdin)
+event = response.get('event') or {}
+summary = ((event.get('payload') or {}).get('summary') or {})
+got = summary.get('delivery_id', '')
 want = os.environ['EXPECTED_DELIVERY_ID']
 if got == want:
     print(f'OK: delivery_id={got} matches the save you just made')
 else:
     print(f'FALSE POSITIVE: got delivery_id={got!r}, expected {want!r}')
-    print('  → a stale ping from a different repo satisfied this wait.')
+    print('  → a stale ping from a different repo satisfied this wait,')
+    print('  → or the wait timed out before the delivery arrived.')
     print('  → re-run with cursor=now (see below) to skip the backlog.')
     sys.exit(1)
 "

@@ -104,6 +104,18 @@ require_dep() {
 
 resolve_url() {
     if [[ -n "${KHONLIANG_WEBHOOK_URL:-}" ]]; then
+        # Validate the override looks plausible: HTTPS scheme, host
+        # present, path ending in /v1/webhooks/github. A typo like a
+        # missing path segment would otherwise be pushed verbatim to
+        # every repo — GitHub would happily accept the malformed URL,
+        # POST deliveries would 404, and the installer would still
+        # report success across the fleet. Loud rejection up front
+        # beats a silent fleet-wide misconfiguration.
+        if [[ "$KHONLIANG_WEBHOOK_URL" != https://*${WEBHOOK_PATH} ]]; then
+            echo "error: KHONLIANG_WEBHOOK_URL=$KHONLIANG_WEBHOOK_URL must be HTTPS and end in '$WEBHOOK_PATH'" >&2
+            echo "  example: https://hooks.example.com$WEBHOOK_PATH" >&2
+            exit 2
+        fi
         echo "$KHONLIANG_WEBHOOK_URL"
         return
     fi
@@ -359,13 +371,24 @@ for h in hooks:
         status = lr.get("status")
         line_out = f"  {repo}: hook={target_id}  events={events}  last_response={code} {status}"
         # ``code is None`` means GitHub has not posted a delivery
-        # yet (status is "unused"). Counts as healthy. Anything
-        # else outside 2xx is a delivery failure that automation
-        # should treat as a failed audit.
+        # yet (status is "unused"). Counts as healthy.
+        #
+        # ``last_response`` carries only the MOST RECENT historical
+        # delivery — there is no time bound. A non-2xx code can be:
+        #  - a transient outage that has since recovered (false
+        #    positive: the hook is configured correctly today),
+        #  - a genuine ongoing delivery failure (real defect).
+        # Earlier code treated either case as ``sys.exit(2)``, which
+        # made automation fail audits forever after a single bad
+        # delivery until another delivery happened to land green.
+        # Print as a WARNING line; the audit return value is owned by
+        # config-shape drift detection, which is the actually-stable
+        # signal. Operators can grep for ``DELIVERY-FAILED-RECENT`` if
+        # they want to escalate on it manually.
         if isinstance(code, int) and not (200 <= code < 300):
-            print(line_out + "  DELIVERY-FAILED")
-            sys.exit(2)
-        print(line_out)
+            print(line_out + "  DELIVERY-FAILED-RECENT (warning)")
+        else:
+            print(line_out)
         break
 ' <<<"$json"; then
         return 2
