@@ -243,11 +243,24 @@ for line in text.splitlines():
 matches = [h for h in hooks if (h.get("config") or {}).get("url", "") == target]
 if not matches:
     sys.exit(0)
-if len(matches) > 1:
-    ids = ",".join(str(h["id"]) for h in matches)
+# A repo may carry an inactive historical hook plus the current
+# active one on the same URL — only the active hook delivers, so
+# this is NOT a duplicate-delivery situation. Prefer the single
+# active match and ignore inactive ones for the dedupe decision.
+# Two-or-more ACTIVE matches still report as duplicate (every
+# delivery would fire twice).
+active_matches = [h for h in matches if h.get("active", False)]
+if len(active_matches) > 1:
+    ids = ",".join(str(h["id"]) for h in active_matches)
     print(f"duplicate:{ids}")
     sys.exit(0)
-h = matches[0]
+if active_matches:
+    h = active_matches[0]
+else:
+    # No active match — pick the first inactive one so drift
+    # detection can still fire on the ``active`` field and the
+    # operator gets a single actionable target.
+    h = matches[0]
 cfg = h.get("config") or {}
 drift = []
 if not h.get("active", False):
@@ -519,6 +532,20 @@ case "${1:-}" in
     --all-khonliang)
         require_dep gh python3
         [[ -n "${KHONLIANG_WEBHOOK_URL:-}" ]] || require_dep tailscale
+        # Capture the target list up front so an empty fleet — gh
+        # auth scoped to the wrong account, the org rename in
+        # progress, or genuinely zero matching repos — is treated as
+        # an actionable failure rather than silently exiting 0. An
+        # earlier shape ran the for-loop directly over the
+        # subshell, so ``rollout to 0 repos`` looked identical to
+        # ``rollout to 11 repos succeeded``.
+        mapfile -t all_targets < <(list_khonliang_repos)
+        if [[ ${#all_targets[@]} -eq 0 ]]; then
+            echo "error: --all-khonliang matched 0 repos under '$DEFAULT_OWNER'" >&2
+            echo "  Check 'gh auth status' — the active account may not see" >&2
+            echo "  the canonical fleet, or the prefix may have moved." >&2
+            exit 1
+        fi
         # Track per-repo outcome. Continue past failures so a single
         # repo's auth/scope/network issue doesn't abort the rest of
         # the fleet, but exit non-zero at the end if anything failed
@@ -526,7 +553,7 @@ case "${1:-}" in
         # automation. Earlier ``|| true`` swallowed every error and
         # made the command always look successful.
         all_failed=()
-        for r in $(list_khonliang_repos); do
+        for r in "${all_targets[@]}"; do
             if ! install_one "$r"; then
                 all_failed+=("$r")
             fi
@@ -559,7 +586,18 @@ case "${1:-}" in
         # diverging from the canonical set).
         check_failed=()
         if [[ "${1:-}" == "--all-khonliang" ]]; then
-            for r in $(list_khonliang_repos); do
+            # Same empty-fleet-is-a-failure semantics as the install
+            # path: a clean audit on zero repos is indistinguishable
+            # from a clean audit on the real fleet, which silently
+            # masks gh-auth scope errors.
+            mapfile -t check_targets < <(list_khonliang_repos)
+            if [[ ${#check_targets[@]} -eq 0 ]]; then
+                echo "error: --check --all-khonliang matched 0 repos under '$DEFAULT_OWNER'" >&2
+                echo "  Check 'gh auth status' — the active account may not see" >&2
+                echo "  the canonical fleet, or the prefix may have moved." >&2
+                exit 2
+            fi
+            for r in "${check_targets[@]}"; do
                 check_one "$r" || check_failed+=("$r")
             done
         else

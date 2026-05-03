@@ -332,12 +332,28 @@ GitHub recorded for the save (visible under
 
 ```sh
 # Use a fresh subscriber_id so the ack-pointer is at zero AND
-# verify the returned delivery_id matches THIS save's id.
+# verify the returned delivery_id matches THIS save's id. Look up
+# the *expected* delivery_id under
+# Settings → Webhooks → <hook> → Recent Deliveries → <click row>;
+# it's the GUID under the "Headers" tab as ``X-GitHub-Delivery``.
 SETUP_SUB="setup-smoke-$(date +%s)"
+EXPECTED_DELIVERY_ID="paste-the-guid-here"
 curl -s -X POST http://localhost:8788/v1/wait \
   -H 'Content-Type: application/json' \
   -d "{\"topics\":[\"github.ping\"],\"subscriber_id\":\"$SETUP_SUB\",\"timeout\":30}" \
-  | python -m json.tool
+  | python3 -c "
+import json, os, sys
+event = json.load(sys.stdin)
+got = (event.get('payload', {}).get('summary', {}) or {}).get('delivery_id', '')
+want = os.environ['EXPECTED_DELIVERY_ID']
+if got == want:
+    print(f'OK: delivery_id={got} matches the save you just made')
+else:
+    print(f'FALSE POSITIVE: got delivery_id={got!r}, expected {want!r}')
+    print('  → a stale ping from a different repo satisfied this wait.')
+    print('  → re-run with cursor=now (see below) to skip the backlog.')
+    sys.exit(1)
+"
 ```
 
 After the bus running this branch picks up `fr_bus_3db58f0b` (PR #29
@@ -387,3 +403,16 @@ sudo systemctl restart khonliang-bus.service
 There is no overlap window: as soon as the bus restarts with the new
 secret, GitHub posts signed with the old secret will fail HMAC
 verification and return 401 until you update each repo.
+
+> **Drift detection limitation:** the script's `--check` and
+> install-time drift detection cannot tell that a hook is signing
+> with a stale secret. GitHub's hooks API redacts `config.secret`
+> in responses, exposing only a "secret is set" presence bit, so
+> drift detection covers events / active / content_type /
+> insecure_ssl / secret-presence — never the secret value itself.
+> After an env-file rotation, every repo's hook still passes
+> drift checks even though every signed delivery is failing 401.
+> Re-running the install script does NOT force-PATCH a hook whose
+> config-shape matches; the only reliable rotation path is the
+> manual UI edit (or deleting+reinstalling the hook). Treat the
+> per-repo UI step in the box above as required, not optional.
