@@ -155,9 +155,10 @@ curl -s -o /tmp/sig-smoke.body -w 'HTTP %{http_code}\n' -X POST \
 # Expected: ``HTTP 200``. A 401 here means the bus's loaded secret
 # disagrees with the env file (rotation drift, quote handling, or
 # trailing-newline in the file). A 503 means the bus has no secret
-# loaded yet — re-read step 2c. Cat /tmp/sig-smoke.body for the
-# response body if the status-code line shows anything other than
-# 200.
+# loaded yet — re-read step 2b (install the env file + drop-in and
+# restart the bus); step 2c only verifies state, it can't generate
+# or load the secret. Cat /tmp/sig-smoke.body for the response body
+# if the status-code line shows anything other than 200.
 cat /tmp/sig-smoke.body
 ```
 
