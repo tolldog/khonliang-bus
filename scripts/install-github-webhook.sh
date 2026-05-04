@@ -40,10 +40,13 @@
 # with multi-page hook lists) and compares the full canonical config
 # (events, active flag, content_type, insecure_ssl, secret-presence).
 # An exact-config match skips; a drifted match is repaired via PATCH;
-# the no-match case creates a fresh hook. Multi-hook repos (two hooks
-# pointing at the same URL — would deliver every event twice) are
+# the no-match case creates a fresh hook. Two-or-more ACTIVE hooks
+# pointing at the same URL (would deliver every event twice) are
 # detected and reported as an error so an operator can collapse them
-# manually.
+# manually. An inactive historical hook plus an active canonical
+# hook on the same URL is NOT flagged as duplicate — only the active
+# hook delivers, so there is no double-fire — and the active match
+# proceeds through the normal install / drift-repair path.
 #
 # Exit status: ``--all-khonliang`` returns non-zero when any per-repo
 # step fails (so automation can detect partial-fleet failures);
@@ -200,7 +203,7 @@ resolve_secret() {
     fi
     if [[ -z "$val" ]]; then
         echo "error: GITHUB_WEBHOOK_SECRET is empty in $DEFAULT_SECRET_FILE" >&2
-        echo "  Generate one with 'python -c \"import secrets; print(secrets.token_urlsafe(48))\"'" >&2
+        echo "  Generate one with 'python3 -c \"import secrets; print(secrets.token_urlsafe(48))\"'" >&2
         echo "  and write it back to the env file." >&2
         exit 2
     fi

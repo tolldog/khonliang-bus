@@ -24,9 +24,9 @@ it returns `503` (preventing a forged-event footgun in production).
 > **Port assumption.** All shell snippets below use port **`8788`**,
 > which is what the canonical systemd unit
 > (`/etc/systemd/system/khonliang-bus.service`) passes to
-> `ExecStart=python -m bus --port 8788`. The bare module
+> `ExecStart=<venv>/bin/python -m bus --port 8788`. The bare module
 > (`bus/__main__.py`) defaults to port `8787`, so a fresh-checkout
-> `python -m bus` without the `--port` flag listens on a different
+> `python3 -m bus` without the `--port` flag listens on a different
 > socket. Either align your systemd unit to use `--port 8788`
 > (recommended; matches every example here), or substitute your
 > chosen port into each `localhost:8788` reference below.
@@ -37,7 +37,7 @@ The secret is a shared string between your bus and GitHub. Generate it
 once with whichever you prefer:
 
 ```sh
-python -c 'import secrets; print(secrets.token_urlsafe(48))'
+python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 # or
 openssl rand -base64 48
 ```
@@ -393,35 +393,45 @@ else:
     print(f'FALSE POSITIVE: got delivery_id={got!r}, expected {want!r}')
     print('  → a stale ping from a different repo satisfied this wait,')
     print('  → or the wait timed out before the delivery arrived.')
-    print('  → if the bus is running the cursor=now build (PR #29),')
-    print('    re-run with cursor=now (see below) to skip the backlog;')
-    print('    on older bus builds cursor is silently ignored — you')
-    print('    must restart the bus to pick the feature up first.')
+    print('  → wait timeout, or backlog replay tricked the wait. The')
+    print('    delivery_id check above is the canonical signal; do')
+    print('    NOT trust cursor=now on a bus you have not verified.')
     sys.exit(1)
 "
 ```
 
-> **Cursor support requires `fr_bus_3db58f0b` (merged via PR #29).**
-> Older bus builds silently drop unknown JSON fields (FastAPI
-> default), so passing ``cursor=now`` on a stale bus is a no-op
-> and the wait still replays from the subscriber's first unacked
-> message. Check whether the running bus has the feature with
-> ``curl http://localhost:8788/v1/health`` — version ≥ 0.3.0
-> ships cursor support; older builds need a
-> ``sudo systemctl restart khonliang-bus.service`` after a fresh
-> deploy.
+A successful ping (delivery_id matches) proves: GitHub reached the
+endpoint, the signature verified, and the bus published the event.
+From here, any subscriber can react with
+`bus_wait_for_event(topics="github.<event>.<action>")`.
+
+> **Optional optimization: `cursor=now` to skip backlog replay.**
+> The bus added a `cursor` field on `/v1/wait` via
+> `fr_bus_3db58f0b` (merged in PR #29). When honored,
+> `"cursor":"now"` pins a fresh subscriber to the current
+> high-water mark instead of replaying every unacked event from
+> message 1, eliminating the false-positive class above.
+>
+> **However:** the field is a silent no-op on bus builds that
+> predate the merge — FastAPI drops unknown JSON fields without
+> error, so the wait still replays backlog. The version string at
+> `GET /v1/health` is NOT a reliable signal for whether cursor is
+> honored (the bus version may not have been bumped at merge
+> time). The reliable probe: do an unsigned-POST smoke (which
+> returns 401 deterministically and publishes nothing on the bus)
+> against a `cursor=now` wait — if the wait returns within
+> milliseconds with a backlog event, cursor was ignored; if it
+> hits the timeout, cursor is honored. Restart the bus
+> (`sudo systemctl restart khonliang-bus.service`) after deploying
+> a build that contains PR #29 to pick the feature up.
 
 ```sh
-# Once the bus is on the cursor=now build:
+# Sample form (only trust the result on a verified-cursor bus):
 curl -s -X POST http://localhost:8788/v1/wait \
   -H 'Content-Type: application/json' \
   -d '{"topics":["github.ping"],"subscriber_id":"setup-smoke","timeout":30,"cursor":"now"}' \
   | python3 -m json.tool
 ```
-
-A successful ping proves: GitHub reached the endpoint, the signature
-verified, and the bus published the event. From here, any subscriber
-can react with `bus_wait_for_event(topics="github.<event>.<action>")`.
 
 ## Topic shapes the receiver emits
 
