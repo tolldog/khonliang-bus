@@ -393,22 +393,30 @@ else:
     print(f'FALSE POSITIVE: got delivery_id={got!r}, expected {want!r}')
     print('  → a stale ping from a different repo satisfied this wait,')
     print('  → or the wait timed out before the delivery arrived.')
-    print('  → re-run with cursor=now (see below) to skip the backlog.')
+    print('  → if the bus is running the cursor=now build (PR #29),')
+    print('    re-run with cursor=now (see below) to skip the backlog;')
+    print('    on older bus builds cursor is silently ignored — you')
+    print('    must restart the bus to pick the feature up first.')
     sys.exit(1)
 "
 ```
 
-After the bus running this branch picks up `fr_bus_3db58f0b` (PR #29
-in the bus repo), an even cleaner form is available — pass
-``"cursor": "now"`` in the body and the wait pins to the current
-high-water mark instead of replaying backlog at all:
+> **Cursor support requires `fr_bus_3db58f0b` (merged via PR #29).**
+> Older bus builds silently drop unknown JSON fields (FastAPI
+> default), so passing ``cursor=now`` on a stale bus is a no-op
+> and the wait still replays from the subscriber's first unacked
+> message. Check whether the running bus has the feature with
+> ``curl http://localhost:8788/v1/health`` — version ≥ 0.3.0
+> ships cursor support; older builds need a
+> ``sudo systemctl restart khonliang-bus.service`` after a fresh
+> deploy.
 
 ```sh
 # Once the bus is on the cursor=now build:
 curl -s -X POST http://localhost:8788/v1/wait \
   -H 'Content-Type: application/json' \
   -d '{"topics":["github.ping"],"subscriber_id":"setup-smoke","timeout":30,"cursor":"now"}' \
-  | python -m json.tool
+  | python3 -m json.tool
 ```
 
 A successful ping proves: GitHub reached the endpoint, the signature

@@ -572,9 +572,19 @@ list_khonliang_repos() {
     # or ``khonliang2`` doesn't sneak into the install set —
     # automation should target the canonical ``khonliang-*``
     # naming explicitly.
-    gh repo list "$DEFAULT_OWNER" --limit 1000 --json name -q '.[].name' \
-        | grep -E '^khonliang-' \
-        | sort
+    #
+    # Filter via ``awk`` not ``grep -E``: under ``set -o pipefail``
+    # ``grep`` returns exit 1 when it finds zero matches, which
+    # propagates as a pipeline failure indistinguishable from a
+    # ``gh repo list`` outage. Callers can't then tell "fleet is
+    # genuinely empty" from "gh API broke." ``awk`` exits 0
+    # regardless of how many lines matched, so caller exit-status
+    # check (the ``if !`` branch) only fires for real failures.
+    local names
+    if ! names=$(gh repo list "$DEFAULT_OWNER" --limit 1000 --json name -q '.[].name'); then
+        return 1
+    fi
+    awk '/^khonliang-/' <<<"$names" | sort
 }
 
 usage() {
@@ -610,13 +620,19 @@ case "${1:-}" in
         # substitution captures stdout AND exits non-zero when the
         # subshell fails, letting the explicit ``if !`` branch
         # surface the underlying gh error.
-        local repo_list
+        #
+        # ``local`` must NOT appear here — this code runs in the
+        # top-level ``case`` body, NOT inside a function, and bash
+        # rejects ``local`` outside a function with
+        # ``local: can only be used in a function``. Plain
+        # assignment is the right form at script scope.
+        repo_list=
         if ! repo_list=$(list_khonliang_repos); then
             echo "error: --all-khonliang: 'gh repo list' failed under '$DEFAULT_OWNER'" >&2
             echo "  Check 'gh auth status' and network reachability to api.github.com." >&2
             exit 1
         fi
-        local all_targets=()
+        all_targets=()
         if [[ -n "$repo_list" ]]; then
             mapfile -t all_targets <<<"$repo_list"
         fi
@@ -673,13 +689,15 @@ case "${1:-}" in
             # instead of being silently masked as "matched 0 repos"
             # (mapfile from process substitution does not propagate
             # subshell exit status — see install path for details).
-            local repo_list
+            # ``local`` is invalid at top-level case scope; plain
+            # assignment.
+            repo_list=
             if ! repo_list=$(list_khonliang_repos); then
                 echo "error: --check --all-khonliang: 'gh repo list' failed under '$DEFAULT_OWNER'" >&2
                 echo "  Check 'gh auth status' and network reachability to api.github.com." >&2
                 exit 2
             fi
-            local check_targets=()
+            check_targets=()
             if [[ -n "$repo_list" ]]; then
                 mapfile -t check_targets <<<"$repo_list"
             fi
