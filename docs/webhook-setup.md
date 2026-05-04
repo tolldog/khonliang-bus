@@ -406,28 +406,34 @@ endpoint, the signature verified, and the bus published the event.
 From here, any subscriber can react with
 `bus_wait_for_event(topics="github.<event>.<action>")`.
 
-> **Optional optimization: `cursor=now` to skip backlog replay.**
-> The bus added a `cursor` field on `/v1/wait` via
-> `fr_bus_3db58f0b` (merged in PR #29). When honored,
+> **Aspirational future optimization: `cursor=now` to skip backlog replay.**
+> A `cursor` field on `/v1/wait` (`fr_bus_3db58f0b`) is the
+> intended fix for the false-positive class above: when honored,
 > `"cursor":"now"` pins a fresh subscriber to the current
 > high-water mark instead of replaying every unacked event from
-> message 1, eliminating the false-positive class above.
+> message 1.
 >
-> **However:** the field is a silent no-op on bus builds that
-> predate the merge — FastAPI drops unknown JSON fields without
-> error, so the wait still replays backlog. The version string at
-> `GET /v1/health` is NOT a reliable signal for whether cursor is
-> honored (the bus version may not have been bumped at merge
-> time). The reliable probe: do an unsigned-POST smoke (which
-> returns 401 deterministically and publishes nothing on the bus)
-> against a `cursor=now` wait — if the wait returns within
-> milliseconds with a backlog event, cursor was ignored; if it
-> hits the timeout, cursor is honored. Restart the bus
-> (`sudo systemctl restart khonliang-bus.service`) after deploying
-> a build that contains PR #29 to pick the feature up.
+> **Today's status (as of this PR):** the `WaitRequest` schema in
+> `bus/server.py` does NOT yet declare a `cursor` field, so even
+> after this PR merges the live bus does not honor `cursor`.
+> FastAPI silently drops unknown JSON fields, so an operator who
+> tries `cursor=now` on the current bus will see backlog replay
+> indistinguishable from feature-honored output. The
+> `delivery_id` assertion in the smoke command above is the
+> canonical correctness signal — do NOT trust `cursor=now`
+> without first verifying the field is honored.
+>
+> **Probe** (works regardless of version-string state): publish
+> nothing on the bus, then issue a `cursor=now` wait with
+> `timeout=2`. If the wait returns within milliseconds with a
+> backlog event, cursor is ignored. If it hits the 2-second
+> timeout with no event, cursor is honored.
+>
+> Once `WaitRequest` declares `cursor` and the bus is restarted
+> to pick up the change, the form below becomes safe to rely on:
 
 ```sh
-# Sample form (only trust the result on a verified-cursor bus):
+# Use only after probing that cursor is honored on the live bus.
 curl -s -X POST http://localhost:8788/v1/wait \
   -H 'Content-Type: application/json' \
   -d '{"topics":["github.ping"],"subscriber_id":"setup-smoke","timeout":30,"cursor":"now"}' \

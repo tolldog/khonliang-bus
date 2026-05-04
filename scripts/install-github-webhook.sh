@@ -244,9 +244,16 @@ existing_hook_match() {
     # that lost its secret server-side.
     #
     # ``gh api --paginate`` walks all pages so a repo with many hooks
-    # doesn't fool this check. gh errors are NOT swallowed.
+    # doesn't fool this check. The ``--jq '.[]'`` flattens each
+    # page's array to one hook object per line, sidestepping a
+    # parser bug the older code had: ``--paginate`` without
+    # ``--jq`` concatenates pages as ``[h1,h2][h3,h4]`` (multiple
+    # arrays in one buffer), which ``json.loads(text)`` rejects as
+    # invalid JSON, so any repo with >30 hooks (the GH default page
+    # size) aborted instead of being scanned. gh errors are NOT
+    # swallowed.
     local repo="$1" url="$2" expected_events="$3" json
-    if ! json=$(gh api --paginate "/repos/${repo}/hooks" 2>&1); then
+    if ! json=$(gh api --paginate "/repos/${repo}/hooks" --jq '.[]' 2>&1); then
         # Truncate via bash parameter expansion, NOT
         # ``printf | head -c 300``: under ``set -o pipefail``
         # ``head`` closes the pipe early once 300 bytes flow,
@@ -262,20 +269,13 @@ existing_hook_match() {
 import json, os, sys
 target = os.environ["TARGET"]
 expected_events = set(json.loads(os.environ["EXPECTED_EVENTS"]))
-text = sys.stdin.read()
+# Each line is one hook object (gh ``--jq .[]`` flattens pages).
 hooks: list = []
-for line in text.splitlines():
+for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
-    try:
-        chunk = json.loads(line)
-    except json.JSONDecodeError:
-        chunk = json.loads(text)
-        hooks = chunk if isinstance(chunk, list) else []
-        break
-    if isinstance(chunk, list):
-        hooks.extend(chunk)
+    hooks.append(json.loads(line))
 matches = [h for h in hooks if (h.get("config") or {}).get("url", "") == target]
 if not matches:
     sys.exit(0)
@@ -358,7 +358,11 @@ check_one() {
     # OK path — surface last_response / events for human-readable
     # confirmation. The audit succeeds.
     local json hid_re events lr_code lr_status
-    if ! json=$(gh api --paginate "/repos/${repo}/hooks" 2>&1); then
+    # ``--jq '.[]'`` flattens each page's array to one hook object
+    # per line so the parser below can iterate without tripping on
+    # the multi-page concatenation problem (see existing_hook_match
+    # for the rationale).
+    if ! json=$(gh api --paginate "/repos/${repo}/hooks" --jq '.[]' 2>&1); then
         # Pure-bash truncation; see SIGPIPE rationale at the
         # earlier ``${json:0:300}`` site in existing_hook_match.
         echo "  $repo: error from gh api /repos/${repo}/hooks: ${json:0:300}" >&2
@@ -377,20 +381,13 @@ check_one() {
 import json, os, sys
 target_id = int(os.environ["HOOK_ID"])
 repo = os.environ["REPO"]
-text = sys.stdin.read()
+# Each line is one hook object (gh ``--jq .[]`` flattens pages).
 hooks: list = []
-for line in text.splitlines():
+for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
-    try:
-        chunk = json.loads(line)
-    except json.JSONDecodeError:
-        chunk = json.loads(text)
-        hooks = chunk if isinstance(chunk, list) else []
-        break
-    if isinstance(chunk, list):
-        hooks.extend(chunk)
+    hooks.append(json.loads(line))
 for h in hooks:
     if h.get("id") == target_id:
         lr = h.get("last_response") or {}
