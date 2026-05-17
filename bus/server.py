@@ -273,7 +273,10 @@ class BusServer:
         kept = 0
         for reg in self.db.get_registrations():
             pid = reg.get("pid")
-            if pid and _pid_alive(int(pid)):
+            # Guard pid > 0 before _pid_alive: os.kill(0, ...) signals the
+            # whole process group, os.kill(-N, ...) signals a process group
+            # by id — neither is the per-agent semantics this skill needs.
+            if pid and int(pid) > 0 and _pid_alive(int(pid)):
                 kept += 1
                 continue
             self.db.deregister_agent(reg["id"])

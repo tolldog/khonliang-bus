@@ -73,6 +73,22 @@ def test_reconcile_treats_zero_pid_as_dead(tmp_path):
     assert db.get_registration("no-pid") is None
 
 
+def test_reconcile_treats_negative_pid_as_dead(tmp_path):
+    """``/v1/register`` accepts any integer PID; a negative value is truthy in
+    Python but ``os.kill(-1, ...)`` signals every process the caller can
+    reach and ``os.kill(-N, ...)`` targets a whole process group. Either
+    would let an invalid persisted PID survive boot reconciliation."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _register(db, "neg-pid", pid=-1)
+    _register(db, "neg-group", pid=-99999)
+
+    result = _bus(db).reconcile_on_boot()
+
+    assert result == {"pids_reaped": 2, "kept": 0}
+    assert db.get_registration("neg-pid") is None
+    assert db.get_registration("neg-group") is None
+
+
 def test_start_agent_no_longer_already_running_after_reconcile(tmp_path):
     """Load-bearing regression: a stale ``healthy`` registration with a dead PID
     used to short-circuit ``start_agent`` to ``already_running``; reconciliation
