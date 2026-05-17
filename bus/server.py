@@ -260,6 +260,28 @@ class BusServer:
             await asyncio.gather(*self._async_request_tasks, return_exceptions=True)
         await self._http.aclose()
 
+    def reconcile_on_boot(self) -> dict:
+        """Drop registrations whose tracked PID is no longer alive.
+
+        Bus restarts faster than agent processes do. Across a host reboot,
+        agent processes die but persisted registrations stay marked
+        ``healthy`` with stale PIDs — so :meth:`start_agent` returns
+        ``already_running`` against PIDs that no longer exist and operators
+        must :meth:`restart_agent` to break the no-op cycle (fr_khonliang-bus_5c58c4e9).
+        """
+        pids_reaped = 0
+        kept = 0
+        for reg in self.db.get_registrations():
+            pid = reg.get("pid")
+            if pid and _pid_alive(int(pid)):
+                kept += 1
+                continue
+            self.db.deregister_agent(reg["id"])
+            pids_reaped += 1
+            logger.info("Reconciled agent %s on boot (pid=%s not alive)", reg["id"], pid)
+        logger.info("Boot reconciliation: pids_reaped=%d kept=%d", pids_reaped, kept)
+        return {"pids_reaped": pids_reaped, "kept": kept}
+
     # -- agent lifecycle --
 
     def install_agent(self, req: InstallRequest) -> dict:
@@ -1426,6 +1448,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @asynccontextmanager
     async def lifespan(app):
+        bus.reconcile_on_boot()
         yield
         await bus.shutdown()
 
