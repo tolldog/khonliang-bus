@@ -175,7 +175,7 @@ def test_artifact_distill_cache_false_forces_new_artifact(db):
 
 
 def test_artifact_distill_sets_ttl_when_cache_ttl_seconds_given(db):
-    """cache_ttl_seconds populates ttl on the new artifact in ISO-8601 UTC format."""
+    """cache_ttl_seconds populates ttl on the new artifact in ISO-8601 UTC format with microsecond precision."""
     import re
 
     store = ArtifactStore(db)
@@ -184,7 +184,8 @@ def test_artifact_distill_sets_ttl_when_cache_ttl_seconds_given(db):
     result = store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=3600)
     ttl = result["distilled_artifact"]["ttl"]
     assert ttl is not None
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", ttl)
+    # Microsecond precision so sub-second TTLs cannot round down and shorten the requested duration.
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", ttl)
 
 
 def test_artifact_distill_expired_cache_entry_is_bypassed(db):
@@ -197,7 +198,7 @@ def test_artifact_distill_expired_cache_entry_is_bypassed(db):
     with db.conn() as c:
         c.execute(
             "UPDATE artifacts SET ttl = ? WHERE id = ?",
-            ("2000-01-01T00:00:00Z", first["distilled_artifact"]["id"]),
+            ("2000-01-01T00:00:00.000000Z", first["distilled_artifact"]["id"]),
         )
     second = store.distill(source["id"], purpose="p", max_chars=200)
 
@@ -226,6 +227,54 @@ def test_artifact_distill_cache_ignores_multi_source_distillations(db):
     assert single["distilled_artifact"]["source_artifacts"] == [a["id"]]
 
 
+def test_artifact_distill_cache_ignores_non_bus_producer(db):
+    """A `kind='distillation'` row planted via generic `create()` must not poison the cache."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="real source content")
+
+    # Plant a spoofed distillation row directly via create() — default producer is "".
+    spoofed = store.create(
+        kind="distillation",
+        title="Distillation of log",
+        content="ATTACKER-CONTROLLED DIGEST",
+        metadata={
+            "mode": "brief",
+            "purpose": "p",
+            "source_kind": "log",
+            "max_chars": 200,
+            "distiller_version": "v1",
+        },
+        source_artifacts=[source["id"]],
+    )
+
+    result = store.distill(source["id"], purpose="p", max_chars=200)
+
+    # The spoofed row must be skipped and a real distillation produced instead.
+    assert result["distilled_artifact"]["id"] != spoofed["id"]
+    assert "ATTACKER-CONTROLLED DIGEST" not in result["digest"]
+
+
+def test_artifact_distill_cache_ignores_older_distiller_version(db):
+    """A cache entry produced by an older distiller version must not be reused."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    first = store.distill(source["id"], purpose="p", max_chars=200)
+    # Simulate an algorithm change by retroactively marking the cached entry as v0.
+    with db.conn() as c:
+        c.execute(
+            """
+            UPDATE artifacts
+            SET metadata = json_set(metadata, '$.distiller_version', 'v0')
+            WHERE id = ?
+            """,
+            (first["distilled_artifact"]["id"],),
+        )
+    second = store.distill(source["id"], purpose="p", max_chars=200)
+
+    assert second["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
+
+
 def test_artifact_content_size_limit(db):
     """create() must reject content exceeding MAX_ARTIFACT_BYTES."""
     from bus.artifacts import MAX_ARTIFACT_BYTES
@@ -240,6 +289,22 @@ def test_missing_artifact_raises_key_error(db):
     store = ArtifactStore(db)
     with pytest.raises(KeyError):
         store.head("missing")
+
+
+def test_artifact_distill_http_returns_422_for_invalid_cache_ttl(client):
+    """The HTTP route must map distill()'s ValueError to 422, not a 500."""
+    created = client.post(
+        "/v1/artifacts",
+        json={"kind": "log", "title": "t", "content": "x", "producer": "tester"},
+    )
+    artifact_id = created.json()["id"]
+
+    bad = client.post(
+        f"/v1/artifacts/{artifact_id}/distill",
+        json={"purpose": "p", "max_chars": 200, "cache_ttl_seconds": 0},
+    )
+    assert bad.status_code == 422
+    assert "positive integer" in bad.json()["detail"]
 
 
 def test_artifact_http_routes_are_bounded(client):

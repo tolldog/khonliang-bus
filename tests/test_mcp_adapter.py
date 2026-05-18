@@ -119,6 +119,19 @@ def test_build_registers_flow_tools(adapter):
     assert "evaluate_spec" in tool_names
 
 
+def test_bus_artifact_distill_tool_exposes_cache_args(adapter):
+    """MCP callers must be able to set cache + cache_ttl_seconds on bus_artifact_distill."""
+    mcp = adapter.build()
+    tools = asyncio.run(mcp.list_tools())
+    distill_tools = [t for t in tools if t.name == "bus_artifact_distill"]
+    assert distill_tools, "expected bus_artifact_distill to be registered"
+    props = distill_tools[0].inputSchema.get("properties", {})
+    for arg in ("cache", "cache_ttl_seconds"):
+        assert arg in props, (
+            f"{arg} missing from bus_artifact_distill schema: {sorted(props)}"
+        )
+
+
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())

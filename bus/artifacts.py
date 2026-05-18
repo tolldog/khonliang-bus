@@ -17,7 +17,9 @@ from typing import Any
 from bus.db import BusDB, _row_to_dict
 
 
-_TTL_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_TTL_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+_DISTILLER_VERSION = "v1"
+_DISTILLATION_PRODUCER = "bus"
 
 
 def _now_iso() -> str:
@@ -28,8 +30,10 @@ def _ttl_iso_from_seconds(seconds: int | None) -> str | None:
     """Return an ISO-8601 UTC timestamp ``seconds`` from now, or None.
 
     Used by ``ArtifactStore.distill`` to set the expiry on cache entries.
-    Lexicographic comparison of this format matches chronological order, so
-    SQLite TEXT comparison is a valid expiry filter without parsing.
+    Microsecond precision is preserved so sub-second TTLs do not round
+    down and shorten the requested duration. Lexicographic comparison of
+    this fixed-width format matches chronological order, so SQLite TEXT
+    comparison is a valid expiry filter without parsing.
     """
     if seconds is None:
         return None
@@ -296,7 +300,7 @@ class ArtifactStore:
             kind="distillation",
             title=f"Distillation of {source['title']}",
             content=digest,
-            producer="bus",
+            producer=_DISTILLATION_PRODUCER,
             session_id=source.get("session_id", ""),
             trace_id=source.get("trace_id", ""),
             content_type="text/plain",
@@ -305,6 +309,7 @@ class ArtifactStore:
                 "purpose": purpose,
                 "source_kind": source.get("kind", ""),
                 "max_chars": max_chars,
+                "distiller_version": _DISTILLER_VERSION,
             },
             source_artifacts=[artifact_id],
             ttl=_ttl_iso_from_seconds(cache_ttl_seconds),
@@ -319,7 +324,12 @@ class ArtifactStore:
         purpose: str,
         max_chars: int,
     ) -> dict[str, Any] | None:
-        """Return the newest non-expired distillation matching the cache key, or None."""
+        """Return the newest non-expired distillation matching the cache key, or None.
+
+        Filters by ``producer`` and ``distiller_version`` so a row planted via
+        a generic ``create()`` call (with default ``producer=""``) or written
+        by an older distiller version cannot be returned as a cache hit.
+        """
         now_iso = _now_iso()
         with self.db.conn() as c:
             row = c.execute(
@@ -329,16 +339,26 @@ class ArtifactStore:
                        source_artifacts, created_at, ttl
                 FROM artifacts
                 WHERE kind = 'distillation'
+                  AND producer = ?
                   AND json_extract(source_artifacts, '$[0]') = ?
                   AND json_array_length(source_artifacts) = 1
                   AND json_extract(metadata, '$.mode') = ?
                   AND json_extract(metadata, '$.purpose') = ?
                   AND json_extract(metadata, '$.max_chars') = ?
+                  AND json_extract(metadata, '$.distiller_version') = ?
                   AND (ttl IS NULL OR ttl > ?)
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (source_id, mode, purpose, max_chars, now_iso),
+                (
+                    _DISTILLATION_PRODUCER,
+                    source_id,
+                    mode,
+                    purpose,
+                    max_chars,
+                    _DISTILLER_VERSION,
+                    now_iso,
+                ),
             ).fetchone()
             return _row_to_dict(row) if row else None
 
