@@ -179,6 +179,8 @@ class ArtifactDistillRequest(BaseModel):
     mode: str = "brief"
     purpose: str = ""
     max_chars: int = 4000
+    cache: bool = True
+    cache_ttl_seconds: int | None = None
 
 
 class ArtifactDistillManyRequest(BaseModel):
@@ -965,6 +967,8 @@ class BusServer:
                 mode=req.mode,
                 purpose=req.purpose,
                 max_chars=req.max_chars,
+                cache=req.cache,
+                cache_ttl_seconds=req.cache_ttl_seconds,
             )
         except KeyError:
             return {"error": "artifact not found"}

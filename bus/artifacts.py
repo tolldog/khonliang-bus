@@ -11,9 +11,29 @@ import hashlib
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bus.db import BusDB, _row_to_dict
+
+
+_TTL_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime(_TTL_FORMAT)
+
+
+def _ttl_iso_from_seconds(seconds: int | None) -> str | None:
+    """Return an ISO-8601 UTC timestamp ``seconds`` from now, or None.
+
+    Used by ``ArtifactStore.distill`` to set the expiry on cache entries.
+    Lexicographic comparison of this format matches chronological order, so
+    SQLite TEXT comparison is a valid expiry filter without parsing.
+    """
+    if seconds is None:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(seconds=int(seconds))).strftime(_TTL_FORMAT)
 
 
 DEFAULT_MAX_CHARS = 4000
@@ -237,15 +257,39 @@ class ArtifactStore:
         mode: str = "brief",
         purpose: str = "",
         max_chars: int = 4000,
+        cache: bool = True,
+        cache_ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Create a deterministic bounded distillation artifact.
 
-        This is intentionally simple in the first slice. Later work can route
-        by artifact kind to LLM or parser-specific distillers.
+        Distillation is deterministic for a given ``(source content, mode,
+        purpose, max_chars)``; when ``cache`` is True (default), an existing
+        matching, non-expired distillation artifact is returned in place of
+        producing a new one. Pass ``cache=False`` to force a fresh artifact.
+
+        When ``cache_ttl_seconds`` is set, the newly created artifact gets an
+        ISO-8601 UTC ``ttl`` ``cache_ttl_seconds`` from now; cache lookup
+        skips entries whose ``ttl`` is past.
         """
+        if cache_ttl_seconds is not None and cache_ttl_seconds <= 0:
+            raise ValueError(
+                "cache_ttl_seconds must be a positive integer or None"
+            )
         source = self.metadata(artifact_id)
         if source is None:
             raise KeyError(artifact_id)
+
+        if cache:
+            cached = self._find_cached_distillation(
+                artifact_id, mode=mode, purpose=purpose, max_chars=max_chars,
+            )
+            if cached is not None:
+                return {
+                    "source_artifact": artifact_id,
+                    "distilled_artifact": cached,
+                    "digest": self._content(cached["id"]),
+                }
+
         content = self._content(artifact_id)
         digest = _distill_text(content, mode=mode, purpose=purpose, max_chars=max_chars)
         distilled = self.create(
@@ -260,10 +304,43 @@ class ArtifactStore:
                 "mode": mode,
                 "purpose": purpose,
                 "source_kind": source.get("kind", ""),
+                "max_chars": max_chars,
             },
             source_artifacts=[artifact_id],
+            ttl=_ttl_iso_from_seconds(cache_ttl_seconds),
         )
         return {"source_artifact": artifact_id, "distilled_artifact": distilled, "digest": digest}
+
+    def _find_cached_distillation(
+        self,
+        source_id: str,
+        *,
+        mode: str,
+        purpose: str,
+        max_chars: int,
+    ) -> dict[str, Any] | None:
+        """Return the newest non-expired distillation matching the cache key, or None."""
+        now_iso = _now_iso()
+        with self.db.conn() as c:
+            row = c.execute(
+                """
+                SELECT id, kind, title, producer, session_id, trace_id,
+                       content_type, size_bytes, sha256, metadata,
+                       source_artifacts, created_at, ttl
+                FROM artifacts
+                WHERE kind = 'distillation'
+                  AND json_extract(source_artifacts, '$[0]') = ?
+                  AND json_array_length(source_artifacts) = 1
+                  AND json_extract(metadata, '$.mode') = ?
+                  AND json_extract(metadata, '$.purpose') = ?
+                  AND json_extract(metadata, '$.max_chars') = ?
+                  AND (ttl IS NULL OR ttl > ?)
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (source_id, mode, purpose, max_chars, now_iso),
+            ).fetchone()
+            return _row_to_dict(row) if row else None
 
     def distill_many(
         self,
