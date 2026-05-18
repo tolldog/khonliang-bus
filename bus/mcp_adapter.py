@@ -490,11 +490,27 @@ class BusMCPAdapter:
             mode: str = "brief",
             purpose: str = "",
             max_chars: int = 4000,
+            cache: bool = True,
+            cache_ttl_seconds: int | None = None,
         ) -> str:
-            """Create and return a bounded distillation artifact."""
+            """Create and return a bounded distillation artifact.
+
+            Distillation is deterministic for a given
+            ``(source, mode, purpose, max_chars)``; when ``cache`` is True
+            (default) a matching non-expired prior result is returned in
+            place of a fresh artifact. Set ``cache_ttl_seconds`` to expire
+            the cache entry after that many seconds (positive int) or leave
+            it unset for no expiry.
+            """
             result = await adapter._async_post(
                 f"/v1/artifacts/{id}/distill",
-                {"mode": mode, "purpose": purpose, "max_chars": max_chars},
+                {
+                    "mode": mode,
+                    "purpose": purpose,
+                    "max_chars": max_chars,
+                    "cache": cache,
+                    "cache_ttl_seconds": cache_ttl_seconds,
+                },
             )
             return json.dumps(result, indent=2)
 

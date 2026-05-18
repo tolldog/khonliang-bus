@@ -120,8 +120,159 @@ def test_artifact_distill_creates_new_artifact_with_source_ref(db):
     distilled = result["distilled_artifact"]
     assert distilled["kind"] == "distillation"
     assert distilled["source_artifacts"] == [source["id"]]
+    assert distilled["metadata"]["max_chars"] == 500
     assert "source_lines: 100" in result["digest"]
     assert len(result["digest"]) <= 500
+
+
+def test_artifact_distill_cache_hit_returns_same_artifact(db):
+    """Same (source, mode, purpose, max_chars) returns the same artifact on re-call."""
+    store = ArtifactStore(db)
+    source = store.create(
+        kind="git_diff",
+        title="diff",
+        content="\n".join(f"+ line {i}" for i in range(50)),
+    )
+
+    first = store.distill(source["id"], purpose="summary", max_chars=400)
+    second = store.distill(source["id"], purpose="summary", max_chars=400)
+
+    assert second["distilled_artifact"]["id"] == first["distilled_artifact"]["id"]
+    assert second["digest"] == first["digest"]
+
+
+def test_artifact_distill_cache_miss_on_different_args(db):
+    """Different purpose or max_chars must produce distinct distillations."""
+    store = ArtifactStore(db)
+    source = store.create(
+        kind="git_diff",
+        title="diff",
+        content="\n".join(f"+ line {i}" for i in range(50)),
+    )
+
+    a = store.distill(source["id"], purpose="for_review", max_chars=400)
+    b = store.distill(source["id"], purpose="for_handoff", max_chars=400)
+    c = store.distill(source["id"], purpose="for_review", max_chars=800)
+
+    ids = {a["distilled_artifact"]["id"], b["distilled_artifact"]["id"], c["distilled_artifact"]["id"]}
+    assert len(ids) == 3
+
+
+def test_artifact_distill_cache_false_forces_new_artifact(db):
+    """cache=False bypasses lookup even when a matching artifact exists."""
+    store = ArtifactStore(db)
+    source = store.create(
+        kind="git_diff",
+        title="diff",
+        content="\n".join(f"+ line {i}" for i in range(20)),
+    )
+
+    first = store.distill(source["id"], purpose="summary", max_chars=300)
+    forced = store.distill(source["id"], purpose="summary", max_chars=300, cache=False)
+
+    assert forced["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
+    assert forced["digest"] == first["digest"]  # deterministic content
+
+
+def test_artifact_distill_sets_ttl_when_cache_ttl_seconds_given(db):
+    """cache_ttl_seconds populates ttl on the new artifact in ISO-8601 UTC format with microsecond precision."""
+    import re
+
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b\nline c")
+
+    result = store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=3600)
+    ttl = result["distilled_artifact"]["ttl"]
+    assert ttl is not None
+    # Microsecond precision so sub-second TTLs cannot round down and shorten the requested duration.
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", ttl)
+
+
+def test_artifact_distill_expired_cache_entry_is_bypassed(db):
+    """An expired cache entry is skipped; a fresh artifact is produced."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b\nline c")
+
+    first = store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=60)
+    # Backdate the cached entry's ttl directly so the next call sees it as expired.
+    with db.conn() as c:
+        c.execute(
+            "UPDATE artifacts SET ttl = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000000Z", first["distilled_artifact"]["id"]),
+        )
+    second = store.distill(source["id"], purpose="p", max_chars=200)
+
+    assert second["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
+
+
+def test_artifact_distill_rejects_non_positive_cache_ttl(db):
+    """Non-positive cache_ttl_seconds is meaningless as a duration and must be rejected."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    for bad in (0, -1, -3600):
+        with pytest.raises(ValueError, match="positive integer or None"):
+            store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=bad)
+
+
+def test_artifact_distill_cache_ignores_multi_source_distillations(db):
+    """distill_many artifacts (multiple sources) must not satisfy single-source cache lookups."""
+    store = ArtifactStore(db)
+    a = store.create(kind="log", title="a", content="alpha alpha alpha")
+    b = store.create(kind="log", title="b", content="beta beta beta")
+
+    store.distill_many([a["id"], b["id"]], purpose="combined", max_chars=400)
+    single = store.distill(a["id"], purpose="combined", max_chars=400)
+
+    assert single["distilled_artifact"]["source_artifacts"] == [a["id"]]
+
+
+def test_artifact_distill_cache_ignores_non_bus_producer(db):
+    """A `kind='distillation'` row planted via generic `create()` must not poison the cache."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="real source content")
+
+    # Plant a spoofed distillation row directly via create() — default producer is "".
+    spoofed = store.create(
+        kind="distillation",
+        title="Distillation of log",
+        content="ATTACKER-CONTROLLED DIGEST",
+        metadata={
+            "mode": "brief",
+            "purpose": "p",
+            "source_kind": "log",
+            "max_chars": 200,
+            "distiller_version": "v1",
+        },
+        source_artifacts=[source["id"]],
+    )
+
+    result = store.distill(source["id"], purpose="p", max_chars=200)
+
+    # The spoofed row must be skipped and a real distillation produced instead.
+    assert result["distilled_artifact"]["id"] != spoofed["id"]
+    assert "ATTACKER-CONTROLLED DIGEST" not in result["digest"]
+
+
+def test_artifact_distill_cache_ignores_older_distiller_version(db):
+    """A cache entry produced by an older distiller version must not be reused."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    first = store.distill(source["id"], purpose="p", max_chars=200)
+    # Simulate an algorithm change by retroactively marking the cached entry as v0.
+    with db.conn() as c:
+        c.execute(
+            """
+            UPDATE artifacts
+            SET metadata = json_set(metadata, '$.distiller_version', 'v0')
+            WHERE id = ?
+            """,
+            (first["distilled_artifact"]["id"],),
+        )
+    second = store.distill(source["id"], purpose="p", max_chars=200)
+
+    assert second["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
 
 
 def test_artifact_content_size_limit(db):
@@ -138,6 +289,22 @@ def test_missing_artifact_raises_key_error(db):
     store = ArtifactStore(db)
     with pytest.raises(KeyError):
         store.head("missing")
+
+
+def test_artifact_distill_http_returns_422_for_invalid_cache_ttl(client):
+    """The HTTP route must map distill()'s ValueError to 422, not a 500."""
+    created = client.post(
+        "/v1/artifacts",
+        json={"kind": "log", "title": "t", "content": "x", "producer": "tester"},
+    )
+    artifact_id = created.json()["id"]
+
+    bad = client.post(
+        f"/v1/artifacts/{artifact_id}/distill",
+        json={"purpose": "p", "max_chars": 200, "cache_ttl_seconds": 0},
+    )
+    assert bad.status_code == 422
+    assert "positive integer" in bad.json()["detail"]
 
 
 def test_artifact_http_routes_are_bounded(client):
