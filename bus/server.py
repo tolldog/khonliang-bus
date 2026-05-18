@@ -1433,9 +1433,14 @@ class BusServer:
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        # The PID exists but we can't signal it (different uid). Treating
+        # this as "dead" would let boot reconciliation deregister a live
+        # agent whenever the bus runs under a different account.
+        return True
+    return True
 
 
 # ---------------------------------------------------------------------------
