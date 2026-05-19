@@ -57,6 +57,12 @@ class RegisterRequest(BaseModel):
     version: str = ""
     skills: list[dict[str, Any]] = []
     collaborations: list[dict[str, Any]] = []
+    # Launch metadata extension, since khonliang-bus-lib PR #24
+    # (fr_khonliang-bus-lib_2cfc0de6, _cccaa6a9). Both optional —
+    # pre-PR#24 bus-lib clients omit them and provenance reports
+    # ``registration_type="unknown"``.
+    launch_spec: dict[str, Any] | None = None
+    launch_info: dict[str, Any] | None = None
 
 
 class HeartbeatRequest(BaseModel):
@@ -368,6 +374,8 @@ class BusServer:
             version=req.version,
             skills=req.skills,
             collaborations=req.collaborations,
+            launch_spec=req.launch_spec,
+            launch_info=req.launch_info,
         )
         logger.info("Registered agent %s at %s (pid=%d, %d skills)", req.id, req.callback, req.pid, len(req.skills))
         # Notify subscribers of registry change
@@ -908,7 +916,7 @@ class BusServer:
             })
         return result
 
-    def get_agent_provenance(self, agent_id: str) -> dict:
+    def get_agent_provenance(self, agent_id: str, redact_sensitive: bool = False) -> dict:
         """Surface what process is currently serving ``agent_id`` and whether
         it matches the canonical install (``installed_agents``).
 
@@ -916,6 +924,25 @@ class BusServer:
         ``registrations`` row (carrying the bus-lib launch_spec / launch_info
         handshake, since khonliang-bus-lib PR #24) against the canonical
         ``installed_agents`` row and reports ``match``: bool.
+
+        **Disclosure profile.** This surface exposes process-level metadata
+        (cwd, executable path, config path, commit_sha, branch, dirty flag,
+        pid). The khonliang ecosystem assumes a local-trusted host
+        (per ``feedback_no_sandboxing_in_local_trusted_env`` memory) and
+        the bus binds to 0.0.0.0 by default — so any host able to reach
+        the bus's HTTP port can read this data. Operators exposing the
+        bus across less-trusted boundaries should either:
+
+        - Bind the bus to ``127.0.0.1`` (or a Tailscale tailnet only), OR
+        - Set the bus config flag ``provenance_redact_sensitive: true``,
+          which causes the HTTP route to call this method with
+          ``redact_sensitive=True``. The MCP adapter (in-process) reads
+          the unredacted form regardless.
+
+        When ``redact_sensitive=True``, the ``process.cwd``,
+        ``process.executable``, ``process.config``, and the entire
+        ``code`` block are replaced with placeholders so a network
+        caller learns only the ``registration_type`` + ``match`` verdict.
 
         Returns:
             ``{agent_id, registration_type, process, code, canonical_install,
@@ -1008,6 +1035,25 @@ class BusServer:
                 and spec.get("config") == canonical_install.get("config")
             )
             registration_type = "canonical" if match else "adhoc"
+
+        if redact_sensitive:
+            if process:
+                for sensitive in ("executable", "cwd", "config"):
+                    if process.get(sensitive) is not None:
+                        process[sensitive] = "<redacted>"
+                if isinstance(process.get("args"), list) and process["args"]:
+                    process["args"] = ["<redacted>"]
+            # Drop the whole code block — commit SHA + branch + dirty are all
+            # disclosure-sensitive in environments where the redact flag is on.
+            if code is not None:
+                code = None
+            # Canonical install discloses /opt paths too; redact those.
+            if canonical_install:
+                for sensitive in ("command", "cwd", "config"):
+                    if canonical_install.get(sensitive) is not None:
+                        canonical_install[sensitive] = "<redacted>"
+                if isinstance(canonical_install.get("args"), list) and canonical_install["args"]:
+                    canonical_install["args"] = ["<redacted>"]
 
         return {
             "agent_id": agent_id,
@@ -1629,8 +1675,15 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/agent/{agent_id}/provenance")
     def agent_provenance(agent_id: str):
         # fr_khonliang-bus_aa096048: canonical-vs-ad-hoc registration state
-        # joined against installed_agents. See BusServer.get_agent_provenance.
-        return bus.get_agent_provenance(agent_id)
+        # joined against installed_agents. The HTTP path honors the
+        # ``provenance_redact_sensitive`` config flag (off by default for
+        # local-trusted hosts; flip on when the bus is reachable from a
+        # less-trusted network). The MCP adapter reads via this same route
+        # — operators wanting unredacted data over a redacted public route
+        # should expose two listeners (a loopback one for adapters, a
+        # network one with redact=true for callers).
+        redact = bool(bus.config.get("provenance_redact_sensitive", False))
+        return bus.get_agent_provenance(agent_id, redact_sensitive=redact)
 
     # -- request/reply --
 

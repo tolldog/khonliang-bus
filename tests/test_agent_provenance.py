@@ -296,3 +296,137 @@ def test_rest_provenance_endpoint_for_unknown_agent(client):
     assert body["registration_type"] == "none"
     assert body["canonical_install"] is None
     assert body["match"] is None
+
+
+# ---------------------------------------------------------------------------
+# HTTP /v1/register parity with WebSocket register path (Copilot R1 #2)
+# ---------------------------------------------------------------------------
+
+
+def test_http_register_persists_launch_fields(client):
+    """The HTTP /v1/register endpoint also forwards launch_spec / launch_info
+    so HTTP-register callers get the same provenance treatment as WS callers.
+
+    Without this wiring, a new bus-lib client speaking HTTP would have its
+    launch fields silently dropped and provenance would always report
+    ``unknown``.
+    """
+    spec = {
+        "executable": "/opt/x/.venv/bin/python",
+        "args": ["-m", "x.agent"],
+        "cwd": "/opt/x",
+        "config": "/opt/x/config.yaml",
+    }
+    info = {"started_at": 1.0, "commit_sha": None, "branch": None, "dirty": None}
+    r = client.post("/v1/register", json={
+        "id": "http-agent",
+        "callback": "http://localhost:9000",
+        "pid": 4242,
+        "version": "0.1.0",
+        "skills": [],
+        "launch_spec": spec,
+        "launch_info": info,
+    })
+    assert r.status_code == 200
+    prov = client.get("/v1/agent/http-agent/provenance").json()
+    # No canonical install for "http-agent" → adhoc (with notes), but launch
+    # fields are visible — proving they were persisted.
+    assert prov["process"]["executable"] == "/opt/x/.venv/bin/python"
+    assert prov["process"]["cwd"] == "/opt/x"
+    assert prov["registration_type"] in ("adhoc",)
+
+
+def test_http_register_without_launch_fields_still_works(client):
+    """Forward compat: pre-PR#24 clients still register correctly."""
+    r = client.post("/v1/register", json={
+        "id": "legacy-http-agent",
+        "callback": "http://localhost:9000",
+        "pid": 1, "version": "0.0.0", "skills": [],
+    })
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Redact-sensitive flag (Copilot R1 #1: information disclosure on
+# unauthenticated 0.0.0.0 listener)
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_redacts_sensitive_fields_when_flagged(bus, db):
+    """When redact_sensitive=True, executable/cwd/config + the entire code
+    block are masked. Callers still see registration_type + match — the
+    verdict — without the underlying paths or commit SHA.
+    """
+    _install_canonical(db)
+    spec = _canonical_spec()
+    db.register_agent(
+        "x-primary", "x", "ws://connected", 4242, "0.1.0",
+        launch_spec=spec,
+        launch_info={"started_at": 1.0, "commit_sha": "deadbeef" * 5, "branch": "main", "dirty": True},
+    )
+    p = bus.get_agent_provenance("x-primary", redact_sensitive=True)
+
+    assert p["registration_type"] == "canonical"
+    assert p["match"] is True  # verdict still exposed
+    assert p["process"]["pid"] == 4242  # pid is not in the sensitive set
+    assert p["process"]["executable"] == "<redacted>"
+    assert p["process"]["cwd"] == "<redacted>"
+    assert p["process"]["config"] == "<redacted>"
+    assert p["process"]["args"] == ["<redacted>"]
+    # Commit/branch/dirty are dropped entirely under redaction.
+    assert p["code"] is None
+    # Canonical install paths also masked.
+    assert p["canonical_install"]["command"] == "<redacted>"
+    assert p["canonical_install"]["cwd"] == "<redacted>"
+    assert p["canonical_install"]["config"] == "<redacted>"
+
+
+def test_provenance_unredacted_by_default(bus, db):
+    """The unredacted call site is the default — local-trusted clients
+    (MCP adapter, developer-side introspection) want full data.
+    """
+    _install_canonical(db)
+    db.register_agent(
+        "x-primary", "x", "ws://connected", 4242, "0.1.0",
+        launch_spec=_canonical_spec(),
+        launch_info={"started_at": 1.0, "commit_sha": "abc", "branch": "main", "dirty": False},
+    )
+    p = bus.get_agent_provenance("x-primary")  # no redact flag → default False
+    assert p["process"]["executable"] == "/opt/x/.venv/bin/python"
+    assert p["code"]["commit_sha"] == "abc"
+
+
+def test_rest_endpoint_honors_redact_config(tmp_path):
+    """When the bus config has provenance_redact_sensitive=True, the HTTP
+    route returns redacted data even though the in-process method still
+    serves unredacted on direct call.
+    """
+    from bus.server import create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app(
+        db_path=str(tmp_path / "redact.db"),
+        config={"provenance_redact_sensitive": True},
+    )
+    c = TestClient(app)
+    # Install + register an agent with full launch fields.
+    c.post("/v1/install", json={
+        "agent_type": "x", "id": "x-primary",
+        "command": "/opt/x/python", "args": ["-m", "x"],
+        "cwd": "/opt/x", "config": "/opt/x/config.yaml",
+    })
+    c.post("/v1/register", json={
+        "id": "x-primary", "callback": "http://localhost:9000",
+        "pid": 4242, "version": "0.1.0", "skills": [],
+        "launch_spec": {
+            "executable": "/opt/x/python", "args": ["-m", "x"],
+            "cwd": "/opt/x", "config": "/opt/x/config.yaml",
+        },
+        "launch_info": {"started_at": 1.0, "commit_sha": "abc", "branch": "main", "dirty": False},
+    })
+    body = c.get("/v1/agent/x-primary/provenance").json()
+    # Verdict still visible.
+    assert body["match"] is True
+    # Sensitive fields masked.
+    assert body["process"]["executable"] == "<redacted>"
+    assert body["code"] is None
