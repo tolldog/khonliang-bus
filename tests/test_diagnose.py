@@ -25,17 +25,20 @@ def fake_alive(monkeypatch):
     return alive_pids
 
 
-def _register(db: BusDB, agent_id: str, pid: int, skills_n: int = 2) -> None:
+def _register(db: BusDB, agent_id: str, pid: int, skills_n: int = 2, include_health_check: bool = True) -> None:
+    skills = [
+        {"name": f"skill_{i}", "description": "", "parameters": {}}
+        for i in range(skills_n)
+    ]
+    if include_health_check:
+        skills.append({"name": "health_check", "description": "", "parameters": {}})
     db.register_agent(
         agent_id=agent_id,
         agent_type="test",
         callback_url="http://localhost:9999",
         pid=pid,
         version="0.1.0",
-        skills=[
-            {"name": f"skill_{i}", "description": "", "parameters": {}}
-            for i in range(skills_n)
-        ],
+        skills=skills,
     )
 
 
@@ -52,10 +55,12 @@ async def test_diagnose_not_registered(tmp_path, fake_alive):
     assert d["agent_id"] == "ghost"
     assert d["verdict"] == "not_registered"
     assert d["pid"] is None
+    assert d["pid_alive"] is False
     assert d["bus_registry"]["registered"] is False
     assert d["bus_registry"]["skill_count"] == 0
     assert d["health_probe"]["ok"] is False
-    assert "install" in d["recommendation"]
+    assert "bus_install_agent" in d["recommendation"]
+    assert "bus_start_agent" in d["recommendation"]
     assert "ghost" in d["recommendation"]
 
 
@@ -69,9 +74,12 @@ async def test_diagnose_crashed(tmp_path, fake_alive):
     d = await bus.diagnose("agent-1")
 
     assert d["verdict"] == "crashed"
-    assert d["pid"] is None  # dead PID surfaces as None
+    # PID stays in the response (last-known) for log / kernel-message grep;
+    # ``pid_alive`` carries the live /proc result.
+    assert d["pid"] == 12345
+    assert d["pid_alive"] is False
     assert d["bus_registry"]["registered"] is True
-    assert d["bus_registry"]["skill_count"] == 2
+    assert d["bus_registry"]["skill_count"] == 3  # 2 fake + health_check
     assert d["health_probe"]["ok"] is False
     assert "bus_start_agent" in d["recommendation"]
 
@@ -86,7 +94,8 @@ async def test_diagnose_wedged_no_ws(tmp_path, fake_alive):
     d = await bus.diagnose("agent-1")
 
     assert d["verdict"] == "agent_wedged"
-    assert d["pid"] == 12345  # alive PID surfaces
+    assert d["pid"] == 12345
+    assert d["pid_alive"] is True
     assert d["health_probe"]["error"] == "no WebSocket connection"
     assert "bus_restart_agent" in d["recommendation"]
 
@@ -152,6 +161,7 @@ async def test_diagnose_ok(tmp_path, fake_alive, monkeypatch):
     assert d["health_probe"]["ok"] is True
     assert d["health_probe"]["latency_ms"] is not None
     assert d["pid"] == 12345
+    assert d["pid_alive"] is True
     assert d["recommendation"] == "no action needed"
 
 
@@ -165,6 +175,31 @@ async def test_diagnose_detail_full_same_shape_as_brief(tmp_path, fake_alive):
 
     assert brief.keys() == full.keys()
     assert brief["verdict"] == full["verdict"]
+
+
+async def test_diagnose_missing_health_check_redirects_recommendation(tmp_path, fake_alive, monkeypatch):
+    """Non-conforming agent (no health_check skill) gets a recommendation
+    pointing at the agent — not at ``bus_restart_agent`` — so callers don't
+    chase a phantom bus-side wedge."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _register(db, "legacy-agent", pid=12345, include_health_check=False)
+    fake_alive.add(12345)
+    bus = _bus(db)
+    bus._agent_connections["legacy-agent"] = object()
+
+    async def _unknown_op(**_kw):
+        return {"error": "unknown operation: health_check"}
+
+    monkeypatch.setattr(bus, "send_request_to_agent_ws", _unknown_op)
+
+    d = await bus.diagnose("legacy-agent")
+
+    assert d["verdict"] == "agent_wedged"
+    # Recommendation must NOT tell the operator to restart the bus / agent —
+    # the diagnosis is that the agent isn't bus-lib-compliant.
+    assert "bus_restart_agent" not in d["recommendation"]
+    assert "health_check" in d["recommendation"]
+    assert "bus-lib" in d["recommendation"] or "BaseAgent" in d["recommendation"]
 
 
 # -- HTTP endpoint integration -----------------------------------------------
@@ -195,3 +230,16 @@ def test_diagnose_endpoint_accepts_detail_query(tmp_path):
 
     assert r.status_code == 200
     assert r.json()["verdict"] == "not_registered"
+
+
+def test_diagnose_endpoint_rejects_unknown_detail(tmp_path):
+    """Unknown ``detail`` values are 400, not silently coerced — protects
+    callers from typos and from `full`'s future shape divergence."""
+    app = create_app(db_path=str(tmp_path / "test.db"))
+    client = TestClient(app)
+
+    r = client.get("/v1/diagnose/ghost", params={"detail": "verbose"})
+
+    assert r.status_code == 400
+    assert "brief" in r.json()["detail"]
+    assert "full" in r.json()["detail"]

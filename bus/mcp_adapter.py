@@ -219,7 +219,13 @@ class BusMCPAdapter:
             Returns a multi-line summary with the verdict, recommendation,
             and the underlying registry / health-probe fields.
             """
-            d = adapter._get(f"/v1/diagnose/{agent_id}", params={"detail": detail})
+            # ``_get`` is sync httpx; wrap with ``to_thread`` so a wedged-agent
+            # probe (up to bus.diagnose's 5s WS timeout) doesn't pin the MCP
+            # event loop. Other bus_* tools have the same shape but smaller
+            # latency tails; collapsing them all to async is a separate FR.
+            d = await asyncio.to_thread(
+                adapter._get, f"/v1/diagnose/{agent_id}", params={"detail": detail}
+            )
             if not isinstance(d, dict):
                 return f"unexpected response: {d!r}"
             reg = d.get("bus_registry") or {}

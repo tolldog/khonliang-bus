@@ -296,12 +296,26 @@ class BusServer:
 
         ``detail`` is accepted for API stability with future fields but
         currently behaves the same for ``brief`` and ``full``.
+
+        The health probe sends ``operation="health_check"`` over the
+        agent's WebSocket. ``health_check`` is part of every agent's
+        always-available built-in skill set (provided by
+        ``khonliang_bus.BaseAgent``), so any agent that successfully
+        registered with the bus will accept it. Agents that override
+        the base class without re-providing ``health_check`` will
+        diagnose as ``agent_wedged`` here — desired behavior: a
+        non-conforming agent IS broken from the bus's point of view.
+
+        The ``pid`` field always reflects the registered PID (so
+        operators can grep logs / kernel messages even after a crash).
+        ``pid_alive`` is the live ``/proc`` check on that PID.
         """
         reg = self.db.get_registration(agent_id)
         if not reg:
             return {
                 "agent_id": agent_id,
                 "pid": None,
+                "pid_alive": False,
                 "bus_registry": {
                     "registered": False,
                     "skill_count": 0,
@@ -313,17 +327,21 @@ class BusServer:
                     "error": "not registered",
                 },
                 "verdict": "not_registered",
-                "recommendation": f"install + bus_start_agent('{agent_id}')",
+                "recommendation": (
+                    f"bus_install_agent(id='{agent_id}', ...) then "
+                    f"bus_start_agent('{agent_id}')"
+                ),
             }
 
         pid = reg.get("pid")
         pid_alive = bool(pid and int(pid) > 0 and _pid_alive(int(pid)))
         ws_connected = self.is_agent_ws_connected(agent_id)
-        skill_count = len(self.db.get_skills(agent_id))
+        skills = self.db.get_skills(agent_id)
+        has_health_check = any(s.get("name") == "health_check" for s in skills)
 
         bus_registry = {
             "registered": True,
-            "skill_count": skill_count,
+            "skill_count": len(skills),
             "last_heartbeat": reg.get("last_heartbeat"),
         }
 
@@ -353,6 +371,19 @@ class BusServer:
             # Process and WS both gone — start it.
             verdict = "crashed"
             recommendation = f"bus_start_agent('{agent_id}')"
+        elif not has_health_check:
+            # Probe failed against an agent that doesn't advertise the
+            # ``health_check`` skill. That skill is provided by
+            # ``khonliang_bus.BaseAgent`` for every conforming agent, so a
+            # missing one is itself the diagnosis: this agent isn't
+            # bus-lib-compliant. Recommend fixing the agent, not restarting
+            # the bus, so callers don't chase a phantom wedge.
+            verdict = "agent_wedged"
+            recommendation = (
+                f"{agent_id} did not register a 'health_check' skill; "
+                f"diagnose v1 cannot probe it. Upgrade to khonliang-bus-lib "
+                f"BaseAgent or register a health_check skill on the agent."
+            )
         else:
             # Any other path means something on the agent side is alive
             # (process and/or WebSocket) but not responding cleanly. Folded
@@ -365,7 +396,8 @@ class BusServer:
 
         return {
             "agent_id": agent_id,
-            "pid": pid if pid_alive else None,
+            "pid": pid,
+            "pid_alive": pid_alive,
             "bus_registry": bus_registry,
             "health_probe": health_probe,
             "verdict": verdict,
@@ -1595,6 +1627,16 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.get("/v1/diagnose/{agent_id}")
     async def diagnose(agent_id: str, detail: str = "brief"):
+        # No auth / rate-limit — same posture as every other bus control-plane
+        # route. khonliang-bus assumes a single-host, local-trusted environment
+        # (see project_dev_fleet_convention + feedback_no_sandboxing_in_local_trusted_env);
+        # security is an explicit non-goal for v1. Network-exposure hardening
+        # is a single platform-wide FR, not per-route.
+        if detail not in ("brief", "full"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"detail must be 'brief' or 'full', got {detail!r}",
+            )
         return await bus.diagnose(agent_id, detail=detail)
 
     # -- request/reply --
