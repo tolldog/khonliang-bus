@@ -63,6 +63,11 @@ class RegisterRequest(BaseModel):
     # ``registration_type="unknown"``.
     launch_spec: dict[str, Any] | None = None
     launch_info: dict[str, Any] | None = None
+    # Welcome extension, since khonliang-bus-lib PR #25
+    # (fr_khonliang-bus_f96722dd). Bus persists into the survives-deregister
+    # welcomes table; older bus-lib agents omit it and the bus stores nothing
+    # (queries return None until the agent re-registers with the new lib).
+    welcome: dict[str, Any] | None = None
 
 
 class HeartbeatRequest(BaseModel):
@@ -581,6 +586,11 @@ class BusServer:
             launch_spec=req.launch_spec,
             launch_info=req.launch_info,
         )
+        # Persist welcome (survives-deregister) so the bus_welcome super-skill
+        # and GET /v1/agents/<id>/welcome work after the agent process exits.
+        # fr_khonliang-bus_f96722dd.
+        if req.welcome is not None:
+            self.db.set_agent_welcome(req.id, req.welcome)
         logger.info("Registered agent %s at %s (pid=%d, %d skills)", req.id, req.callback, req.pid, len(req.skills))
         # Notify subscribers of registry change
         await self._publish_event("bus.registry_changed", {"agent_id": req.id, "action": "registered"})
@@ -1557,6 +1567,14 @@ class BusServer:
                         launch_spec=data.get("launch_spec"),
                         launch_info=data.get("launch_info"),
                     )
+                    # Persist welcome to the survives-deregister catalog so
+                    # cold-start LLMs + bus_welcome super-skill see it even
+                    # after the agent process exits.
+                    # fr_khonliang-bus_f96722dd. Only ``dict`` is honored —
+                    # ignore stray non-dict shapes a future client might send.
+                    welcome = data.get("welcome")
+                    if isinstance(welcome, dict):
+                        self.db.set_agent_welcome(agent_id, welcome)
                     await ws.send_json({"type": "registered", "id": agent_id})
                     logger.info("Agent %s connected via WebSocket (%d skills)", agent_id, len(data.get("skills", [])))
                     await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "registered"})
@@ -1953,6 +1971,37 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
                 detail=f"detail must be 'brief' or 'full', got {detail!r}",
             )
         return await bus.diagnose(agent_id, detail=detail)
+
+    @app.get("/v1/agents/{agent_id}/welcome")
+    def agent_welcome(agent_id: str):
+        # fr_khonliang-bus_f96722dd: read the persisted welcome blob. Survives
+        # deregister + bus restart; returns 404 if the agent has never
+        # published one. The bus_welcome super-skill consumes this directly.
+        record = bus.db.get_agent_welcome(agent_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no welcome on file for agent_id={agent_id!r}",
+            )
+        return record
+
+    @app.post("/v1/agents/{agent_id}/welcome")
+    def agent_welcome_set(agent_id: str, payload: dict[str, Any]):
+        # Late-update / operator-override path for the welcome catalog
+        # (fr_khonliang-bus_f96722dd "POST /v1/agents/<id>/welcome").
+        # Accepts a JSON dict; persists it as the agent's welcome. Idempotent:
+        # the same payload posted twice yields one row (most-recent-wins).
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="welcome must be a JSON object")
+        bus.db.set_agent_welcome(agent_id, payload)
+        return {"agent_id": agent_id, "status": "stored"}
+
+    @app.get("/v1/agents/welcomes")
+    def list_welcomes():
+        # Fleet-wide list, ordered by agent_id. Used by the bus_welcome
+        # super-skill (sibling fr_khonliang-bus_37498850) to build cold-start
+        # briefings. Empty list (not 404) when no welcomes have been published.
+        return bus.db.list_agent_welcomes()
 
     @app.get("/v1/agent/{agent_id}/provenance")
     def agent_provenance(agent_id: str):

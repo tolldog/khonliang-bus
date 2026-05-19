@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS registrations (
     status          TEXT NOT NULL DEFAULT 'healthy'
 );
 
+-- Persistent: per-agent welcome blobs, survive deregister + bus restart.
+-- fr_khonliang-bus_f96722dd: bus-lib agents auto-publish their welcome
+-- on register; cold-start LLMs query GET /v1/agents/<id>/welcome and
+-- the bus_welcome super-skill consults this catalog. Most-recent-wins
+-- on re-register (no version history; out of scope for v1).
+CREATE TABLE IF NOT EXISTS welcomes (
+    agent_id    TEXT PRIMARY KEY,
+    welcome     TEXT NOT NULL,                              -- JSON
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Runtime: skills per agent
 CREATE TABLE IF NOT EXISTS skills (
     agent_id     TEXT NOT NULL,
@@ -292,6 +303,69 @@ class BusDB:
         with self.conn() as c:
             r = c.execute("SELECT * FROM installed_agents WHERE id = ?", (agent_id,)).fetchone()
             return _row_to_dict(r) if r else None
+
+    # -- welcomes (per-agent welcome blobs, survive deregister) --
+    #
+    # fr_khonliang-bus_f96722dd: BaseAgent.start() forwards the agent's
+    # welcome dict on register; bus persists it here. Cold-start LLMs +
+    # the bus_welcome super-skill consume this catalog even after the
+    # agent process exits.
+
+    def set_agent_welcome(self, agent_id: str, welcome: dict[str, Any]) -> None:
+        """Upsert an agent's welcome blob. Most-recent-wins on re-register
+        — no version history kept (out of scope for v1)."""
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO welcomes (agent_id, welcome, updated_at) "
+                "VALUES (?, ?, datetime('now')) "
+                "ON CONFLICT(agent_id) DO UPDATE SET "
+                "welcome = excluded.welcome, updated_at = excluded.updated_at",
+                (agent_id, json.dumps(welcome)),
+            )
+
+    def get_agent_welcome(self, agent_id: str) -> dict[str, Any] | None:
+        """Return the persisted welcome (parsed dict) plus the updated_at
+        timestamp, or ``None`` if no welcome has ever been published for
+        this agent_id.
+
+        Shape: ``{welcome: dict, updated_at: str}`` — keeps the wrapping
+        explicit so future fields (e.g. content_hash, content_type) can be
+        added without breaking callers that assumed a bare blob.
+        """
+        with self.conn() as c:
+            r = c.execute(
+                "SELECT welcome, updated_at FROM welcomes WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+        if not r:
+            return None
+        try:
+            parsed = json.loads(r["welcome"])
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        return {"welcome": parsed, "updated_at": r["updated_at"]}
+
+    def list_agent_welcomes(self) -> list[dict[str, Any]]:
+        """Enumerate every persisted welcome. Used by the bus_welcome
+        super-skill to assemble a fleet-wide cold-start briefing.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT agent_id, welcome, updated_at FROM welcomes "
+                "ORDER BY agent_id"
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                parsed = json.loads(r["welcome"])
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            out.append({
+                "agent_id": r["agent_id"],
+                "welcome": parsed,
+                "updated_at": r["updated_at"],
+            })
+        return out
 
     # -- registrations --
 
