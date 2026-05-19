@@ -908,6 +908,117 @@ class BusServer:
             })
         return result
 
+    def get_agent_provenance(self, agent_id: str) -> dict:
+        """Surface what process is currently serving ``agent_id`` and whether
+        it matches the canonical install (``installed_agents``).
+
+        Implements ``fr_khonliang-bus_aa096048`` Tier 1: joins the runtime
+        ``registrations`` row (carrying the bus-lib launch_spec / launch_info
+        handshake, since khonliang-bus-lib PR #24) against the canonical
+        ``installed_agents`` row and reports ``match``: bool.
+
+        Returns:
+            ``{agent_id, registration_type, process, code, canonical_install,
+            match, notes}``.
+
+            ``registration_type`` ∈ ``{"canonical", "adhoc", "unknown", "none"}``:
+            - ``canonical``: a runtime registration exists, ``launch_spec``
+              fields all match the ``installed_agents`` row exactly.
+            - ``adhoc``: a runtime registration exists but ``launch_spec``
+              diverges from the canonical install (or no canonical install
+              exists for this agent_id).
+            - ``unknown``: a runtime registration exists but the agent did
+              not include ``launch_spec`` (older bus-lib).
+            - ``none``: no runtime registration; the agent is not connected.
+
+            ``match`` is True/False when ``registration_type`` is canonical/adhoc
+            *and* the canonical install exists; None when the comparison can't
+            be made (unknown / none / no canonical row).
+        """
+        runtime = self.db.get_registration(agent_id)
+        installed = self.db.get_installed_agent(agent_id)
+
+        # ``get_installed_agent`` already runs ``_row_to_dict`` which parses
+        # the ``args`` JSON column into a list. Keep a typed reference for the
+        # match comparison; tolerate the legacy string shape defensively
+        # (e.g. if a future caller hands us a raw row).
+        canonical_install: dict | None = None
+        canonical_args: list | None = None
+        if installed:
+            canonical_install = dict(installed)
+            args_field = canonical_install.get("args")
+            if isinstance(args_field, list):
+                canonical_args = args_field
+            elif isinstance(args_field, str):
+                try:
+                    canonical_args = json.loads(args_field)
+                    canonical_install["args"] = canonical_args
+                except (json.JSONDecodeError, TypeError):
+                    canonical_args = None
+
+        if not runtime:
+            return {
+                "agent_id": agent_id,
+                "registration_type": "none",
+                "process": None,
+                "code": None,
+                "canonical_install": canonical_install,
+                "match": None,
+                "notes": [],
+            }
+
+        spec = runtime.get("launch_spec")
+        info = runtime.get("launch_info")
+        notes: list[str] = []
+
+        process: dict | None = {
+            "pid": runtime.get("pid"),
+            "executable": spec.get("executable") if isinstance(spec, dict) else None,
+            "args": spec.get("args") if isinstance(spec, dict) else None,
+            "cwd": spec.get("cwd") if isinstance(spec, dict) else None,
+            "config": spec.get("config") if isinstance(spec, dict) else None,
+            "started_at": info.get("started_at") if isinstance(info, dict) else None,
+        }
+
+        code: dict | None = None
+        if isinstance(info, dict):
+            code = {
+                "commit_sha": info.get("commit_sha"),
+                "branch": info.get("branch"),
+                "dirty": info.get("dirty"),
+                # behind_main is not computed bus-side; downstream consumers
+                # (e.g. developer.fleet_inventory) compare against ~/dev mains.
+                "behind_main": None,
+            }
+
+        # Determine registration_type + match.
+        if not isinstance(spec, dict):
+            registration_type = "unknown"
+            match: bool | None = None
+            notes.append("agent did not report launch_spec (pre-PR#24 bus-lib?)")
+        elif canonical_install is None:
+            registration_type = "adhoc"
+            match = None
+            notes.append("no canonical install row for this agent_id")
+        else:
+            match = (
+                spec.get("executable") == canonical_install.get("command")
+                and spec.get("args") == canonical_args
+                and spec.get("cwd") == canonical_install.get("cwd")
+                and spec.get("config") == canonical_install.get("config")
+            )
+            registration_type = "canonical" if match else "adhoc"
+
+        return {
+            "agent_id": agent_id,
+            "registration_type": registration_type,
+            "process": process,
+            "code": code,
+            "canonical_install": canonical_install,
+            "match": match,
+            "notes": notes,
+        }
+
     def get_platform_status(self) -> dict:
         installed = self.db.get_installed_agents()
         regs = self.db.get_registrations()
@@ -1147,7 +1258,9 @@ class BusServer:
         Protocol (all JSON over one WebSocket):
 
         Agent → Bus:
-          {"type": "register", "id": "...", "version": "...", "skills": [...], "collaborations": [...]}
+          {"type": "register", "id": "...", "version": "...", "skills": [...], "collaborations": [...],
+           "launch_spec": {...} | null,    # how to respawn (executable, args, cwd, config); since bus-lib PR #24
+           "launch_info": {...} | null}    # runtime snapshot (started_at, commit_sha, branch, dirty); since bus-lib PR #24
           {"type": "heartbeat"}
           {"type": "response", "correlation_id": "...", "result": {...}}
           {"type": "error", "correlation_id": "...", "error": "...", "retryable": bool}
@@ -1172,7 +1285,12 @@ class BusServer:
                 if msg_type == "register":
                     agent_id = data["id"]
                     self._agent_connections[agent_id] = ws
-                    # Store registration in DB
+                    # Store registration in DB.
+                    # launch_spec / launch_info: optional handshake extension
+                    # contributed by khonliang-bus-lib PR #24
+                    # (fr_khonliang-bus-lib_2cfc0de6, _cccaa6a9). Older bus-lib
+                    # versions omit them; we pass None through unchanged so
+                    # get_agent_provenance can report unknown match status.
                     self.db.register_agent(
                         agent_id=agent_id,
                         agent_type=data.get("agent_type", agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id),
@@ -1181,6 +1299,8 @@ class BusServer:
                         version=data.get("version", ""),
                         skills=data.get("skills", []),
                         collaborations=data.get("collaborations", []),
+                        launch_spec=data.get("launch_spec"),
+                        launch_info=data.get("launch_info"),
                     )
                     await ws.send_json({"type": "registered", "id": agent_id})
                     logger.info("Agent %s connected via WebSocket (%d skills)", agent_id, len(data.get("skills", [])))
@@ -1505,6 +1625,12 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/services")
     def services():
         return bus.get_services()
+
+    @app.get("/v1/agent/{agent_id}/provenance")
+    def agent_provenance(agent_id: str):
+        # fr_khonliang-bus_aa096048: canonical-vs-ad-hoc registration state
+        # joined against installed_agents. See BusServer.get_agent_provenance.
+        return bus.get_agent_provenance(agent_id)
 
     # -- request/reply --
 
