@@ -9,11 +9,51 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bus.db import BusDB, _row_to_dict
+
+
+_TTL_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+_DISTILLER_VERSION = "v1"
+_DISTILLATION_PRODUCER = "bus"
+_DISTILLATION_KIND = "distillation"
+# One year. Larger values are pointless against artifact GC and would push
+# `now + seconds` toward `datetime.max`, where `timedelta` can overflow.
+_MAX_CACHE_TTL_SECONDS = 365 * 24 * 3600
+
+# Process-wide lock serializing ``ArtifactStore.distill()``'s lookup-then-insert
+# critical section. The bus runs as a single process (see
+# project_bus_service_persistence), so a Python lock is sufficient atomicity:
+# without it, two concurrent distill calls for the same cache key can both miss
+# and both insert, producing duplicate distillation rows.
+_DISTILL_LOCK = threading.Lock()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime(_TTL_FORMAT)
+
+
+def _ttl_iso_from_seconds(seconds: int | None) -> str | None:
+    """Return an ISO-8601 UTC timestamp ``seconds`` from now, or None.
+
+    Used by ``ArtifactStore.distill`` to set the expiry on cache entries.
+    ``cache_ttl_seconds`` is an integer-second duration; microsecond
+    precision in the stored format is about the lookup compare, not the
+    input: it prevents ``ttl`` and ``_now_iso()`` from both rounding to
+    the same second boundary right at the expiry instant (which would
+    flip the entry to "expired" one second early under ``ttl > now``).
+    Lexicographic comparison of this fixed-width format matches
+    chronological order, so SQLite TEXT comparison is a valid expiry
+    filter without parsing.
+    """
+    if seconds is None:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(seconds=int(seconds))).strftime(_TTL_FORMAT)
 
 
 DEFAULT_MAX_CHARS = 4000
@@ -57,7 +97,45 @@ class ArtifactStore:
         Content is currently stored in SQLite. The API intentionally exposes
         only bounded retrieval helpers so the backend can move to filesystem
         blobs later without changing callers.
+
+        ``kind='distillation'`` is reserved for the internal
+        ``distill`` / ``distill_many`` paths so a generic caller cannot
+        plant a row that would later satisfy the cache-hit lookup.
         """
+        if kind == _DISTILLATION_KIND:
+            raise ValueError(
+                f"kind={_DISTILLATION_KIND!r} is reserved; use distill() / distill_many()"
+            )
+        return self._create(
+            kind=kind,
+            title=title,
+            content=content,
+            producer=producer,
+            session_id=session_id,
+            trace_id=trace_id,
+            content_type=content_type,
+            metadata=metadata,
+            source_artifacts=source_artifacts,
+            artifact_id=artifact_id,
+            ttl=ttl,
+        )
+
+    def _create(
+        self,
+        *,
+        kind: str,
+        title: str,
+        content: str,
+        producer: str = "",
+        session_id: str = "",
+        trace_id: str = "",
+        content_type: str = "text/plain",
+        metadata: dict[str, Any] | None = None,
+        source_artifacts: list[str] | None = None,
+        artifact_id: str = "",
+        ttl: str | None = None,
+    ) -> dict[str, Any]:
+        """Internal create — bypasses the public-kind guard. Use ``create()`` externally."""
         if not kind:
             raise ValueError("kind is required")
         if not title:
@@ -237,33 +315,129 @@ class ArtifactStore:
         mode: str = "brief",
         purpose: str = "",
         max_chars: int = 4000,
+        cache: bool = True,
+        cache_ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Create a deterministic bounded distillation artifact.
 
-        This is intentionally simple in the first slice. Later work can route
-        by artifact kind to LLM or parser-specific distillers.
+        Distillation is deterministic for a given ``(source content, mode,
+        purpose, max_chars)``; when ``cache`` is True (default), an existing
+        matching, non-expired distillation artifact is returned in place of
+        producing a new one. Pass ``cache=False`` to force a fresh artifact.
+
+        ``cache_ttl_seconds`` applies **at creation time only**: on a cache
+        miss, the freshly stored artifact's ``ttl`` is set to that many
+        seconds from now. On a cache hit, the existing entry's ``ttl`` is
+        what governs expiry — the caller's ``cache_ttl_seconds`` is *not*
+        retroactively narrowed onto an existing entry. This is intentional:
+        a forever-cached entry is just as valid a result for the caller's
+        deterministic source, so we return it rather than re-compute. If a
+        caller needs a guaranteed-fresh artifact or its own TTL on the
+        stored row, it must pass ``cache=False``.
+
+        The lookup-then-insert critical section is serialized by a
+        process-wide lock so concurrent callers of the same cache key do
+        not both miss and produce duplicate rows.
         """
+        if cache_ttl_seconds is not None and (
+            cache_ttl_seconds <= 0 or cache_ttl_seconds > _MAX_CACHE_TTL_SECONDS
+        ):
+            raise ValueError(
+                "cache_ttl_seconds must be a positive integer "
+                f"<= {_MAX_CACHE_TTL_SECONDS} (1 year), or None"
+            )
         source = self.metadata(artifact_id)
         if source is None:
             raise KeyError(artifact_id)
-        content = self._content(artifact_id)
-        digest = _distill_text(content, mode=mode, purpose=purpose, max_chars=max_chars)
-        distilled = self.create(
-            kind="distillation",
-            title=f"Distillation of {source['title']}",
-            content=digest,
-            producer="bus",
-            session_id=source.get("session_id", ""),
-            trace_id=source.get("trace_id", ""),
-            content_type="text/plain",
-            metadata={
-                "mode": mode,
-                "purpose": purpose,
-                "source_kind": source.get("kind", ""),
-            },
-            source_artifacts=[artifact_id],
-        )
-        return {"source_artifact": artifact_id, "distilled_artifact": distilled, "digest": digest}
+
+        with _DISTILL_LOCK:
+            if cache:
+                cached = self._find_cached_distillation(
+                    artifact_id, mode=mode, purpose=purpose, max_chars=max_chars,
+                )
+                if cached is not None:
+                    return {
+                        "source_artifact": artifact_id,
+                        "distilled_artifact": cached,
+                        "digest": self._content(cached["id"]),
+                    }
+
+            content = self._content(artifact_id)
+            digest = _distill_text(content, mode=mode, purpose=purpose, max_chars=max_chars)
+            distilled = self._create(
+                kind=_DISTILLATION_KIND,
+                title=f"Distillation of {source['title']}",
+                content=digest,
+                producer=_DISTILLATION_PRODUCER,
+                session_id=source.get("session_id", ""),
+                trace_id=source.get("trace_id", ""),
+                content_type="text/plain",
+                metadata={
+                    "mode": mode,
+                    "purpose": purpose,
+                    "source_kind": source.get("kind", ""),
+                    "max_chars": max_chars,
+                    "distiller_version": _DISTILLER_VERSION,
+                },
+                source_artifacts=[artifact_id],
+                ttl=_ttl_iso_from_seconds(cache_ttl_seconds),
+            )
+            return {"source_artifact": artifact_id, "distilled_artifact": distilled, "digest": digest}
+
+    def _find_cached_distillation(
+        self,
+        source_id: str,
+        *,
+        mode: str,
+        purpose: str,
+        max_chars: int,
+    ) -> dict[str, Any] | None:
+        """Return the newest non-expired distillation matching the cache key, or None.
+
+        Filters by ``producer`` and ``distiller_version`` so a row planted via
+        a generic ``create()`` call (with default ``producer=""``) or written
+        by an older distiller version cannot be returned as a cache hit.
+
+        ``kind`` and ``producer`` are inlined as literals (rather than bound
+        parameters) so the matching predicate is statically recognizable by
+        SQLite's partial-index matcher; otherwise
+        ``idx_artifacts_distillation_cache`` (which is partial on
+        ``kind='distillation' AND producer='bus'``) would not be applied
+        and the lookup would degrade to a scan over distillation rows.
+        ``_DISTILLATION_KIND`` and ``_DISTILLATION_PRODUCER`` are private
+        constants, never caller-supplied, so the f-string interpolation is
+        not an injection surface.
+        """
+        now_iso = _now_iso()
+        with self.db.conn() as c:
+            row = c.execute(
+                f"""
+                SELECT id, kind, title, producer, session_id, trace_id,
+                       content_type, size_bytes, sha256, metadata,
+                       source_artifacts, created_at, ttl
+                FROM artifacts
+                WHERE kind = '{_DISTILLATION_KIND}'
+                  AND producer = '{_DISTILLATION_PRODUCER}'
+                  AND json_extract(source_artifacts, '$[0]') = ?
+                  AND json_array_length(source_artifacts) = 1
+                  AND json_extract(metadata, '$.mode') = ?
+                  AND json_extract(metadata, '$.purpose') = ?
+                  AND json_extract(metadata, '$.max_chars') = ?
+                  AND json_extract(metadata, '$.distiller_version') = ?
+                  AND (ttl IS NULL OR ttl > ?)
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (
+                    source_id,
+                    mode,
+                    purpose,
+                    max_chars,
+                    _DISTILLER_VERSION,
+                    now_iso,
+                ),
+            ).fetchone()
+            return _row_to_dict(row) if row else None
 
     def distill_many(
         self,
@@ -288,11 +462,11 @@ class ArtifactStore:
             )
             sections.append(f"# {meta['title']} ({aid})\n{text}")
         digest = _bound_text("\n\n".join(sections), max_chars, truncated=False).text
-        distilled = self.create(
-            kind="distillation",
+        distilled = self._create(
+            kind=_DISTILLATION_KIND,
             title="Distillation of multiple artifacts",
             content=digest,
-            producer="bus",
+            producer=_DISTILLATION_PRODUCER,
             content_type="text/plain",
             metadata={"purpose": purpose, "source_count": len(artifact_ids)},
             source_artifacts=artifact_ids,

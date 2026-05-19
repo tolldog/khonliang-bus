@@ -119,6 +119,58 @@ def test_build_registers_flow_tools(adapter):
     assert "evaluate_spec" in tool_names
 
 
+def test_bus_artifact_distill_tool_exposes_cache_args(adapter):
+    """MCP callers must be able to set cache + cache_ttl_seconds on bus_artifact_distill."""
+    mcp = adapter.build()
+    tools = asyncio.run(mcp.list_tools())
+    distill_tools = [t for t in tools if t.name == "bus_artifact_distill"]
+    assert distill_tools, "expected bus_artifact_distill to be registered"
+    props = distill_tools[0].inputSchema.get("properties", {})
+    for arg in ("cache", "cache_ttl_seconds"):
+        assert arg in props, (
+            f"{arg} missing from bus_artifact_distill schema: {sorted(props)}"
+        )
+
+
+def test_bus_artifact_distill_tool_forwards_cache_args(adapter):
+    """The tool must actually forward cache + cache_ttl_seconds in the POST body, not just accept them.
+
+    A regression that drops them from the request payload while keeping
+    them in the function signature would silently break MCP callers; the
+    schema-presence assertion above wouldn't catch it.
+    """
+    captured: dict = {}
+
+    async def fake_post(path, body, http_timeout=None):
+        captured["path"] = path
+        captured["body"] = body
+        return {"ok": True}
+
+    adapter._async_post = fake_post  # type: ignore[assignment]
+    mcp = adapter.build()
+
+    asyncio.run(
+        mcp.call_tool(
+            "bus_artifact_distill",
+            {
+                "id": "art_xyz",
+                "mode": "brief",
+                "purpose": "docs",
+                "max_chars": 1000,
+                "cache": False,
+                "cache_ttl_seconds": 3600,
+            },
+        )
+    )
+
+    assert captured["path"] == "/v1/artifacts/art_xyz/distill"
+    assert captured["body"]["cache"] is False
+    assert captured["body"]["cache_ttl_seconds"] == 3600
+    assert captured["body"]["mode"] == "brief"
+    assert captured["body"]["purpose"] == "docs"
+    assert captured["body"]["max_chars"] == 1000
+
+
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())

@@ -120,8 +120,254 @@ def test_artifact_distill_creates_new_artifact_with_source_ref(db):
     distilled = result["distilled_artifact"]
     assert distilled["kind"] == "distillation"
     assert distilled["source_artifacts"] == [source["id"]]
+    assert distilled["metadata"]["max_chars"] == 500
     assert "source_lines: 100" in result["digest"]
     assert len(result["digest"]) <= 500
+
+
+def test_artifact_distill_cache_hit_returns_same_artifact(db):
+    """Same (source, mode, purpose, max_chars) returns the same artifact on re-call."""
+    store = ArtifactStore(db)
+    source = store.create(
+        kind="git_diff",
+        title="diff",
+        content="\n".join(f"+ line {i}" for i in range(50)),
+    )
+
+    first = store.distill(source["id"], purpose="summary", max_chars=400)
+    second = store.distill(source["id"], purpose="summary", max_chars=400)
+
+    assert second["distilled_artifact"]["id"] == first["distilled_artifact"]["id"]
+    assert second["digest"] == first["digest"]
+
+
+def test_artifact_distill_cache_miss_on_different_args(db):
+    """Different purpose or max_chars must produce distinct distillations."""
+    store = ArtifactStore(db)
+    source = store.create(
+        kind="git_diff",
+        title="diff",
+        content="\n".join(f"+ line {i}" for i in range(50)),
+    )
+
+    a = store.distill(source["id"], purpose="for_review", max_chars=400)
+    b = store.distill(source["id"], purpose="for_handoff", max_chars=400)
+    c = store.distill(source["id"], purpose="for_review", max_chars=800)
+
+    ids = {a["distilled_artifact"]["id"], b["distilled_artifact"]["id"], c["distilled_artifact"]["id"]}
+    assert len(ids) == 3
+
+
+def test_artifact_distill_cache_false_forces_new_artifact(db):
+    """cache=False bypasses lookup even when a matching artifact exists."""
+    store = ArtifactStore(db)
+    source = store.create(
+        kind="git_diff",
+        title="diff",
+        content="\n".join(f"+ line {i}" for i in range(20)),
+    )
+
+    first = store.distill(source["id"], purpose="summary", max_chars=300)
+    forced = store.distill(source["id"], purpose="summary", max_chars=300, cache=False)
+
+    assert forced["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
+    assert forced["digest"] == first["digest"]  # deterministic content
+
+
+def test_artifact_distill_sets_ttl_when_cache_ttl_seconds_given(db):
+    """cache_ttl_seconds populates ttl on the new artifact in ISO-8601 UTC format with microsecond precision."""
+    import re
+
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b\nline c")
+
+    result = store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=3600)
+    ttl = result["distilled_artifact"]["ttl"]
+    assert ttl is not None
+    # Microsecond precision in the stored value avoids ttl/now both rounding
+    # to the same second boundary at the expiry instant (which would flip the
+    # entry to "expired" one second early under `ttl > now`).
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", ttl)
+
+
+def test_artifact_distill_expired_cache_entry_is_bypassed(db):
+    """An expired cache entry is skipped; a fresh artifact is produced."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b\nline c")
+
+    first = store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=60)
+    # Backdate the cached entry's ttl directly so the next call sees it as expired.
+    with db.conn() as c:
+        c.execute(
+            "UPDATE artifacts SET ttl = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000000Z", first["distilled_artifact"]["id"]),
+        )
+    second = store.distill(source["id"], purpose="p", max_chars=200)
+
+    assert second["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
+
+
+def test_artifact_distill_rejects_non_positive_cache_ttl(db):
+    """Non-positive cache_ttl_seconds is meaningless as a duration and must be rejected."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    for bad in (0, -1, -3600):
+        with pytest.raises(ValueError, match="positive integer"):
+            store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=bad)
+
+
+def test_artifact_distill_cache_ignores_multi_source_distillations(db):
+    """distill_many artifacts (multiple sources) must not satisfy single-source cache lookups."""
+    store = ArtifactStore(db)
+    a = store.create(kind="log", title="a", content="alpha alpha alpha")
+    b = store.create(kind="log", title="b", content="beta beta beta")
+
+    store.distill_many([a["id"], b["id"]], purpose="combined", max_chars=400)
+    single = store.distill(a["id"], purpose="combined", max_chars=400)
+
+    assert single["distilled_artifact"]["source_artifacts"] == [a["id"]]
+
+
+def test_artifact_create_rejects_reserved_distillation_kind(db):
+    """Public create() must refuse `kind='distillation'` so the cache key cannot be spoofed."""
+    store = ArtifactStore(db)
+    with pytest.raises(ValueError, match="reserved"):
+        store.create(kind="distillation", title="planted", content="x")
+
+
+def test_artifact_distill_cache_ignores_non_bus_producer(db):
+    """Defense-in-depth: even rows planted via the internal path with a foreign producer must be skipped."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="real source content")
+
+    # Bypass the public-kind gate to plant a foreign-producer distillation row.
+    spoofed = store._create(
+        kind="distillation",
+        title="Distillation of log",
+        content="ATTACKER-CONTROLLED DIGEST",
+        producer="not-bus",
+        metadata={
+            "mode": "brief",
+            "purpose": "p",
+            "source_kind": "log",
+            "max_chars": 200,
+            "distiller_version": "v1",
+        },
+        source_artifacts=[source["id"]],
+    )
+
+    result = store.distill(source["id"], purpose="p", max_chars=200)
+
+    assert result["distilled_artifact"]["id"] != spoofed["id"]
+    assert "ATTACKER-CONTROLLED DIGEST" not in result["digest"]
+
+
+def test_artifact_distill_cache_ignores_older_distiller_version(db):
+    """A cache entry produced by an older distiller version must not be reused."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    first = store.distill(source["id"], purpose="p", max_chars=200)
+    # Simulate an algorithm change by retroactively marking the cached entry as v0.
+    with db.conn() as c:
+        c.execute(
+            """
+            UPDATE artifacts
+            SET metadata = json_set(metadata, '$.distiller_version', 'v0')
+            WHERE id = ?
+            """,
+            (first["distilled_artifact"]["id"],),
+        )
+    second = store.distill(source["id"], purpose="p", max_chars=200)
+
+    assert second["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
+
+
+def test_artifact_distill_cache_hit_does_not_retroactively_apply_caller_ttl(db):
+    """Cache hits return the existing entry; caller's cache_ttl_seconds applies on creation only.
+
+    This is documented, intentional behavior: a deterministic distillation
+    is just as valid whether stored with no TTL or a 60s TTL. Callers that
+    need a guaranteed-fresh artifact (or their own TTL on the stored row)
+    must pass cache=False.
+    """
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    # First call stores a forever-cached entry (no TTL).
+    forever = store.distill(source["id"], purpose="p", max_chars=200)
+    assert forever["distilled_artifact"]["ttl"] is None
+
+    # Second call passes a tight TTL but should still return the same forever entry.
+    second = store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=60)
+    assert second["distilled_artifact"]["id"] == forever["distilled_artifact"]["id"]
+    assert second["distilled_artifact"]["ttl"] is None  # original TTL preserved
+
+
+def test_artifact_distill_cache_lookup_breaks_ties_by_rowid_not_id(db):
+    """Same-second cache rows must be ordered by insertion (rowid), not random id.
+
+    SQLite's `datetime('now')` is second-precision, and `id` is a random
+    `art_<hex>` slug. If `id DESC` is used as the tiebreaker, the lookup
+    can return the older row when its random id happens to sort higher
+    than the newer one — for example preserving a no-TTL entry over a
+    just-inserted TTL-bound entry.
+    """
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="src")
+    cache_metadata = {
+        "mode": "brief",
+        "purpose": "p",
+        "source_kind": "log",
+        "max_chars": 200,
+        "distiller_version": "v1",
+    }
+
+    # Plant two rows via _create with explicit ids chosen so that
+    # lexicographic id-order is the OPPOSITE of insertion order.
+    older = store._create(
+        kind="distillation",
+        title="older",
+        content="OLDER",
+        producer="bus",
+        metadata=cache_metadata,
+        source_artifacts=[source["id"]],
+        artifact_id="art_zzzzzzzzzzzz",  # lex-highest id but inserted first
+    )
+    newer = store._create(
+        kind="distillation",
+        title="newer",
+        content="NEWER",
+        producer="bus",
+        metadata=cache_metadata,
+        source_artifacts=[source["id"]],
+        artifact_id="art_aaaaaaaaaaaa",  # lex-lowest id but inserted second
+    )
+
+    # Force identical created_at so the second-precision tie kicks in.
+    with db.conn() as c:
+        c.execute(
+            "UPDATE artifacts SET created_at = ? WHERE id IN (?, ?)",
+            ("2026-01-01 00:00:00", older["id"], newer["id"]),
+        )
+
+    # Cache hit must return the row inserted second (highest rowid), not
+    # the row whose random id happens to sort higher.
+    hit = store.distill(source["id"], purpose="p", max_chars=200)
+    assert hit["distilled_artifact"]["id"] == newer["id"]
+    assert hit["digest"] == "NEWER"
+
+
+def test_artifact_distill_rejects_cache_ttl_above_upper_bound(db):
+    """cache_ttl_seconds above the upper bound must be rejected before timedelta overflow."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    # One year + 1 second is over the cap.
+    too_long = 365 * 24 * 3600 + 1
+    with pytest.raises(ValueError, match="1 year"):
+        store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=too_long)
 
 
 def test_artifact_content_size_limit(db):
@@ -138,6 +384,22 @@ def test_missing_artifact_raises_key_error(db):
     store = ArtifactStore(db)
     with pytest.raises(KeyError):
         store.head("missing")
+
+
+def test_artifact_distill_http_returns_422_for_invalid_cache_ttl(client):
+    """The HTTP route must map distill()'s ValueError to 422, not a 500."""
+    created = client.post(
+        "/v1/artifacts",
+        json={"kind": "log", "title": "t", "content": "x", "producer": "tester"},
+    )
+    artifact_id = created.json()["id"]
+
+    bad = client.post(
+        f"/v1/artifacts/{artifact_id}/distill",
+        json={"purpose": "p", "max_chars": 200, "cache_ttl_seconds": 0},
+    )
+    assert bad.status_code == 422
+    assert "positive integer" in bad.json()["detail"]
 
 
 def test_artifact_http_routes_are_bounded(client):

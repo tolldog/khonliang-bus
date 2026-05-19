@@ -185,6 +185,8 @@ class ArtifactDistillRequest(BaseModel):
     mode: str = "brief"
     purpose: str = ""
     max_chars: int = 4000
+    cache: bool = True
+    cache_ttl_seconds: int | None = None
 
 
 class ArtifactDistillManyRequest(BaseModel):
@@ -1266,9 +1268,13 @@ class BusServer:
                 mode=req.mode,
                 purpose=req.purpose,
                 max_chars=req.max_chars,
+                cache=req.cache,
+                cache_ttl_seconds=req.cache_ttl_seconds,
             )
         except KeyError:
             return {"error": "artifact not found"}
+        except ValueError as e:
+            return {"error": str(e)}
 
     def distill_many_artifacts(self, req: ArtifactDistillManyRequest) -> dict:
         try:
@@ -2172,7 +2178,8 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     def artifact_distill(artifact_id: str, req: ArtifactDistillRequest):
         result = bus.distill_artifact(artifact_id, req)
         if "error" in result:
-            raise HTTPException(status_code=404, detail=result["error"])
+            status = 404 if "not found" in result["error"] else 422
+            raise HTTPException(status_code=status, detail=result["error"])
         return result
 
     # -- observability --
