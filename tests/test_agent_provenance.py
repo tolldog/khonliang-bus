@@ -488,3 +488,85 @@ def test_rest_endpoint_unknown_agent_safe_either_way(tmp_path):
         body = c.get("/v1/agent/ghost/provenance").json()
         assert body["registration_type"] == "none"
         assert body["canonical_install"] is None
+
+
+# ---------------------------------------------------------------------------
+# CLI / env-var plumbing for provenance_disclose_full (Copilot R3 #1:
+# operators can't actually opt INTO disclosure in a standard deployment
+# unless the flag has a real configuration surface).
+# ---------------------------------------------------------------------------
+
+
+def test_main_cli_flag_disclose_full_off_by_default(monkeypatch):
+    """Without --provenance-disclose-full or the env var, the parsed args
+    leave the flag False — matches the safe-by-default rule for the HTTP
+    route on an unauthenticated 0.0.0.0 listener.
+    """
+    from bus.__main__ import _env_bool
+    import argparse, os
+
+    # Simulate clean env.
+    monkeypatch.delenv("KHONLIANG_BUS_PROVENANCE_DISCLOSE_FULL", raising=False)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--provenance-disclose-full",
+        action="store_true",
+        default=_env_bool("KHONLIANG_BUS_PROVENANCE_DISCLOSE_FULL"),
+    )
+    args = parser.parse_args([])
+    assert args.provenance_disclose_full is False
+
+
+def test_main_cli_flag_disclose_full_on_via_arg(monkeypatch):
+    """``--provenance-disclose-full`` on the CLI flips the flag to True."""
+    from bus.__main__ import _env_bool
+    import argparse
+
+    monkeypatch.delenv("KHONLIANG_BUS_PROVENANCE_DISCLOSE_FULL", raising=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--provenance-disclose-full",
+        action="store_true",
+        default=_env_bool("KHONLIANG_BUS_PROVENANCE_DISCLOSE_FULL"),
+    )
+    args = parser.parse_args(["--provenance-disclose-full"])
+    assert args.provenance_disclose_full is True
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("1", True), ("true", True), ("True", True), ("TRUE", True),
+     ("yes", True), ("on", True),
+     ("0", False), ("false", False), ("no", False), ("off", False),
+     ("", False), ("garbage", False)],
+)
+def test_env_bool_parsing(monkeypatch, raw, expected):
+    """The env-var parser handles common bool spellings; only the documented
+    truthy set flips the flag — anything else (typos, empty) stays False.
+    Operationally important: a misspelled env var in a systemd EnvironmentFile
+    must not silently enable disclosure.
+    """
+    from bus.__main__ import _env_bool
+
+    monkeypatch.setenv("X", raw)
+    assert _env_bool("X") is expected
+
+
+def test_main_cli_flag_disclose_full_on_via_env(monkeypatch):
+    """The env-var path is operationally cleaner for systemd deployments —
+    drop ``KHONLIANG_BUS_PROVENANCE_DISCLOSE_FULL=1`` in an EnvironmentFile
+    instead of editing the unit's ExecStart line.
+    """
+    from bus.__main__ import _env_bool
+    import argparse
+
+    monkeypatch.setenv("KHONLIANG_BUS_PROVENANCE_DISCLOSE_FULL", "1")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--provenance-disclose-full",
+        action="store_true",
+        default=_env_bool("KHONLIANG_BUS_PROVENANCE_DISCLOSE_FULL"),
+    )
+    args = parser.parse_args([])
+    assert args.provenance_disclose_full is True

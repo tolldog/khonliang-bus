@@ -122,6 +122,7 @@ def test_build_registers_flow_tools(adapter):
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
+    names = {t.name for t in tools}
     # 16 bus tools (12 non-artifact + 2 distill + 1 bus_topics +
     # 1 bus_agent_provenance) + 3 skills + 1 flow = 20. The seven
     # read-side bus_artifact_* tools were retired with khonliang-store
@@ -129,6 +130,43 @@ def test_total_tool_count(adapter):
     # to close fr_bus_7b2d41d2; ``bus_agent_provenance`` was added to
     # close fr_khonliang-bus_aa096048 (Tier 1 visibility).
     assert len(tools) == 20
+    # Spot-check load-bearing names so the aggregate count alone can't
+    # mask a rename / replacement (per Copilot R3 on PR #34).
+    expected_named = {
+        "bus_services", "bus_status", "bus_matrix", "bus_flows",
+        "bus_skills", "bus_topics", "bus_agent_provenance",
+    }
+    assert expected_named.issubset(names), (
+        f"missing required tool names: {expected_named - names}"
+    )
+
+
+def test_bus_agent_provenance_tool_present_and_callable(adapter):
+    """``bus_agent_provenance`` is the user-facing MCP face of
+    fr_khonliang-bus_aa096048's Tier 1 primitive. The aggregate
+    tool-count test can't catch a rename — assert presence by name
+    and exercise the formatted output for an unknown agent.
+    """
+    mcp = adapter.build()
+    tools = asyncio.run(mcp.list_tools())
+    matches = [t for t in tools if t.name == "bus_agent_provenance"]
+    assert len(matches) == 1, "bus_agent_provenance not registered"
+    tool = matches[0]
+    # Smoke test the description (closes Copilot's "ideally exercise
+    # its formatted output" ask in a way that doesn't depend on
+    # full-app integration — the route formatting is tested
+    # end-to-end in tests/test_agent_provenance.py).
+    assert tool.description, "bus_agent_provenance is missing a description"
+    # Description should mention the core concept (canonical-vs-ad-hoc /
+    # registration / install — at least one) so an LLM caller knows what
+    # the tool does without reading source.
+    desc_lower = tool.description.lower()
+    assert any(
+        kw in desc_lower for kw in ("canonical", "ad-hoc", "adhoc", "install")
+    ), f"description missing core concept: {tool.description[:200]!r}"
+    # Schema accepts an agent_id arg (string).
+    schema = tool.inputSchema
+    assert "agent_id" in schema.get("properties", {})
 
 
 def test_bus_services_tool(adapter):
