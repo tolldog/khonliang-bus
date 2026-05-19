@@ -29,12 +29,21 @@ CREATE TABLE IF NOT EXISTS installed_agents (
 );
 
 -- Runtime: who's running now (rebuilt on each boot)
+--
+-- launch_spec / launch_info are JSON-serialized shapes contributed by
+-- bus-lib's register handshake (since khonliang-bus-lib PR #24). Used
+-- by ``get_agent_provenance`` to surface canonical-vs-ad-hoc
+-- registration state alongside ``installed_agents`` for
+-- ``fr_khonliang-bus_aa096048``. Nullable for backward compatibility
+-- with older bus-lib versions that don't send these fields.
 CREATE TABLE IF NOT EXISTS registrations (
     id              TEXT PRIMARY KEY,
     agent_type      TEXT NOT NULL,
     callback_url    TEXT NOT NULL,
     pid             INTEGER NOT NULL,
     version         TEXT,
+    launch_spec     TEXT,                              -- JSON: {executable, args, cwd, config}
+    launch_info     TEXT,                              -- JSON: {started_at, commit_sha, branch, dirty}
     registered_at   TEXT NOT NULL DEFAULT (datetime('now')),
     last_heartbeat  TEXT NOT NULL DEFAULT (datetime('now')),
     status          TEXT NOT NULL DEFAULT 'healthy'
@@ -210,6 +219,20 @@ class BusDB:
     def _init_schema(self) -> None:
         with self.conn() as c:
             c.executescript(SCHEMA)
+            self._migrate_registrations_launch_columns(c)
+
+    @staticmethod
+    def _migrate_registrations_launch_columns(c: sqlite3.Connection) -> None:
+        """Add ``launch_spec`` / ``launch_info`` to ``registrations`` for
+        databases created before fr_khonliang-bus_aa096048. SQLite's
+        ``ADD COLUMN`` is forward-compatible (existing rows get NULL);
+        we guard with a column-presence check so re-runs are a no-op.
+        """
+        existing = {row[1] for row in c.execute("PRAGMA table_info(registrations)").fetchall()}
+        if "launch_spec" not in existing:
+            c.execute("ALTER TABLE registrations ADD COLUMN launch_spec TEXT")
+        if "launch_info" not in existing:
+            c.execute("ALTER TABLE registrations ADD COLUMN launch_info TEXT")
 
     @contextmanager
     def conn(self):
@@ -269,11 +292,29 @@ class BusDB:
         version: str = "",
         skills: list[dict] | None = None,
         collaborations: list[dict] | None = None,
+        launch_spec: dict | None = None,
+        launch_info: dict | None = None,
     ) -> None:
+        """Persist a runtime registration row.
+
+        ``launch_spec`` and ``launch_info`` are the bus-lib register-handshake
+        extension introduced by khonliang-bus-lib PR #24
+        (``fr_khonliang-bus-lib_2cfc0de6`` / ``fr_khonliang-bus-lib_cccaa6a9``).
+        Both are optional — older bus-lib versions don't send them, and the
+        bus stores NULL in those rows. The provenance primitive
+        (``get_agent_provenance``) downgrades gracefully when either is
+        absent.
+        """
         with self.conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO registrations (id, agent_type, callback_url, pid, version) VALUES (?, ?, ?, ?, ?)",
-                (agent_id, agent_type, callback_url, pid, version),
+                "INSERT OR REPLACE INTO registrations "
+                "(id, agent_type, callback_url, pid, version, launch_spec, launch_info) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id, agent_type, callback_url, pid, version,
+                    json.dumps(launch_spec) if launch_spec is not None else None,
+                    json.dumps(launch_info) if launch_info is not None else None,
+                ),
             )
             # Rebuild skills for this agent
             c.execute("DELETE FROM skills WHERE agent_id = ?", (agent_id,))
@@ -327,12 +368,12 @@ class BusDB:
     def get_registrations(self) -> list[dict[str, Any]]:
         with self.conn() as c:
             rows = c.execute("SELECT * FROM registrations").fetchall()
-            return [_row_to_dict(r) for r in rows]
+            return [_inflate_registration(r) for r in rows]
 
     def get_registration(self, agent_id: str) -> dict[str, Any] | None:
         with self.conn() as c:
             r = c.execute("SELECT * FROM registrations WHERE id = ?", (agent_id,)).fetchone()
-            return _row_to_dict(r) if r else None
+            return _inflate_registration(r) if r else None
 
     def get_healthy_agent_for_type(self, agent_type: str) -> dict[str, Any] | None:
         """Find a healthy registered agent of the given type."""
@@ -849,6 +890,26 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
                 d[key] = json.loads(d[key])
             except (json.JSONDecodeError, TypeError):
                 pass
+    return d
+
+
+def _inflate_registration(row: sqlite3.Row) -> dict[str, Any]:
+    """Like ``_row_to_dict`` but also JSON-parses ``launch_spec`` /
+    ``launch_info`` (added by ``fr_khonliang-bus_aa096048``).
+
+    Kept as a separate helper so the generic ``_row_to_dict`` does not
+    grow per-table knowledge for every JSON column added in the future.
+    """
+    d = _row_to_dict(row)
+    for key in ("launch_spec", "launch_info"):
+        raw = d.get(key)
+        if isinstance(raw, str):
+            try:
+                d[key] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                d[key] = None
+        elif raw is None:
+            d[key] = None
     return d
 
 
