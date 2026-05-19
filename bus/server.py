@@ -927,17 +927,16 @@ class BusServer:
 
         **Disclosure profile.** This surface exposes process-level metadata
         (cwd, executable path, config path, commit_sha, branch, dirty flag,
-        pid). The khonliang ecosystem assumes a local-trusted host
-        (per ``feedback_no_sandboxing_in_local_trusted_env`` memory) and
-        the bus binds to 0.0.0.0 by default — so any host able to reach
-        the bus's HTTP port can read this data. Operators exposing the
-        bus across less-trusted boundaries should either:
+        pid). The bus binds 0.0.0.0 with no authentication, so the HTTP
+        route is **redacted by default** — operators must explicitly opt
+        INTO full disclosure via the ``provenance_disclose_full: true``
+        bus config flag (typical for local-trusted hosts, per the
+        ``feedback_no_sandboxing_in_local_trusted_env`` memory).
 
-        - Bind the bus to ``127.0.0.1`` (or a Tailscale tailnet only), OR
-        - Set the bus config flag ``provenance_redact_sensitive: true``,
-          which causes the HTTP route to call this method with
-          ``redact_sensitive=True``. The MCP adapter (in-process) reads
-          the unredacted form regardless.
+        The in-process call site (this method, called directly from
+        Python within the same process) defaults ``redact_sensitive=False``
+        — i.e. unredacted — because the trust boundary is process-internal.
+        The HTTP route inverts that via the config flag described above.
 
         When ``redact_sensitive=True``, the ``process.cwd``,
         ``process.executable``, ``process.config``, and the entire
@@ -1675,15 +1674,26 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/agent/{agent_id}/provenance")
     def agent_provenance(agent_id: str):
         # fr_khonliang-bus_aa096048: canonical-vs-ad-hoc registration state
-        # joined against installed_agents. The HTTP path honors the
-        # ``provenance_redact_sensitive`` config flag (off by default for
-        # local-trusted hosts; flip on when the bus is reachable from a
-        # less-trusted network). The MCP adapter reads via this same route
-        # — operators wanting unredacted data over a redacted public route
-        # should expose two listeners (a loopback one for adapters, a
-        # network one with redact=true for callers).
-        redact = bool(bus.config.get("provenance_redact_sensitive", False))
-        return bus.get_agent_provenance(agent_id, redact_sensitive=redact)
+        # joined against installed_agents.
+        #
+        # **HTTP route is redacted by default.** The bus binds 0.0.0.0 with
+        # no authentication, so any network peer that can reach this port
+        # can read whatever the route returns. Redact-by-default means a
+        # forgotten exposure (or a future Tailscale Funnel rule that adds
+        # 8788 alongside webhooks) doesn't silently leak host/source
+        # metadata — operators must explicitly opt INTO disclosure.
+        #
+        # Local-trusted hosts (the typical khonliang dev environment, per
+        # ``feedback_no_sandboxing_in_local_trusted_env``) opt in by
+        # setting ``provenance_disclose_full: true`` in the bus config.
+        # The in-process call site (``BusServer.get_agent_provenance``)
+        # always supports unredacted output via the ``redact_sensitive``
+        # kwarg, so callers reaching the bus over IPC / shared memory
+        # / same-process imports remain unaffected.
+        disclose_full = bool(bus.config.get("provenance_disclose_full", False))
+        return bus.get_agent_provenance(
+            agent_id, redact_sensitive=not disclose_full,
+        )
 
     # -- request/reply --
 

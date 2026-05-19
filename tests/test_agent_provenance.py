@@ -303,14 +303,25 @@ def test_rest_provenance_endpoint_for_unknown_agent(client):
 # ---------------------------------------------------------------------------
 
 
-def test_http_register_persists_launch_fields(client):
+def test_http_register_persists_launch_fields(tmp_path):
     """The HTTP /v1/register endpoint also forwards launch_spec / launch_info
     so HTTP-register callers get the same provenance treatment as WS callers.
 
     Without this wiring, a new bus-lib client speaking HTTP would have its
     launch fields silently dropped and provenance would always report
-    ``unknown``.
+    ``unknown``. We opt into ``provenance_disclose_full`` for this test so
+    persistence is verifiable via the public read surface; redact-by-default
+    behavior is covered by ``test_rest_endpoint_redacts_by_default``.
     """
+    from bus.server import create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app(
+        db_path=str(tmp_path / "http-reg.db"),
+        config={"provenance_disclose_full": True},
+    )
+    c = TestClient(app)
+
     spec = {
         "executable": "/opt/x/.venv/bin/python",
         "args": ["-m", "x.agent"],
@@ -318,7 +329,7 @@ def test_http_register_persists_launch_fields(client):
         "config": "/opt/x/config.yaml",
     }
     info = {"started_at": 1.0, "commit_sha": None, "branch": None, "dirty": None}
-    r = client.post("/v1/register", json={
+    r = c.post("/v1/register", json={
         "id": "http-agent",
         "callback": "http://localhost:9000",
         "pid": 4242,
@@ -328,9 +339,9 @@ def test_http_register_persists_launch_fields(client):
         "launch_info": info,
     })
     assert r.status_code == 200
-    prov = client.get("/v1/agent/http-agent/provenance").json()
+    prov = c.get("/v1/agent/http-agent/provenance").json()
     # No canonical install for "http-agent" → adhoc (with notes), but launch
-    # fields are visible — proving they were persisted.
+    # fields are visible under disclose_full — proving they were persisted.
     assert prov["process"]["executable"] == "/opt/x/.venv/bin/python"
     assert prov["process"]["cwd"] == "/opt/x"
     assert prov["registration_type"] in ("adhoc",)
@@ -396,20 +407,8 @@ def test_provenance_unredacted_by_default(bus, db):
     assert p["code"]["commit_sha"] == "abc"
 
 
-def test_rest_endpoint_honors_redact_config(tmp_path):
-    """When the bus config has provenance_redact_sensitive=True, the HTTP
-    route returns redacted data even though the in-process method still
-    serves unredacted on direct call.
-    """
-    from bus.server import create_app
-    from fastapi.testclient import TestClient
-
-    app = create_app(
-        db_path=str(tmp_path / "redact.db"),
-        config={"provenance_redact_sensitive": True},
-    )
-    c = TestClient(app)
-    # Install + register an agent with full launch fields.
+def _register_canonical_via_http(c) -> None:
+    """Helper: install + HTTP-register an agent with matching launch_spec."""
     c.post("/v1/install", json={
         "agent_type": "x", "id": "x-primary",
         "command": "/opt/x/python", "args": ["-m", "x"],
@@ -424,9 +423,68 @@ def test_rest_endpoint_honors_redact_config(tmp_path):
         },
         "launch_info": {"started_at": 1.0, "commit_sha": "abc", "branch": "main", "dirty": False},
     })
+
+
+def test_rest_endpoint_redacts_by_default(tmp_path):
+    """Default HTTP behavior is redacted: an unauthenticated 0.0.0.0
+    listener must not leak host/source metadata to network peers.
+    Operators on local-trusted hosts opt INTO disclosure (see next test).
+
+    Closes Copilot R2 on PR #34: redact-by-default is the correct stance
+    for a control-plane route on an unauthenticated public listener.
+    """
+    from bus.server import create_app
+    from fastapi.testclient import TestClient
+
+    # No provenance_disclose_full in config → defaults to redacted.
+    app = create_app(db_path=str(tmp_path / "default.db"))
+    c = TestClient(app)
+    _register_canonical_via_http(c)
+
     body = c.get("/v1/agent/x-primary/provenance").json()
-    # Verdict still visible.
-    assert body["match"] is True
+    assert body["match"] is True          # verdict still visible
+    assert body["registration_type"] == "canonical"
+    assert body["process"]["pid"] == 4242  # pid not in sensitive set
     # Sensitive fields masked.
     assert body["process"]["executable"] == "<redacted>"
+    assert body["process"]["cwd"] == "<redacted>"
     assert body["code"] is None
+    assert body["canonical_install"]["command"] == "<redacted>"
+
+
+def test_rest_endpoint_discloses_full_when_opted_in(tmp_path):
+    """``provenance_disclose_full: true`` opts into unredacted disclosure
+    on the HTTP route — typical config for a local-trusted host.
+    """
+    from bus.server import create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app(
+        db_path=str(tmp_path / "disclose.db"),
+        config={"provenance_disclose_full": True},
+    )
+    c = TestClient(app)
+    _register_canonical_via_http(c)
+
+    body = c.get("/v1/agent/x-primary/provenance").json()
+    assert body["match"] is True
+    # Sensitive fields revealed under explicit opt-in.
+    assert body["process"]["executable"] == "/opt/x/python"
+    assert body["process"]["cwd"] == "/opt/x"
+    assert body["code"]["commit_sha"] == "abc"
+    assert body["canonical_install"]["command"] == "/opt/x/python"
+
+
+def test_rest_endpoint_unknown_agent_safe_either_way(tmp_path):
+    """The ``none`` shape (no runtime, no install) is safe to expose under
+    both flag positions — no host data to redact in the first place.
+    """
+    from bus.server import create_app
+    from fastapi.testclient import TestClient
+
+    for cfg in ({}, {"provenance_disclose_full": True}):
+        app = create_app(db_path=str(tmp_path / f"unk-{bool(cfg)}.db"), config=cfg)
+        c = TestClient(app)
+        body = c.get("/v1/agent/ghost/provenance").json()
+        assert body["registration_type"] == "none"
+        assert body["canonical_install"] is None
