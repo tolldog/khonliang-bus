@@ -57,6 +57,12 @@ class RegisterRequest(BaseModel):
     version: str = ""
     skills: list[dict[str, Any]] = []
     collaborations: list[dict[str, Any]] = []
+    # Launch metadata extension, since khonliang-bus-lib PR #24
+    # (fr_khonliang-bus-lib_2cfc0de6, _cccaa6a9). Both optional —
+    # pre-PR#24 bus-lib clients omit them and provenance reports
+    # ``registration_type="unknown"``.
+    launch_spec: dict[str, Any] | None = None
+    launch_info: dict[str, Any] | None = None
 
 
 class HeartbeatRequest(BaseModel):
@@ -368,6 +374,8 @@ class BusServer:
             version=req.version,
             skills=req.skills,
             collaborations=req.collaborations,
+            launch_spec=req.launch_spec,
+            launch_info=req.launch_info,
         )
         logger.info("Registered agent %s at %s (pid=%d, %d skills)", req.id, req.callback, req.pid, len(req.skills))
         # Notify subscribers of registry change
@@ -908,6 +916,135 @@ class BusServer:
             })
         return result
 
+    def get_agent_provenance(self, agent_id: str, redact_sensitive: bool = False) -> dict:
+        """Surface what process is currently serving ``agent_id`` and whether
+        it matches the canonical install (``installed_agents``).
+
+        Implements ``fr_khonliang-bus_aa096048`` Tier 1: joins the runtime
+        ``registrations`` row (carrying the bus-lib launch_spec / launch_info
+        handshake, since khonliang-bus-lib PR #24) against the canonical
+        ``installed_agents`` row and reports ``match``: bool.
+
+        **Disclosure profile.** This surface exposes process-level metadata
+        (cwd, executable path, config path, commit_sha, branch, dirty flag,
+        pid). The bus binds 0.0.0.0 with no authentication, so the HTTP
+        route is **redacted by default** — operators must explicitly opt
+        INTO full disclosure via the ``provenance_disclose_full: true``
+        bus config flag (typical for local-trusted hosts, per the
+        ``feedback_no_sandboxing_in_local_trusted_env`` memory).
+
+        The in-process call site (this method, called directly from
+        Python within the same process) defaults ``redact_sensitive=False``
+        — i.e. unredacted — because the trust boundary is process-internal.
+        The HTTP route inverts that via the config flag described above.
+
+        When ``redact_sensitive=True``, the ``process.cwd``,
+        ``process.executable``, ``process.config``, and the entire
+        ``code`` block are replaced with placeholders so a network
+        caller learns only the ``registration_type`` + ``match`` verdict.
+
+        Returns:
+            ``{agent_id, registration_type, process, code, canonical_install,
+            match, notes}``.
+
+            ``registration_type`` ∈ ``{"canonical", "adhoc", "unknown", "none"}``:
+            - ``canonical``: a runtime registration exists, ``launch_spec``
+              fields all match the ``installed_agents`` row exactly.
+            - ``adhoc``: a runtime registration exists but ``launch_spec``
+              diverges from the canonical install (or no canonical install
+              exists for this agent_id).
+            - ``unknown``: a runtime registration exists but the agent did
+              not include ``launch_spec`` (older bus-lib).
+            - ``none``: no runtime registration; the agent is not connected.
+
+            ``match`` is True/False when ``registration_type`` is canonical/adhoc
+            *and* the canonical install exists; None when the comparison can't
+            be made (unknown / none / no canonical row).
+        """
+        runtime = self.db.get_registration(agent_id)
+        installed = self.db.get_installed_agent(agent_id)
+
+        # ``get_installed_agent`` already runs ``_row_to_dict`` which parses
+        # the ``args`` JSON column into a list. Keep a typed reference for the
+        # match comparison; tolerate the legacy string shape defensively
+        # (e.g. if a future caller hands us a raw row).
+        canonical_install: dict | None = None
+        canonical_args: list | None = None
+        if installed:
+            canonical_install = dict(installed)
+            args_field = canonical_install.get("args")
+            if isinstance(args_field, list):
+                canonical_args = args_field
+            elif isinstance(args_field, str):
+                try:
+                    canonical_args = json.loads(args_field)
+                    canonical_install["args"] = canonical_args
+                except (json.JSONDecodeError, TypeError):
+                    canonical_args = None
+
+        if not runtime:
+            return _maybe_redact_provenance({
+                "agent_id": agent_id,
+                "registration_type": "none",
+                "process": None,
+                "code": None,
+                "canonical_install": canonical_install,
+                "match": None,
+                "notes": [],
+            }, redact_sensitive)
+
+        spec = runtime.get("launch_spec")
+        info = runtime.get("launch_info")
+        notes: list[str] = []
+
+        process: dict | None = {
+            "pid": runtime.get("pid"),
+            "executable": spec.get("executable") if isinstance(spec, dict) else None,
+            "args": spec.get("args") if isinstance(spec, dict) else None,
+            "cwd": spec.get("cwd") if isinstance(spec, dict) else None,
+            "config": spec.get("config") if isinstance(spec, dict) else None,
+            "started_at": info.get("started_at") if isinstance(info, dict) else None,
+        }
+
+        code: dict | None = None
+        if isinstance(info, dict):
+            code = {
+                "commit_sha": info.get("commit_sha"),
+                "branch": info.get("branch"),
+                "dirty": info.get("dirty"),
+                # behind_main is not computed bus-side; downstream consumers
+                # (e.g. developer.fleet_inventory) compare against ~/dev mains.
+                "behind_main": None,
+            }
+
+        # Determine registration_type + match.
+        if not isinstance(spec, dict):
+            registration_type = "unknown"
+            match: bool | None = None
+            notes.append("agent did not report launch_spec (pre-PR#24 bus-lib?)")
+        elif canonical_install is None:
+            registration_type = "adhoc"
+            match = None
+            notes.append("no canonical install row for this agent_id")
+        else:
+            match = (
+                spec.get("executable") == canonical_install.get("command")
+                and spec.get("args") == canonical_args
+                and spec.get("cwd") == canonical_install.get("cwd")
+                and spec.get("config") == canonical_install.get("config")
+            )
+            registration_type = "canonical" if match else "adhoc"
+
+        return _maybe_redact_provenance({
+            "agent_id": agent_id,
+            "registration_type": registration_type,
+            "process": process,
+            "code": code,
+            "canonical_install": canonical_install,
+            "match": match,
+            "notes": notes,
+        }, redact_sensitive)
+
     def get_platform_status(self) -> dict:
         installed = self.db.get_installed_agents()
         regs = self.db.get_registrations()
@@ -1147,7 +1284,9 @@ class BusServer:
         Protocol (all JSON over one WebSocket):
 
         Agent → Bus:
-          {"type": "register", "id": "...", "version": "...", "skills": [...], "collaborations": [...]}
+          {"type": "register", "id": "...", "version": "...", "skills": [...], "collaborations": [...],
+           "launch_spec": {...} | null,    # how to respawn (executable, args, cwd, config); since bus-lib PR #24
+           "launch_info": {...} | null}    # runtime snapshot (started_at, commit_sha, branch, dirty); since bus-lib PR #24
           {"type": "heartbeat"}
           {"type": "response", "correlation_id": "...", "result": {...}}
           {"type": "error", "correlation_id": "...", "error": "...", "retryable": bool}
@@ -1172,7 +1311,12 @@ class BusServer:
                 if msg_type == "register":
                     agent_id = data["id"]
                     self._agent_connections[agent_id] = ws
-                    # Store registration in DB
+                    # Store registration in DB.
+                    # launch_spec / launch_info: optional handshake extension
+                    # contributed by khonliang-bus-lib PR #24
+                    # (fr_khonliang-bus-lib_2cfc0de6, _cccaa6a9). Older bus-lib
+                    # versions omit them; we pass None through unchanged so
+                    # get_agent_provenance can report unknown match status.
                     self.db.register_agent(
                         agent_id=agent_id,
                         agent_type=data.get("agent_type", agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id),
@@ -1181,6 +1325,8 @@ class BusServer:
                         version=data.get("version", ""),
                         skills=data.get("skills", []),
                         collaborations=data.get("collaborations", []),
+                        launch_spec=data.get("launch_spec"),
+                        launch_info=data.get("launch_info"),
                     )
                     await ws.send_json({"type": "registered", "id": agent_id})
                     logger.info("Agent %s connected via WebSocket (%d skills)", agent_id, len(data.get("skills", [])))
@@ -1430,6 +1576,64 @@ class BusServer:
         return {"verdict": req.verdict, "trace_id": req.trace_id}
 
 
+_REDACTED = "<redacted>"
+_PROCESS_SENSITIVE = ("executable", "cwd", "config")
+_INSTALL_SENSITIVE = ("command", "cwd", "config")
+
+
+def _redact_field(payload: dict, key: str) -> None:
+    """Replace ``payload[key]`` with the standard placeholder if the field
+    is present (i.e. not None / not absent). Type-agnostic: applies to any
+    non-None value (str, list, dict, number) so a malicious agent can't
+    bypass redaction by sending an unexpected JSON shape.
+    """
+    if payload.get(key) is not None:
+        payload[key] = _REDACTED
+
+
+def _maybe_redact_provenance(payload: dict, redact: bool) -> dict:
+    """Apply the redaction policy to a provenance payload at every return
+    path. Used by ``BusServer.get_agent_provenance`` so the early-return
+    case (``registration_type == "none"``) cannot bypass the same masking
+    the main flow applies.
+
+    Fields cleared (when ``redact=True``):
+      - ``process.executable``, ``process.cwd``, ``process.config``,
+        ``process.args`` (regardless of type — any non-None value becomes
+        the placeholder).
+      - ``code`` block dropped entirely (commit_sha + branch + dirty are
+        all disclosure-sensitive).
+      - ``canonical_install.command``, ``.cwd``, ``.config``, ``.args``
+        replaced the same way.
+
+    Fields preserved (treated as the public verdict):
+      - ``agent_id``, ``registration_type``, ``match``, ``notes``.
+      - ``process.pid``, ``process.started_at``.
+      - ``canonical_install.agent_type``, ``.installed_at``.
+    """
+    if not redact:
+        return payload
+
+    process = payload.get("process")
+    if isinstance(process, dict):
+        for k in _PROCESS_SENSITIVE:
+            _redact_field(process, k)
+        _redact_field(process, "args")
+
+    # Drop the entire code block; consumers needing commit info must
+    # use a trusted call path.
+    if payload.get("code") is not None:
+        payload["code"] = None
+
+    install = payload.get("canonical_install")
+    if isinstance(install, dict):
+        for k in _INSTALL_SENSITIVE:
+            _redact_field(install, k)
+        _redact_field(install, "args")
+
+    return payload
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -1505,6 +1709,30 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/services")
     def services():
         return bus.get_services()
+
+    @app.get("/v1/agent/{agent_id}/provenance")
+    def agent_provenance(agent_id: str):
+        # fr_khonliang-bus_aa096048: canonical-vs-ad-hoc registration state
+        # joined against installed_agents.
+        #
+        # **HTTP route is redacted by default.** The bus binds 0.0.0.0 with
+        # no authentication, so any network peer that can reach this port
+        # can read whatever the route returns. Redact-by-default means a
+        # forgotten exposure (or a future Tailscale Funnel rule that adds
+        # 8788 alongside webhooks) doesn't silently leak host/source
+        # metadata — operators must explicitly opt INTO disclosure.
+        #
+        # Local-trusted hosts (the typical khonliang dev environment, per
+        # ``feedback_no_sandboxing_in_local_trusted_env``) opt in by
+        # setting ``provenance_disclose_full: true`` in the bus config.
+        # The in-process call site (``BusServer.get_agent_provenance``)
+        # always supports unredacted output via the ``redact_sensitive``
+        # kwarg, so callers reaching the bus over IPC / shared memory
+        # / same-process imports remain unaffected.
+        disclose_full = bool(bus.config.get("provenance_disclose_full", False))
+        return bus.get_agent_provenance(
+            agent_id, redact_sensitive=not disclose_full,
+        )
 
     # -- request/reply --
 

@@ -174,6 +174,55 @@ class BusMCPAdapter:
             return "=== AGENTS ===\n" + "\n".join(lines)
 
         @mcp.tool()
+        async def bus_agent_provenance(agent_id: str) -> str:
+            """Show what process is serving ``agent_id`` and whether it matches
+            the canonical install.
+
+            Surfaces the canonical-vs-ad-hoc distinction
+            (``fr_khonliang-bus_aa096048``). Reads the runtime registration
+            (carrying bus-lib's launch_spec / launch_info handshake) and
+            joins it against ``installed_agents``.
+
+            Returns one of four registration_type values:
+              - ``canonical``: launch_spec matches installed_agents exactly.
+              - ``adhoc``: launch_spec diverges (different cwd, config, args,
+                or executable) — e.g. a dev-launched process serving a
+                production agent_id.
+              - ``unknown``: agent registered but pre-PR#24 bus-lib — can't
+                compare.
+              - ``none``: agent is not currently registered.
+            """
+            p = adapter._get(f"/v1/agent/{agent_id}/provenance")
+            lines = [f"agent: {p['agent_id']}", f"registration_type: {p['registration_type']}"]
+            if p.get("match") is not None:
+                lines.append(f"match: {p['match']}")
+            proc = p.get("process") or {}
+            if proc:
+                lines.append(
+                    f"process: pid={proc.get('pid')} "
+                    f"exec={proc.get('executable')} "
+                    f"cwd={proc.get('cwd')}"
+                )
+            code = p.get("code") or {}
+            if code:
+                commit = (code.get("commit_sha") or "")[:8] or "?"
+                dirty_marker = "*" if code.get("dirty") else ""
+                lines.append(
+                    f"code: {commit}{dirty_marker} on {code.get('branch') or '?'}"
+                )
+            canonical = p.get("canonical_install")
+            if canonical:
+                lines.append(
+                    f"canonical: {canonical.get('command')} "
+                    f"@ {canonical.get('cwd')}"
+                )
+            else:
+                lines.append("canonical: (not installed)")
+            for note in p.get("notes", []):
+                lines.append(f"note: {note}")
+            return "\n".join(lines)
+
+        @mcp.tool()
         async def bus_status() -> str:
             """Platform status: agent counts, skill counts, flow availability."""
             s = adapter._get("/v1/status")
