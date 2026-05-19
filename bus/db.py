@@ -196,6 +196,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_producer ON artifacts(producer, created_at);
+-- Partial expression index that backs ArtifactStore._find_cached_distillation.
+-- Without it, the JSON-extract predicates degrade to a scan over the
+-- distillation set, which grows unbounded for forever-TTL entries.
+CREATE INDEX IF NOT EXISTS idx_artifacts_distillation_cache
+    ON artifacts (
+        json_extract(source_artifacts, '$[0]'),
+        json_extract(metadata, '$.mode'),
+        json_extract(metadata, '$.purpose'),
+        json_extract(metadata, '$.max_chars'),
+        json_extract(metadata, '$.distiller_version')
+    )
+    WHERE kind = 'distillation' AND producer = 'bus';
 """
 
 

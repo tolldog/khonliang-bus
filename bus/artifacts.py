@@ -20,6 +20,10 @@ from bus.db import BusDB, _row_to_dict
 _TTL_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 _DISTILLER_VERSION = "v1"
 _DISTILLATION_PRODUCER = "bus"
+_DISTILLATION_KIND = "distillation"
+# One year. Larger values are pointless against artifact GC and would push
+# `now + seconds` toward `datetime.max`, where `timedelta` can overflow.
+_MAX_CACHE_TTL_SECONDS = 365 * 24 * 3600
 
 
 def _now_iso() -> str:
@@ -30,10 +34,14 @@ def _ttl_iso_from_seconds(seconds: int | None) -> str | None:
     """Return an ISO-8601 UTC timestamp ``seconds`` from now, or None.
 
     Used by ``ArtifactStore.distill`` to set the expiry on cache entries.
-    Microsecond precision is preserved so sub-second TTLs do not round
-    down and shorten the requested duration. Lexicographic comparison of
-    this fixed-width format matches chronological order, so SQLite TEXT
-    comparison is a valid expiry filter without parsing.
+    ``cache_ttl_seconds`` is an integer-second duration; microsecond
+    precision in the stored format is about the lookup compare, not the
+    input: it prevents ``ttl`` and ``_now_iso()`` from both rounding to
+    the same second boundary right at the expiry instant (which would
+    flip the entry to "expired" one second early under ``ttl > now``).
+    Lexicographic comparison of this fixed-width format matches
+    chronological order, so SQLite TEXT comparison is a valid expiry
+    filter without parsing.
     """
     if seconds is None:
         return None
@@ -81,7 +89,45 @@ class ArtifactStore:
         Content is currently stored in SQLite. The API intentionally exposes
         only bounded retrieval helpers so the backend can move to filesystem
         blobs later without changing callers.
+
+        ``kind='distillation'`` is reserved for the internal
+        ``distill`` / ``distill_many`` paths so a generic caller cannot
+        plant a row that would later satisfy the cache-hit lookup.
         """
+        if kind == _DISTILLATION_KIND:
+            raise ValueError(
+                f"kind={_DISTILLATION_KIND!r} is reserved; use distill() / distill_many()"
+            )
+        return self._create(
+            kind=kind,
+            title=title,
+            content=content,
+            producer=producer,
+            session_id=session_id,
+            trace_id=trace_id,
+            content_type=content_type,
+            metadata=metadata,
+            source_artifacts=source_artifacts,
+            artifact_id=artifact_id,
+            ttl=ttl,
+        )
+
+    def _create(
+        self,
+        *,
+        kind: str,
+        title: str,
+        content: str,
+        producer: str = "",
+        session_id: str = "",
+        trace_id: str = "",
+        content_type: str = "text/plain",
+        metadata: dict[str, Any] | None = None,
+        source_artifacts: list[str] | None = None,
+        artifact_id: str = "",
+        ttl: str | None = None,
+    ) -> dict[str, Any]:
+        """Internal create — bypasses the public-kind guard. Use ``create()`` externally."""
         if not kind:
             raise ValueError("kind is required")
         if not title:
@@ -275,9 +321,12 @@ class ArtifactStore:
         ISO-8601 UTC ``ttl`` ``cache_ttl_seconds`` from now; cache lookup
         skips entries whose ``ttl`` is past.
         """
-        if cache_ttl_seconds is not None and cache_ttl_seconds <= 0:
+        if cache_ttl_seconds is not None and (
+            cache_ttl_seconds <= 0 or cache_ttl_seconds > _MAX_CACHE_TTL_SECONDS
+        ):
             raise ValueError(
-                "cache_ttl_seconds must be a positive integer or None"
+                "cache_ttl_seconds must be a positive integer "
+                f"<= {_MAX_CACHE_TTL_SECONDS} (1 year), or None"
             )
         source = self.metadata(artifact_id)
         if source is None:
@@ -296,8 +345,8 @@ class ArtifactStore:
 
         content = self._content(artifact_id)
         digest = _distill_text(content, mode=mode, purpose=purpose, max_chars=max_chars)
-        distilled = self.create(
-            kind="distillation",
+        distilled = self._create(
+            kind=_DISTILLATION_KIND,
             title=f"Distillation of {source['title']}",
             content=digest,
             producer=_DISTILLATION_PRODUCER,
@@ -385,11 +434,11 @@ class ArtifactStore:
             )
             sections.append(f"# {meta['title']} ({aid})\n{text}")
         digest = _bound_text("\n\n".join(sections), max_chars, truncated=False).text
-        distilled = self.create(
-            kind="distillation",
+        distilled = self._create(
+            kind=_DISTILLATION_KIND,
             title="Distillation of multiple artifacts",
             content=digest,
-            producer="bus",
+            producer=_DISTILLATION_PRODUCER,
             content_type="text/plain",
             metadata={"purpose": purpose, "source_count": len(artifact_ids)},
             source_artifacts=artifact_ids,

@@ -184,7 +184,9 @@ def test_artifact_distill_sets_ttl_when_cache_ttl_seconds_given(db):
     result = store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=3600)
     ttl = result["distilled_artifact"]["ttl"]
     assert ttl is not None
-    # Microsecond precision so sub-second TTLs cannot round down and shorten the requested duration.
+    # Microsecond precision in the stored value avoids ttl/now both rounding
+    # to the same second boundary at the expiry instant (which would flip the
+    # entry to "expired" one second early under `ttl > now`).
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", ttl)
 
 
@@ -211,7 +213,7 @@ def test_artifact_distill_rejects_non_positive_cache_ttl(db):
     source = store.create(kind="log", title="log", content="line a\nline b")
 
     for bad in (0, -1, -3600):
-        with pytest.raises(ValueError, match="positive integer or None"):
+        with pytest.raises(ValueError, match="positive integer"):
             store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=bad)
 
 
@@ -227,16 +229,24 @@ def test_artifact_distill_cache_ignores_multi_source_distillations(db):
     assert single["distilled_artifact"]["source_artifacts"] == [a["id"]]
 
 
+def test_artifact_create_rejects_reserved_distillation_kind(db):
+    """Public create() must refuse `kind='distillation'` so the cache key cannot be spoofed."""
+    store = ArtifactStore(db)
+    with pytest.raises(ValueError, match="reserved"):
+        store.create(kind="distillation", title="planted", content="x")
+
+
 def test_artifact_distill_cache_ignores_non_bus_producer(db):
-    """A `kind='distillation'` row planted via generic `create()` must not poison the cache."""
+    """Defense-in-depth: even rows planted via the internal path with a foreign producer must be skipped."""
     store = ArtifactStore(db)
     source = store.create(kind="log", title="log", content="real source content")
 
-    # Plant a spoofed distillation row directly via create() — default producer is "".
-    spoofed = store.create(
+    # Bypass the public-kind gate to plant a foreign-producer distillation row.
+    spoofed = store._create(
         kind="distillation",
         title="Distillation of log",
         content="ATTACKER-CONTROLLED DIGEST",
+        producer="not-bus",
         metadata={
             "mode": "brief",
             "purpose": "p",
@@ -249,7 +259,6 @@ def test_artifact_distill_cache_ignores_non_bus_producer(db):
 
     result = store.distill(source["id"], purpose="p", max_chars=200)
 
-    # The spoofed row must be skipped and a real distillation produced instead.
     assert result["distilled_artifact"]["id"] != spoofed["id"]
     assert "ATTACKER-CONTROLLED DIGEST" not in result["digest"]
 
@@ -273,6 +282,17 @@ def test_artifact_distill_cache_ignores_older_distiller_version(db):
     second = store.distill(source["id"], purpose="p", max_chars=200)
 
     assert second["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
+
+
+def test_artifact_distill_rejects_cache_ttl_above_upper_bound(db):
+    """cache_ttl_seconds above the upper bound must be rejected before timedelta overflow."""
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    # One year + 1 second is over the cap.
+    too_long = 365 * 24 * 3600 + 1
+    with pytest.raises(ValueError, match="1 year"):
+        store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=too_long)
 
 
 def test_artifact_content_size_limit(db):
