@@ -4,9 +4,13 @@ catalog.
 Covers:
 - ``BusDB`` upsert / get / list of welcome blobs.
 - Welcome survives deregister (separate table from ``registrations``).
-- HTTP and WS register paths persist welcome alongside the registration.
+- HTTP register path persists welcome alongside the registration.
+- WS register path persists welcome too — coverage in
+  ``tests/test_agent_ws.py::test_ws_register_persists_welcome``.
 - HTTP ``GET /v1/agents/{id}/welcome``, ``POST .../welcome``,
   ``GET /v1/agents/welcomes`` endpoints.
+- ``MAX_WELCOME_BYTES`` size cap enforced at the DB layer and surfaced
+  as 413 on the POST endpoint / silently logged on register paths.
 
 The bus-lib side (BaseAgent forwarding welcome on register) is tested in
 ``khonliang-bus-lib/tests/test_agent.py`` + ``test_connector.py``.
@@ -178,11 +182,57 @@ def test_post_welcome_endpoint_persists(client):
 
 
 def test_post_welcome_endpoint_rejects_non_object(client):
-    """The wire shape is a JSON object; lists / strings / numbers rejected."""
-    # FastAPI's json body parser accepts any JSON; reject non-dict explicitly.
+    """The wire shape is a JSON object; lists / strings / numbers rejected.
+
+    The ``payload: dict[str, Any]`` annotation on the handler is the
+    schema FastAPI/Pydantic enforces, so 422 is the canonical response —
+    we don't need to (and don't) add a redundant isinstance check.
+    """
     r = client.post("/v1/agents/x/welcome", json=["not", "an", "object"])
-    # FastAPI may return 422 (Pydantic validator) or 400 (our explicit check).
-    assert r.status_code in (400, 422)
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Size cap (Copilot R1 #4: prevent DB bloat / memory pressure from a
+# misconfigured agent publishing a multi-megabyte welcome blob).
+# ---------------------------------------------------------------------------
+
+
+def test_set_agent_welcome_rejects_oversized_blob(db):
+    """A welcome blob exceeding MAX_WELCOME_BYTES raises ValueError at the
+    DB layer; callers decide how to surface (silent skip on register
+    paths, 413 on the POST endpoint).
+    """
+    # Build a payload whose JSON exceeds the cap by ~1 KB so the test is
+    # not flaky against future tweaks to MAX_WELCOME_BYTES.
+    oversized = {"agent_id": "x", "padding": "x" * (db.MAX_WELCOME_BYTES + 1024)}
+    with pytest.raises(ValueError, match="refusing to persist"):
+        db.set_agent_welcome("x-primary", oversized)
+
+
+def test_post_welcome_endpoint_returns_413_for_oversized(client, db):
+    oversized = {"agent_id": "x", "padding": "x" * (db.MAX_WELCOME_BYTES + 1024)}
+    r = client.post("/v1/agents/oversized-agent/welcome", json=oversized)
+    assert r.status_code == 413
+    assert "refusing to persist" in r.json()["detail"]
+
+
+def test_http_register_with_oversized_welcome_still_registers(client, db):
+    """Parity with WS path: oversized welcome from one agent must not block
+    the entire registration. The welcome is logged + skipped; the agent
+    is still registered and callable.
+    """
+    oversized = {"agent_id": "x", "padding": "x" * (db.MAX_WELCOME_BYTES + 1024)}
+    r = client.post("/v1/register", json={
+        "id": "big-welcome-agent",
+        "callback": "http://localhost:9000",
+        "pid": 1, "version": "0.1.0", "skills": [],
+        "welcome": oversized,
+    })
+    # Register still succeeds.
+    assert r.status_code == 200
+    # But no welcome got stored.
+    assert client.get("/v1/agents/big-welcome-agent/welcome").status_code == 404
 
 
 def test_post_welcome_endpoint_overwrites_existing(client, db):

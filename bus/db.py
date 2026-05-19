@@ -311,26 +311,54 @@ class BusDB:
     # the bus_welcome super-skill consume this catalog even after the
     # agent process exits.
 
+    #: Maximum serialized size (bytes) we'll persist for a welcome blob.
+    #: Welcomes are bounded editorial — typical real-world payloads from
+    #: the 7 khonliang agents are well under 16 KB. The 256 KB ceiling
+    #: leaves substantial headroom for richer future content while
+    #: preventing a single misconfigured agent from bloating the welcomes
+    #: table (or pinning bus memory) with multi-megabyte payloads.
+    #: Closes Copilot R1 #4 on PR #37.
+    MAX_WELCOME_BYTES = 256 * 1024
+
     def set_agent_welcome(self, agent_id: str, welcome: dict[str, Any]) -> None:
         """Upsert an agent's welcome blob. Most-recent-wins on re-register
-        — no version history kept (out of scope for v1)."""
+        — no version history kept (out of scope for v1).
+
+        Raises:
+            ValueError: if the serialized welcome exceeds
+                :attr:`MAX_WELCOME_BYTES`. Caller is responsible for
+                logging and either rejecting the request (POST endpoint)
+                or skipping persistence (WS / HTTP register paths, where
+                an oversized welcome from one agent must not block
+                registration of others).
+        """
+        encoded = json.dumps(welcome)
+        encoded_len = len(encoded.encode("utf-8"))
+        if encoded_len > self.MAX_WELCOME_BYTES:
+            raise ValueError(
+                f"welcome for agent_id={agent_id!r} is {encoded_len} bytes "
+                f"(max {self.MAX_WELCOME_BYTES}); refusing to persist"
+            )
         with self.conn() as c:
             c.execute(
                 "INSERT INTO welcomes (agent_id, welcome, updated_at) "
                 "VALUES (?, ?, datetime('now')) "
                 "ON CONFLICT(agent_id) DO UPDATE SET "
                 "welcome = excluded.welcome, updated_at = excluded.updated_at",
-                (agent_id, json.dumps(welcome)),
+                (agent_id, encoded),
             )
 
     def get_agent_welcome(self, agent_id: str) -> dict[str, Any] | None:
-        """Return the persisted welcome (parsed dict) plus the updated_at
-        timestamp, or ``None`` if no welcome has ever been published for
-        this agent_id.
+        """Return the persisted welcome plus the updated_at timestamp,
+        or ``None`` if no welcome has ever been published for this agent_id.
 
-        Shape: ``{welcome: dict, updated_at: str}`` — keeps the wrapping
-        explicit so future fields (e.g. content_hash, content_type) can be
-        added without breaking callers that assumed a bare blob.
+        Shape: ``{welcome: dict | None, updated_at: str}`` — the wrapping
+        is explicit so future fields (e.g. content_hash, content_type)
+        can be added without breaking callers that assumed a bare blob.
+        ``welcome`` is ``None`` if the stored row contains malformed JSON
+        (defensive, exercised by ``test_welcome_with_corrupt_json_returns_none``);
+        callers should treat that case as "row exists but content is
+        unusable" rather than "no row".
         """
         with self.conn() as c:
             r = c.execute(

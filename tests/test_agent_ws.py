@@ -251,3 +251,82 @@ def test_agent_ws_async_request_creates_result_artifact(tmp_path):
             payload = json.loads(content["text"])
             assert payload["status"] == "ok"
             assert payload["result"] == {"echoed": {"msg": "hello"}}
+
+def test_ws_register_persists_welcome(client):
+    """fr_khonliang-bus_f96722dd: WS register path must persist welcome
+    alongside the registration — parity with the HTTP path. Without this
+    coverage, a regression that only broke WS-side persistence would
+    slip through (no other test exercises that code path).
+    """
+    welcome = {
+        "agent_id": "ws-welcomed",
+        "agent_type": "researcher",
+        "version": "0.1.0",
+        "role": "test fixture",
+        "skill_count": 1,
+    }
+    with client.websocket_connect("/v1/agent") as ws:
+        ws.send_json({
+            "type": "register",
+            "id": "ws-welcomed",
+            "agent_type": "researcher",
+            "version": "0.1.0",
+            "pid": 4242,
+            "skills": [{"name": "find", "description": "d"}],
+            "welcome": welcome,
+        })
+        ws.receive_json()  # registered
+
+    # After disconnect: welcome still retrievable (survives-deregister
+    # invariant), agent removed from services.
+    body = client.get("/v1/agents/ws-welcomed/welcome").json()
+    assert body["welcome"] == welcome
+
+
+def test_ws_register_without_welcome_stores_nothing(client):
+    """Backward compat: pre-PR#25 bus-lib agents on the WS path omit
+    welcome — bus stores nothing; GET returns 404."""
+    with client.websocket_connect("/v1/agent") as ws:
+        ws.send_json({
+            "type": "register",
+            "id": "ws-legacy",
+            "skills": [],
+        })
+        ws.receive_json()
+    assert client.get("/v1/agents/ws-legacy/welcome").status_code == 404
+
+
+def test_ws_register_ignores_non_dict_welcome(client):
+    """Defensive: a WS client sending a non-dict welcome (string, list,
+    int, ...) must not break registration. Bus silently ignores the field;
+    register succeeds; GET returns 404."""
+    with client.websocket_connect("/v1/agent") as ws:
+        ws.send_json({
+            "type": "register",
+            "id": "ws-bad-welcome",
+            "skills": [],
+            "welcome": "not a dict",
+        })
+        ws.receive_json()
+    assert client.get("/v1/agents/ws-bad-welcome/welcome").status_code == 404
+
+
+def test_ws_register_oversized_welcome_still_registers(client, db):
+    """Parity with HTTP path: oversized welcome from one agent must not
+    block its registration. The welcome is logged + skipped; the agent
+    appears in services + skills (with the registration intact); only the
+    welcome catalog is empty for that agent."""
+    oversized = {"agent_id": "x", "padding": "x" * (db.MAX_WELCOME_BYTES + 1024)}
+    with client.websocket_connect("/v1/agent") as ws:
+        ws.send_json({
+            "type": "register",
+            "id": "ws-big-welcome",
+            "skills": [{"name": "do_thing"}],
+            "welcome": oversized,
+        })
+        ws.receive_json()  # registered — not blocked
+        services = client.get("/v1/services").json()
+        assert any(s["id"] == "ws-big-welcome" for s in services)
+    # But the welcome got dropped.
+    assert client.get("/v1/agents/ws-big-welcome/welcome").status_code == 404
+

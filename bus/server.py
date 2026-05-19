@@ -588,9 +588,17 @@ class BusServer:
         )
         # Persist welcome (survives-deregister) so the bus_welcome super-skill
         # and GET /v1/agents/<id>/welcome work after the agent process exits.
-        # fr_khonliang-bus_f96722dd.
+        # fr_khonliang-bus_f96722dd. An oversized welcome must not break the
+        # HTTP register response — log and proceed without it (parity with
+        # the WS path).
         if req.welcome is not None:
-            self.db.set_agent_welcome(req.id, req.welcome)
+            try:
+                self.db.set_agent_welcome(req.id, req.welcome)
+            except ValueError as e:
+                logger.warning(
+                    "Welcome rejected during HTTP register for %s: %s",
+                    req.id, e,
+                )
         logger.info("Registered agent %s at %s (pid=%d, %d skills)", req.id, req.callback, req.pid, len(req.skills))
         # Notify subscribers of registry change
         await self._publish_event("bus.registry_changed", {"agent_id": req.id, "action": "registered"})
@@ -1572,9 +1580,20 @@ class BusServer:
                     # after the agent process exits.
                     # fr_khonliang-bus_f96722dd. Only ``dict`` is honored —
                     # ignore stray non-dict shapes a future client might send.
+                    # An oversized welcome from one agent must not block
+                    # registration of others, so size-limit failures are
+                    # logged and the registration proceeds without the
+                    # welcome (the agent stays callable; its welcome can
+                    # be retried via POST /v1/agents/<id>/welcome).
                     welcome = data.get("welcome")
                     if isinstance(welcome, dict):
-                        self.db.set_agent_welcome(agent_id, welcome)
+                        try:
+                            self.db.set_agent_welcome(agent_id, welcome)
+                        except ValueError as e:
+                            logger.warning(
+                                "Welcome rejected during WS register for %s: %s",
+                                agent_id, e,
+                            )
                     await ws.send_json({"type": "registered", "id": agent_id})
                     logger.info("Agent %s connected via WebSocket (%d skills)", agent_id, len(data.get("skills", [])))
                     await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "registered"})
@@ -1991,9 +2010,16 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         # (fr_khonliang-bus_f96722dd "POST /v1/agents/<id>/welcome").
         # Accepts a JSON dict; persists it as the agent's welcome. Idempotent:
         # the same payload posted twice yields one row (most-recent-wins).
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="welcome must be a JSON object")
-        bus.db.set_agent_welcome(agent_id, payload)
+        #
+        # FastAPI's pydantic-based body parsing already returns 422 for
+        # non-object JSON bodies (the ``payload: dict[str, Any]`` annotation
+        # is the schema). The only validation we still own is the size cap:
+        # explicit 413 for oversized welcomes, since a bus client may want
+        # to distinguish "rejected for size" from generic 422.
+        try:
+            bus.db.set_agent_welcome(agent_id, payload)
+        except ValueError as e:
+            raise HTTPException(status_code=413, detail=str(e))
         return {"agent_id": agent_id, "status": "stored"}
 
     @app.get("/v1/agents/welcomes")
