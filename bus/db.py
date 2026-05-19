@@ -324,6 +324,15 @@ class BusDB:
         """Upsert an agent's welcome blob. Most-recent-wins on re-register
         — no version history kept (out of scope for v1).
 
+        The persisted blob is normalized to ``welcome["agent_id"] = agent_id``
+        before serialization, so the stored content is always self-consistent
+        with the primary key. If the caller passed a dict with a different
+        ``agent_id`` inside (e.g. a misrouted POST from an operator override,
+        or an agent self-publishing under one id but claiming another in its
+        own welcome dict), we log a warning and overwrite. Closes Copilot PR
+        #37 R2 — downstream fleet catalogs / cold-start LLMs can rely on
+        ``stored_welcome["agent_id"] == row.agent_id``.
+
         Raises:
             ValueError: if the serialized welcome exceeds
                 :attr:`MAX_WELCOME_BYTES`. Caller is responsible for
@@ -332,6 +341,16 @@ class BusDB:
                 an oversized welcome from one agent must not block
                 registration of others).
         """
+        # Normalize agent_id inside the welcome to match the primary key.
+        # Copy first so we don't mutate the caller's dict.
+        if welcome.get("agent_id") != agent_id:
+            if "agent_id" in welcome:
+                logger.warning(
+                    "Welcome for agent_id=%r contained inconsistent "
+                    "agent_id=%r; overwriting to match storage key.",
+                    agent_id, welcome.get("agent_id"),
+                )
+            welcome = {**welcome, "agent_id": agent_id}
         encoded = json.dumps(welcome)
         encoded_len = len(encoded.encode("utf-8"))
         if encoded_len > self.MAX_WELCOME_BYTES:

@@ -217,6 +217,67 @@ def test_post_welcome_endpoint_returns_413_for_oversized(client, db):
     assert "refusing to persist" in r.json()["detail"]
 
 
+def test_set_welcome_normalizes_agent_id_when_inconsistent(db, caplog):
+    """Copilot PR #37 R2: if the welcome dict's internal ``agent_id`` differs
+    from the storage key, the persisted blob is overwritten to match.
+    Downstream consumers (fleet catalog, cold-start LLM) can rely on
+    ``stored_welcome["agent_id"] == row.agent_id`` without cross-checking.
+    """
+    import logging
+
+    inconsistent = {
+        "agent_id": "wrong-id",  # disagrees with the storage key below
+        "role": "test",
+    }
+    with caplog.at_level(logging.WARNING, logger="bus.db"):
+        db.set_agent_welcome("real-id", inconsistent)
+    record = db.get_agent_welcome("real-id")
+    # Persisted blob is self-consistent with the storage key.
+    assert record["welcome"]["agent_id"] == "real-id"
+    # Other fields preserved.
+    assert record["welcome"]["role"] == "test"
+    # And the warning fired so operators see the divergence.
+    assert any(
+        "inconsistent agent_id" in r.message and "wrong-id" in r.message
+        for r in caplog.records
+    )
+
+
+def test_set_welcome_fills_missing_agent_id(db, caplog):
+    """Welcome blob without an ``agent_id`` field gets one added — no warning
+    since the caller wasn't *contradicting* the key, just not specifying it.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="bus.db"):
+        db.set_agent_welcome("filled-id", {"role": "test"})
+    record = db.get_agent_welcome("filled-id")
+    assert record["welcome"]["agent_id"] == "filled-id"
+    # No warning when the caller omitted agent_id (vs. supplied a wrong one).
+    assert not any(
+        "inconsistent agent_id" in r.message for r in caplog.records
+    )
+
+
+def test_set_welcome_does_not_warn_when_agent_id_matches(db, caplog):
+    """No spurious log when the caller correctly set agent_id themselves."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="bus.db"):
+        db.set_agent_welcome("consistent-id", {"agent_id": "consistent-id", "role": "test"})
+    assert not any("inconsistent agent_id" in r.message for r in caplog.records)
+
+
+def test_set_welcome_does_not_mutate_caller_dict(db):
+    """The normalization must not mutate the caller's dict — they may
+    still need the original for logging / retry / observability.
+    """
+    original = {"agent_id": "wrong-id", "role": "test"}
+    snapshot = dict(original)
+    db.set_agent_welcome("real-id", original)
+    assert original == snapshot, "set_agent_welcome mutated caller's dict"
+
+
 def test_http_register_with_oversized_welcome_still_registers(client, db):
     """Parity with WS path: oversized welcome from one agent must not block
     the entire registration. The welcome is logged + skipped; the agent
@@ -236,11 +297,16 @@ def test_http_register_with_oversized_welcome_still_registers(client, db):
 
 
 def test_post_welcome_endpoint_overwrites_existing(client, db):
-    """POST is idempotent; second post replaces."""
+    """POST is idempotent; second post replaces.
+
+    Note: per R2 self-consistency normalization, the stored welcome
+    always carries ``agent_id`` matching the storage key, even if the
+    caller omitted it from the body.
+    """
     db.set_agent_welcome("x-primary", _sample_welcome())
     client.post("/v1/agents/x-primary/welcome", json={"role": "REPLACED"})
     body = client.get("/v1/agents/x-primary/welcome").json()
-    assert body["welcome"] == {"role": "REPLACED"}
+    assert body["welcome"] == {"agent_id": "x-primary", "role": "REPLACED"}
 
 
 # ---------------------------------------------------------------------------
