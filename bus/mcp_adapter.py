@@ -160,17 +160,32 @@ class BusMCPAdapter:
 
         @mcp.tool()
         async def bus_services() -> str:
-            """List all registered agents with their skills and status."""
+            """List all registered agents with their skills and status.
+
+            Also surfaces ``autostart_failed`` entries — agents installed in
+            the bus catalog but whose autostart attempt failed at boot
+            (per fr_khonliang-bus_fc904c3e). These rows carry an
+            ``autostart_error`` field with the failure reason.
+            """
             services = adapter._get("/v1/services")
             if not services:
                 return "no agents registered"
             lines = []
             for svc in services:
-                status = "✓" if svc["status"] == "healthy" else "✗"
-                lines.append(
-                    f"  {status} {svc['id']} (v{svc.get('version', '?')}, "
-                    f"{svc['skill_count']} skills)"
+                status_str = svc.get("status", "unknown")
+                if status_str == "healthy":
+                    marker = "✓"
+                elif status_str == "autostart_failed":
+                    marker = "⚠"
+                else:
+                    marker = "✗"
+                line = (
+                    f"  {marker} {svc['id']} (v{svc.get('version', '?') or '?'}, "
+                    f"{svc.get('skill_count', 0)} skills)"
                 )
+                if status_str == "autostart_failed":
+                    line += f" [autostart_failed: {svc.get('autostart_error', '')}]"
+                lines.append(line)
             return "=== AGENTS ===\n" + "\n".join(lines)
 
         @mcp.tool()

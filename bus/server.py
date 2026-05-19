@@ -236,6 +236,9 @@ class BusServer:
         self.db = db
         self.config = config or {}
         self._processes: dict[str, subprocess.Popen] = {}  # agent_id → process
+        # agent_id → error message; populated by autostart_installed_agents()
+        # on bus boot. Reset on each bus restart (runtime-only, not persisted).
+        self._autostart_failures: dict[str, str] = {}
         self._http = httpx.AsyncClient(timeout=30.0)
         self._subscribers: dict[str, list[WebSocket]] = {}  # topic → websockets
         self._agent_connections: dict[str, WebSocket] = {}  # agent_id → WebSocket
@@ -292,6 +295,66 @@ class BusServer:
             logger.info("Reconciled agent %s on boot (pid=%s not alive)", reg["id"], pid)
         logger.info("Boot reconciliation: pids_reaped=%d kept=%d", pids_reaped, kept)
         return {"pids_reaped": pids_reaped, "kept": kept}
+
+    def autostart_installed_agents(self) -> dict:
+        """Walk ``installed_agents`` and launch each via :meth:`start_agent`.
+
+        Called from the FastAPI lifespan after :meth:`reconcile_on_boot` —
+        bus is listening and the registrations table is clean, so each
+        ``start_agent`` call gets a fair shot.
+
+        Failure of any one agent's launch does NOT abort the loop. Errors
+        are accumulated in ``self._autostart_failures`` and surfaced on the
+        ``/v1/services`` response so an operator inspecting the running
+        platform sees what didn't come up. The dict resets on each bus
+        restart (runtime state only, not persisted) so a transient failure
+        doesn't permanently stigmatize an agent across restarts.
+
+        Idempotent across bus restarts: :meth:`start_agent` returns
+        ``already_running`` for any registration the boot-time reconciliation
+        kept (none, by construction — boot reconciliation clears the
+        registration table — but the guard means a partial pre-boot crash
+        can't double-launch on the next pass).
+
+        See fr_khonliang-bus_fc904c3e. v1 source-of-truth is the
+        ``installed_agents`` table itself; YAML-config allowlist /
+        autostart-disable-per-agent is a follow-up FR. Lazy-eligible
+        agents (sibling FR fr_khonliang-bus_c81f7ab5) will opt out via
+        the same future config when that lands.
+        """
+        self._autostart_failures.clear()
+        started: list[str] = []
+        skipped: list[str] = []
+        for installed in self.db.get_installed_agents():
+            agent_id = installed["id"]
+            try:
+                result = self.start_agent(agent_id)
+            except Exception as e:
+                self._autostart_failures[agent_id] = str(e)
+                logger.warning("autostart: %s raised %s", agent_id, e)
+                continue
+            status = result.get("status")
+            if status == "started":
+                started.append(agent_id)
+                logger.info("autostart: %s started (pid=%s)", agent_id, result.get("pid"))
+            elif status == "already_running":
+                skipped.append(agent_id)
+            else:
+                # ``start_agent`` returns ``{error: ...}`` on launch failure
+                # (subprocess.Popen exception) or ``{error: 'not installed'}``
+                # — neither has ``status == 'started'``.
+                err = result.get("error", f"unexpected start_agent result: {result!r}")
+                self._autostart_failures[agent_id] = err
+                logger.warning("autostart: %s failed — %s", agent_id, err)
+        logger.info(
+            "Autostart complete: started=%d skipped=%d failed=%d",
+            len(started), len(skipped), len(self._autostart_failures),
+        )
+        return {
+            "started": started,
+            "skipped": skipped,
+            "failed": dict(self._autostart_failures),
+        }
 
     async def diagnose(self, agent_id: str, detail: str = "brief") -> dict:
         """Probe an agent across multiple failure axes.
@@ -1042,6 +1105,7 @@ class BusServer:
 
     def get_services(self) -> list[dict]:
         regs = self.db.get_registrations()
+        registered_ids = {reg["id"] for reg in regs}
         result = []
         for reg in regs:
             skills = self.db.get_skills(reg["id"])
@@ -1054,6 +1118,26 @@ class BusServer:
                 "pid": reg["pid"],
                 "skill_count": len(skills),
                 "skills": [s["name"] for s in skills],
+            })
+        # Surface autostart failures alongside live registrations so the
+        # services list reflects the FULL post-boot picture, not just the
+        # successes. Skip any agent that DID end up registered (a retry
+        # after autostart succeeded — the live entry is canonical).
+        # Per fr_khonliang-bus_fc904c3e acceptance #3.
+        for agent_id, error in self._autostart_failures.items():
+            if agent_id in registered_ids:
+                continue
+            installed = self.db.get_installed_agent(agent_id)
+            result.append({
+                "id": agent_id,
+                "agent_type": (installed or {}).get("agent_type", "unknown"),
+                "status": "autostart_failed",
+                "version": "",
+                "callback_url": "",
+                "pid": None,
+                "skill_count": 0,
+                "skills": [],
+                "autostart_error": error,
             })
         return result
 
@@ -1806,6 +1890,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @asynccontextmanager
     async def lifespan(app):
         bus.reconcile_on_boot()
+        bus.autostart_installed_agents()
         yield
         await bus.shutdown()
 
