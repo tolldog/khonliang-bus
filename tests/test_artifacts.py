@@ -284,6 +284,27 @@ def test_artifact_distill_cache_ignores_older_distiller_version(db):
     assert second["distilled_artifact"]["id"] != first["distilled_artifact"]["id"]
 
 
+def test_artifact_distill_cache_hit_does_not_retroactively_apply_caller_ttl(db):
+    """Cache hits return the existing entry; caller's cache_ttl_seconds applies on creation only.
+
+    This is documented, intentional behavior: a deterministic distillation
+    is just as valid whether stored with no TTL or a 60s TTL. Callers that
+    need a guaranteed-fresh artifact (or their own TTL on the stored row)
+    must pass cache=False.
+    """
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="line a\nline b")
+
+    # First call stores a forever-cached entry (no TTL).
+    forever = store.distill(source["id"], purpose="p", max_chars=200)
+    assert forever["distilled_artifact"]["ttl"] is None
+
+    # Second call passes a tight TTL but should still return the same forever entry.
+    second = store.distill(source["id"], purpose="p", max_chars=200, cache_ttl_seconds=60)
+    assert second["distilled_artifact"]["id"] == forever["distilled_artifact"]["id"]
+    assert second["distilled_artifact"]["ttl"] is None  # original TTL preserved
+
+
 def test_artifact_distill_rejects_cache_ttl_above_upper_bound(db):
     """cache_ttl_seconds above the upper bound must be rejected before timedelta overflow."""
     store = ArtifactStore(db)

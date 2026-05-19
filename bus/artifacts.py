@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,13 @@ _DISTILLATION_KIND = "distillation"
 # One year. Larger values are pointless against artifact GC and would push
 # `now + seconds` toward `datetime.max`, where `timedelta` can overflow.
 _MAX_CACHE_TTL_SECONDS = 365 * 24 * 3600
+
+# Process-wide lock serializing ``ArtifactStore.distill()``'s lookup-then-insert
+# critical section. The bus runs as a single process (see
+# project_bus_service_persistence), so a Python lock is sufficient atomicity:
+# without it, two concurrent distill calls for the same cache key can both miss
+# and both insert, producing duplicate distillation rows.
+_DISTILL_LOCK = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -317,9 +325,19 @@ class ArtifactStore:
         matching, non-expired distillation artifact is returned in place of
         producing a new one. Pass ``cache=False`` to force a fresh artifact.
 
-        When ``cache_ttl_seconds`` is set, the newly created artifact gets an
-        ISO-8601 UTC ``ttl`` ``cache_ttl_seconds`` from now; cache lookup
-        skips entries whose ``ttl`` is past.
+        ``cache_ttl_seconds`` applies **at creation time only**: on a cache
+        miss, the freshly stored artifact's ``ttl`` is set to that many
+        seconds from now. On a cache hit, the existing entry's ``ttl`` is
+        what governs expiry — the caller's ``cache_ttl_seconds`` is *not*
+        retroactively narrowed onto an existing entry. This is intentional:
+        a forever-cached entry is just as valid a result for the caller's
+        deterministic source, so we return it rather than re-compute. If a
+        caller needs a guaranteed-fresh artifact or its own TTL on the
+        stored row, it must pass ``cache=False``.
+
+        The lookup-then-insert critical section is serialized by a
+        process-wide lock so concurrent callers of the same cache key do
+        not both miss and produce duplicate rows.
         """
         if cache_ttl_seconds is not None and (
             cache_ttl_seconds <= 0 or cache_ttl_seconds > _MAX_CACHE_TTL_SECONDS
@@ -332,38 +350,39 @@ class ArtifactStore:
         if source is None:
             raise KeyError(artifact_id)
 
-        if cache:
-            cached = self._find_cached_distillation(
-                artifact_id, mode=mode, purpose=purpose, max_chars=max_chars,
-            )
-            if cached is not None:
-                return {
-                    "source_artifact": artifact_id,
-                    "distilled_artifact": cached,
-                    "digest": self._content(cached["id"]),
-                }
+        with _DISTILL_LOCK:
+            if cache:
+                cached = self._find_cached_distillation(
+                    artifact_id, mode=mode, purpose=purpose, max_chars=max_chars,
+                )
+                if cached is not None:
+                    return {
+                        "source_artifact": artifact_id,
+                        "distilled_artifact": cached,
+                        "digest": self._content(cached["id"]),
+                    }
 
-        content = self._content(artifact_id)
-        digest = _distill_text(content, mode=mode, purpose=purpose, max_chars=max_chars)
-        distilled = self._create(
-            kind=_DISTILLATION_KIND,
-            title=f"Distillation of {source['title']}",
-            content=digest,
-            producer=_DISTILLATION_PRODUCER,
-            session_id=source.get("session_id", ""),
-            trace_id=source.get("trace_id", ""),
-            content_type="text/plain",
-            metadata={
-                "mode": mode,
-                "purpose": purpose,
-                "source_kind": source.get("kind", ""),
-                "max_chars": max_chars,
-                "distiller_version": _DISTILLER_VERSION,
-            },
-            source_artifacts=[artifact_id],
-            ttl=_ttl_iso_from_seconds(cache_ttl_seconds),
-        )
-        return {"source_artifact": artifact_id, "distilled_artifact": distilled, "digest": digest}
+            content = self._content(artifact_id)
+            digest = _distill_text(content, mode=mode, purpose=purpose, max_chars=max_chars)
+            distilled = self._create(
+                kind=_DISTILLATION_KIND,
+                title=f"Distillation of {source['title']}",
+                content=digest,
+                producer=_DISTILLATION_PRODUCER,
+                session_id=source.get("session_id", ""),
+                trace_id=source.get("trace_id", ""),
+                content_type="text/plain",
+                metadata={
+                    "mode": mode,
+                    "purpose": purpose,
+                    "source_kind": source.get("kind", ""),
+                    "max_chars": max_chars,
+                    "distiller_version": _DISTILLER_VERSION,
+                },
+                source_artifacts=[artifact_id],
+                ttl=_ttl_iso_from_seconds(cache_ttl_seconds),
+            )
+            return {"source_artifact": artifact_id, "distilled_artifact": distilled, "digest": digest}
 
     def _find_cached_distillation(
         self,
@@ -378,17 +397,27 @@ class ArtifactStore:
         Filters by ``producer`` and ``distiller_version`` so a row planted via
         a generic ``create()`` call (with default ``producer=""``) or written
         by an older distiller version cannot be returned as a cache hit.
+
+        ``kind`` and ``producer`` are inlined as literals (rather than bound
+        parameters) so the matching predicate is statically recognizable by
+        SQLite's partial-index matcher; otherwise
+        ``idx_artifacts_distillation_cache`` (which is partial on
+        ``kind='distillation' AND producer='bus'``) would not be applied
+        and the lookup would degrade to a scan over distillation rows.
+        ``_DISTILLATION_KIND`` and ``_DISTILLATION_PRODUCER`` are private
+        constants, never caller-supplied, so the f-string interpolation is
+        not an injection surface.
         """
         now_iso = _now_iso()
         with self.db.conn() as c:
             row = c.execute(
-                """
+                f"""
                 SELECT id, kind, title, producer, session_id, trace_id,
                        content_type, size_bytes, sha256, metadata,
                        source_artifacts, created_at, ttl
                 FROM artifacts
-                WHERE kind = 'distillation'
-                  AND producer = ?
+                WHERE kind = '{_DISTILLATION_KIND}'
+                  AND producer = '{_DISTILLATION_PRODUCER}'
                   AND json_extract(source_artifacts, '$[0]') = ?
                   AND json_array_length(source_artifacts) = 1
                   AND json_extract(metadata, '$.mode') = ?
@@ -400,7 +429,6 @@ class ArtifactStore:
                 LIMIT 1
                 """,
                 (
-                    _DISTILLATION_PRODUCER,
                     source_id,
                     mode,
                     purpose,
