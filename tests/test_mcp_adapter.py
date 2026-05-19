@@ -123,18 +123,20 @@ def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
     names = {t.name for t in tools}
-    # 16 bus tools (12 non-artifact + 2 distill + 1 bus_topics +
-    # 1 bus_agent_provenance) + 3 skills + 1 flow = 20. The seven
-    # read-side bus_artifact_* tools were retired with khonliang-store
-    # Phase 4c (`fr_khonliang-bus_9151395d`); ``bus_topics`` was added
-    # to close fr_bus_7b2d41d2; ``bus_agent_provenance`` was added to
-    # close fr_khonliang-bus_aa096048 (Tier 1 visibility).
-    assert len(tools) == 20
+    # 17 bus tools (12 non-artifact + 2 distill + 1 bus_topics +
+    # 1 bus_agent_provenance + 1 bus_diagnose) + 3 skills + 1 flow = 21.
+    # The seven read-side bus_artifact_* tools were retired with
+    # khonliang-store Phase 4c (`fr_khonliang-bus_9151395d`);
+    # ``bus_topics`` closed fr_bus_7b2d41d2; ``bus_agent_provenance``
+    # closes fr_khonliang-bus_aa096048 (Tier 1 visibility);
+    # ``bus_diagnose`` closes fr_khonliang-bus_8fe376c7 (v1, bus-side
+    # fields only).
+    assert len(tools) == 21
     # Spot-check load-bearing names so the aggregate count alone can't
     # mask a rename / replacement (per Copilot R3 on PR #34).
     expected_named = {
         "bus_services", "bus_status", "bus_matrix", "bus_flows",
-        "bus_skills", "bus_topics", "bus_agent_provenance",
+        "bus_skills", "bus_topics", "bus_agent_provenance", "bus_diagnose",
     }
     assert expected_named.issubset(names), (
         f"missing required tool names: {expected_named - names}"
@@ -167,6 +169,29 @@ def test_bus_agent_provenance_tool_present_and_callable(adapter):
     # Schema accepts an agent_id arg (string).
     schema = tool.inputSchema
     assert "agent_id" in schema.get("properties", {})
+
+
+def test_bus_diagnose_tool_present_and_callable(adapter):
+    """``bus_diagnose`` is the user-facing MCP face of
+    fr_khonliang-bus_8fe376c7's v1 primitive (structured per-agent
+    failure-mode probe). Parallel structure to the agent_provenance
+    test so a rename gets caught at the name level, not just the
+    aggregate count."""
+    mcp = adapter.build()
+    tools = asyncio.run(mcp.list_tools())
+    matches = [t for t in tools if t.name == "bus_diagnose"]
+    assert len(matches) == 1, "bus_diagnose not registered"
+    tool = matches[0]
+    assert tool.description, "bus_diagnose is missing a description"
+    desc_lower = tool.description.lower()
+    # Description should mention the core concepts so an LLM caller
+    # knows when to invoke it.
+    assert any(
+        kw in desc_lower for kw in ("crashed", "wedged", "verdict", "diagnose", "probe")
+    ), f"description missing core concept: {tool.description[:200]!r}"
+    schema = tool.inputSchema
+    assert "agent_id" in schema.get("properties", {})
+    assert "detail" in schema.get("properties", {})
 
 
 def test_bus_services_tool(adapter):

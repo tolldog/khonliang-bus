@@ -291,6 +291,145 @@ class BusServer:
         logger.info("Boot reconciliation: pids_reaped=%d kept=%d", pids_reaped, kept)
         return {"pids_reaped": pids_reaped, "kept": kept}
 
+    async def diagnose(self, agent_id: str, detail: str = "brief") -> dict:
+        """Probe an agent across multiple failure axes.
+
+        v1 covers bus-side fields only — registration view, WebSocket
+        health probe, verdict synthesis. Adapter-side routing sync,
+        agent-internal worker state, and recent logs are deferred to
+        follow-up FRs (the full Diagnosis envelope is in
+        fr_khonliang-bus_8fe376c7).
+
+        ``detail`` is accepted for API stability with future fields but
+        currently behaves the same for ``brief`` and ``full``.
+
+        The health probe sends ``operation="health_check"`` over the
+        agent's WebSocket. ``health_check`` is part of every agent's
+        always-available built-in skill set (provided by
+        ``khonliang_bus.BaseAgent``), so any agent that successfully
+        registered with the bus will accept it. Agents that override
+        the base class without re-providing ``health_check`` will
+        diagnose as ``agent_wedged`` here — desired behavior: a
+        non-conforming agent IS broken from the bus's point of view.
+
+        The ``pid`` field always reflects the registered PID (so
+        operators can grep logs / kernel messages even after a crash).
+        ``pid_alive`` is the live ``/proc`` check on that PID.
+        """
+        reg = self.db.get_registration(agent_id)
+        if not reg:
+            return {
+                "agent_id": agent_id,
+                "pid": None,
+                "pid_alive": False,
+                "bus_registry": {
+                    "registered": False,
+                    "skill_count": 0,
+                    "last_heartbeat": None,
+                },
+                "health_probe": {
+                    "ok": False,
+                    "latency_ms": None,
+                    "error": "not registered",
+                },
+                "verdict": "not_registered",
+                "recommendation": (
+                    f"bus_install_agent(id='{agent_id}', ...) then "
+                    f"bus_start_agent('{agent_id}')"
+                ),
+            }
+
+        pid = reg.get("pid")
+        pid_int = int(pid) if pid is not None else 0
+        pid_alive = pid_int > 0 and _pid_alive(pid_int)
+        pid_known_dead = pid_int > 0 and not pid_alive
+        ws_connected = self.is_agent_ws_connected(agent_id)
+        skills = self.db.get_skills(agent_id)
+        has_health_check = any(s.get("name") == "health_check" for s in skills)
+
+        bus_registry = {
+            "registered": True,
+            "skill_count": len(skills),
+            "last_heartbeat": reg.get("last_heartbeat"),
+        }
+
+        # Short-circuit: if the registered PID exists in /proc terms but is
+        # gone, the agent IS crashed regardless of any stale entry that may
+        # still linger in ``_agent_connections``. Skip the probe — a write
+        # to a dead WS would only churn ``correlation_id`` and recover the
+        # same verdict the caller will get faster from here.
+        if pid_known_dead:
+            return {
+                "agent_id": agent_id,
+                "pid": pid,
+                "pid_alive": False,
+                "bus_registry": bus_registry,
+                "health_probe": {
+                    "ok": False,
+                    "latency_ms": None,
+                    "error": f"pid {pid} not alive (skipped probe)",
+                },
+                "verdict": "crashed",
+                "recommendation": f"bus_start_agent('{agent_id}')",
+            }
+
+        health_probe: dict = {"ok": False, "latency_ms": None, "error": None}
+        if ws_connected:
+            correlation_id = f"diag-{uuid.uuid4().hex[:12]}"
+            t0 = time.monotonic()
+            result = await self.send_request_to_agent_ws(
+                agent_id=agent_id,
+                operation="health_check",
+                args={},
+                correlation_id=correlation_id,
+                timeout=5.0,
+            )
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            if isinstance(result, dict) and "error" in result:
+                health_probe = {"ok": False, "latency_ms": latency_ms, "error": result["error"]}
+            else:
+                health_probe = {"ok": True, "latency_ms": latency_ms, "error": None}
+        else:
+            health_probe["error"] = "no WebSocket connection"
+
+        if health_probe["ok"]:
+            verdict = "ok"
+            recommendation = "no action needed"
+        elif ws_connected and not has_health_check:
+            # Probe failed against an agent that's connected over WS but
+            # doesn't advertise the ``health_check`` skill. That skill is
+            # provided by ``khonliang_bus.BaseAgent`` for every conforming
+            # agent, so a missing one is itself the diagnosis: this agent
+            # isn't bus-lib-compliant. Recommend fixing the agent, not
+            # restarting the bus, so callers don't chase a phantom wedge.
+            # Gated on ``ws_connected`` — if the WS is also down, the WS is
+            # the load-bearing issue and falls through to the wedged branch
+            # below.
+            verdict = "agent_wedged"
+            recommendation = (
+                f"{agent_id} did not register a 'health_check' skill; "
+                f"diagnose v1 cannot probe it. Upgrade to khonliang-bus-lib "
+                f"BaseAgent or register a health_check skill on the agent."
+            )
+        else:
+            # PID is alive (we'd have short-circuited otherwise) but the
+            # probe failed — agent process is running but isn't responding
+            # cleanly, OR the WS is down. Folded into one wedged branch in
+            # v1; sub-verdicts (``wedged_in_request`` vs ``worker_down``)
+            # belong with the worker / adapter sub-field FRs, not here.
+            verdict = "agent_wedged"
+            recommendation = f"bus_restart_agent('{agent_id}')"
+
+        return {
+            "agent_id": agent_id,
+            "pid": pid,
+            "pid_alive": pid_alive,
+            "bus_registry": bus_registry,
+            "health_probe": health_probe,
+            "verdict": verdict,
+            "recommendation": recommendation,
+        }
+
     # -- agent lifecycle --
 
     def install_agent(self, req: InstallRequest) -> dict:
@@ -1709,6 +1848,20 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/services")
     def services():
         return bus.get_services()
+
+    @app.get("/v1/diagnose/{agent_id}")
+    async def diagnose(agent_id: str, detail: str = "brief"):
+        # No auth / rate-limit — same posture as every other bus control-plane
+        # route. khonliang-bus assumes a single-host, local-trusted environment
+        # (see project_dev_fleet_convention + feedback_no_sandboxing_in_local_trusted_env);
+        # security is an explicit non-goal for v1. Network-exposure hardening
+        # is a single platform-wide FR, not per-route.
+        if detail not in ("brief", "full"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"detail must be 'brief' or 'full', got {detail!r}",
+            )
+        return await bus.diagnose(agent_id, detail=detail)
 
     @app.get("/v1/agent/{agent_id}/provenance")
     def agent_provenance(agent_id: str):
