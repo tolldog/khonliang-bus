@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS registrations (
     status          TEXT NOT NULL DEFAULT 'healthy'
 );
 
+-- Persistent: per-agent welcome blobs, survive deregister + bus restart.
+-- fr_khonliang-bus_f96722dd: bus-lib agents auto-publish their welcome
+-- on register; cold-start LLMs query GET /v1/agents/<id>/welcome and
+-- the bus_welcome super-skill consults this catalog. Most-recent-wins
+-- on re-register (no version history; out of scope for v1).
+CREATE TABLE IF NOT EXISTS welcomes (
+    agent_id    TEXT PRIMARY KEY,
+    welcome     TEXT NOT NULL,                              -- JSON
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Runtime: skills per agent
 CREATE TABLE IF NOT EXISTS skills (
     agent_id     TEXT NOT NULL,
@@ -292,6 +303,116 @@ class BusDB:
         with self.conn() as c:
             r = c.execute("SELECT * FROM installed_agents WHERE id = ?", (agent_id,)).fetchone()
             return _row_to_dict(r) if r else None
+
+    # -- welcomes (per-agent welcome blobs, survive deregister) --
+    #
+    # fr_khonliang-bus_f96722dd: BaseAgent.start() forwards the agent's
+    # welcome dict on register; bus persists it here. Cold-start LLMs +
+    # the bus_welcome super-skill consume this catalog even after the
+    # agent process exits.
+
+    #: Maximum serialized size (bytes) we'll persist for a welcome blob.
+    #: Welcomes are bounded editorial — typical real-world payloads from
+    #: the 7 khonliang agents are well under 16 KB. The 256 KB ceiling
+    #: leaves substantial headroom for richer future content while
+    #: preventing a single misconfigured agent from bloating the welcomes
+    #: table (or pinning bus memory) with multi-megabyte payloads.
+    #: Closes Copilot R1 #4 on PR #37.
+    MAX_WELCOME_BYTES = 256 * 1024
+
+    def set_agent_welcome(self, agent_id: str, welcome: dict[str, Any]) -> None:
+        """Upsert an agent's welcome blob. Most-recent-wins on re-register
+        — no version history kept (out of scope for v1).
+
+        The persisted blob is normalized to ``welcome["agent_id"] = agent_id``
+        before serialization, so the stored content is always self-consistent
+        with the primary key. If the caller passed a dict with a different
+        ``agent_id`` inside (e.g. a misrouted POST from an operator override,
+        or an agent self-publishing under one id but claiming another in its
+        own welcome dict), we log a warning and overwrite. Closes Copilot PR
+        #37 R2 — downstream fleet catalogs / cold-start LLMs can rely on
+        ``stored_welcome["agent_id"] == row.agent_id``.
+
+        Raises:
+            ValueError: if the serialized welcome exceeds
+                :attr:`MAX_WELCOME_BYTES`. Caller is responsible for
+                logging and either rejecting the request (POST endpoint)
+                or skipping persistence (WS / HTTP register paths, where
+                an oversized welcome from one agent must not block
+                registration of others).
+        """
+        # Normalize agent_id inside the welcome to match the primary key.
+        # Copy first so we don't mutate the caller's dict.
+        if welcome.get("agent_id") != agent_id:
+            if "agent_id" in welcome:
+                logger.warning(
+                    "Welcome for agent_id=%r contained inconsistent "
+                    "agent_id=%r; overwriting to match storage key.",
+                    agent_id, welcome.get("agent_id"),
+                )
+            welcome = {**welcome, "agent_id": agent_id}
+        encoded = json.dumps(welcome)
+        encoded_len = len(encoded.encode("utf-8"))
+        if encoded_len > self.MAX_WELCOME_BYTES:
+            raise ValueError(
+                f"welcome for agent_id={agent_id!r} is {encoded_len} bytes "
+                f"(max {self.MAX_WELCOME_BYTES}); refusing to persist"
+            )
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO welcomes (agent_id, welcome, updated_at) "
+                "VALUES (?, ?, datetime('now')) "
+                "ON CONFLICT(agent_id) DO UPDATE SET "
+                "welcome = excluded.welcome, updated_at = excluded.updated_at",
+                (agent_id, encoded),
+            )
+
+    def get_agent_welcome(self, agent_id: str) -> dict[str, Any] | None:
+        """Return the persisted welcome plus the updated_at timestamp,
+        or ``None`` if no welcome has ever been published for this agent_id.
+
+        Shape: ``{welcome: dict | None, updated_at: str}`` — the wrapping
+        is explicit so future fields (e.g. content_hash, content_type)
+        can be added without breaking callers that assumed a bare blob.
+        ``welcome`` is ``None`` if the stored row contains malformed JSON
+        (defensive, exercised by ``test_welcome_with_corrupt_json_returns_none``);
+        callers should treat that case as "row exists but content is
+        unusable" rather than "no row".
+        """
+        with self.conn() as c:
+            r = c.execute(
+                "SELECT welcome, updated_at FROM welcomes WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+        if not r:
+            return None
+        try:
+            parsed = json.loads(r["welcome"])
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        return {"welcome": parsed, "updated_at": r["updated_at"]}
+
+    def list_agent_welcomes(self) -> list[dict[str, Any]]:
+        """Enumerate every persisted welcome. Used by the bus_welcome
+        super-skill to assemble a fleet-wide cold-start briefing.
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT agent_id, welcome, updated_at FROM welcomes "
+                "ORDER BY agent_id"
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                parsed = json.loads(r["welcome"])
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            out.append({
+                "agent_id": r["agent_id"],
+                "welcome": parsed,
+                "updated_at": r["updated_at"],
+            })
+        return out
 
     # -- registrations --
 
