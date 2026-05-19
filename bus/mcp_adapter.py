@@ -219,8 +219,7 @@ class BusMCPAdapter:
             Returns a multi-line summary with the verdict, recommendation,
             and the underlying registry / health-probe fields.
             """
-            params = {"detail": detail} if detail else None
-            d = adapter._get(f"/v1/diagnose/{agent_id}", params=params)
+            d = adapter._get(f"/v1/diagnose/{agent_id}", params={"detail": detail})
             if not isinstance(d, dict):
                 return f"unexpected response: {d!r}"
             reg = d.get("bus_registry") or {}

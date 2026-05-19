@@ -350,22 +350,18 @@ class BusServer:
             verdict = "ok"
             recommendation = "no action needed"
         elif not pid_alive and not ws_connected:
+            # Process and WS both gone — start it.
             verdict = "crashed"
             recommendation = f"bus_start_agent('{agent_id}')"
-        elif ws_connected and health_probe["error"] == "timeout":
-            verdict = "agent_wedged"
-            recommendation = f"bus_restart_agent('{agent_id}')"
-        elif ws_connected:
-            # WS up but probe returned an error — agent is responding but unhealthy.
-            verdict = "agent_wedged"
-            recommendation = f"bus_restart_agent('{agent_id}')"
-        elif pid_alive and not ws_connected:
-            # Process exists but isn't connected to the bus.
-            verdict = "agent_wedged"
-            recommendation = f"bus_restart_agent('{agent_id}')"
         else:
-            verdict = "unknown"
-            recommendation = "investigate manually"
+            # Any other path means something on the agent side is alive
+            # (process and/or WebSocket) but not responding cleanly. Folded
+            # into one wedged branch in v1 — when sub-verdicts gain distinct
+            # recommendations (e.g. ``wedged_in_request`` vs
+            # ``worker_down``) they belong with the worker / adapter sub-
+            # field FRs, not here.
+            verdict = "agent_wedged"
+            recommendation = f"bus_restart_agent('{agent_id}')"
 
         return {
             "agent_id": agent_id,
