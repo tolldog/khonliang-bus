@@ -130,26 +130,61 @@ def test_supervise_once_clears_stale_registration_before_restart(tmp_path):
     _install(db, "a1")
     bus = _bus(db)
 
-    # Simulate a prior successful run: agent registered + heartbeat'd healthy.
+    # Simulate a prior successful run: agent registered + heartbeat'd healthy
+    # with the SAME pid that's now dead, so the PID-match check upholds
+    # ownership and the deregister fires.
+    fake = _FakePopen(pid=99999, alive=False, returncode=1)
     db.register_agent(
         agent_id="a1",
         agent_type="test",
         callback_url="http://localhost:9999",
-        pid=99999,
+        pid=fake.pid,
         version="0.1.0",
         skills=[],
     )
     db.heartbeat("a1")
-    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus._processes["a1"] = fake
 
     result = bus.supervise_once()
 
     assert "a1" in result["restarted"]
-    # Stale registration was cleared so the new launch could proceed.
-    # The new launch immediately Popens /bin/true — by the time we check,
-    # the registrations table reflects what _start_process put back, which
-    # is nothing (no re-register until the agent connects over WS, which
-    # /bin/true won't do). The load-bearing assertion: it didn't short-circuit.
+    # The stale 'healthy' row WAS cleared. /bin/true won't re-register
+    # (it doesn't speak WS), so the table stays empty afterwards.
+    assert db.get_registration("a1") is None
+
+
+def test_supervise_once_skips_when_replacement_is_already_registered(tmp_path):
+    """If something else already registered against the same ``agent_id``
+    with a different PID between the crash and this sweep, the supervisor
+    must NOT deregister it — the replacement is canonical now."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus(db)
+
+    crashed = _FakePopen(pid=11111, alive=False, returncode=1)
+    bus._processes["a1"] = crashed
+
+    # Replacement instance registered with a DIFFERENT pid before our sweep.
+    db.register_agent(
+        agent_id="a1",
+        agent_type="test",
+        callback_url="http://localhost:9999",
+        pid=22222,
+        version="0.1.0",
+        skills=[{"name": "do_thing", "description": "", "parameters": {}}],
+    )
+
+    result = bus.supervise_once()
+
+    # The agent is reported alive (the replacement) and we did NOT
+    # trigger a restart — would have wiped the replacement's skills.
+    assert "a1" in result["alive"]
+    assert "a1" not in result["restarted"]
+    reg = db.get_registration("a1")
+    assert reg is not None
+    assert int(reg["pid"]) == 22222
+    assert len(db.get_skills("a1")) == 1
+    assert "a1" not in bus._processes
 
 
 async def test_start_supervisor_returns_running_task_and_is_idempotent(tmp_path):
@@ -167,6 +202,29 @@ async def test_start_supervisor_returns_running_task_and_is_idempotent(tmp_path)
         await task
     except asyncio.CancelledError:
         pass
+
+
+def test_start_supervisor_rejects_non_positive_interval(tmp_path):
+    """``asyncio.sleep`` raises on negative and effectively spins on zero —
+    either would silently disable supervision. Reject loudly at config time."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    bus = _bus(db)
+
+    with pytest.raises(ValueError, match="supervisor interval"):
+        bus.start_supervisor(interval=0)
+    with pytest.raises(ValueError, match="supervisor interval"):
+        bus.start_supervisor(interval=-1.0)
+    with pytest.raises(ValueError, match="supervisor interval"):
+        bus.start_supervisor(interval=0.001)  # below the minimum
+
+
+def test_start_supervisor_reads_interval_from_config(tmp_path):
+    """Without an explicit kwarg, the supervisor reads ``supervisor_interval_s``
+    from bus config — and the same validation guard applies."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    bad = BusServer(db, config={"supervisor_interval_s": 0})
+    with pytest.raises(ValueError, match="supervisor interval"):
+        bad.start_supervisor()
 
 
 async def test_supervision_loop_runs_supervise_once(tmp_path, monkeypatch):
@@ -192,7 +250,9 @@ async def test_supervision_loop_runs_supervise_once(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bus, "supervise_once", _count)
 
-    task = bus.start_supervisor(interval=0.01)
+    # Minimum allowed interval — the validation guard is part of the surface
+    # this test exercises end-to-end.
+    task = bus.start_supervisor(interval=0.1)
     try:
         await asyncio.wait_for(fired_twice.wait(), timeout=2.0)
     finally:

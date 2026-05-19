@@ -275,8 +275,12 @@ class BusServer:
             self._supervisor_task.cancel()
             try:
                 await self._supervisor_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                # Don't blanket-swallow: a real supervisor crash should be
+                # diagnosable in the bus log. Preserve the traceback.
+                logger.exception("Supervisor task raised during shutdown")
             self._supervisor_task = None
         if self._async_request_tasks:
             for task in list(self._async_request_tasks):
@@ -402,6 +406,7 @@ class BusServer:
             # Process exited. Pop the dead entry before relaunching so the
             # new Popen replaces it cleanly.
             exit_code = proc.returncode
+            crashed_pid = proc.pid
             self._processes.pop(agent_id, None)
             installed = self.db.get_installed_agent(agent_id)
             if installed is None:
@@ -409,8 +414,22 @@ class BusServer:
                 lost[agent_id] = "no longer installed"
                 logger.warning("Supervisor: %s exited (code=%s) and is no longer installed", agent_id, exit_code)
                 continue
-            # Clear any stale registration so start_agent doesn't see a
-            # leftover 'healthy' row from before the crash.
+            # If a different instance has already registered against this
+            # agent_id (operator manually started a replacement between the
+            # crash and this sweep, or another supervisor instance got there
+            # first), don't touch its registration. Drop our tracking and
+            # move on — the replacement is now canonical.
+            reg = self.db.get_registration(agent_id)
+            if reg is not None and reg.get("pid") and int(reg["pid"]) != crashed_pid:
+                logger.info(
+                    "Supervisor: %s exited (code=%s, pid=%s) but a replacement registered as pid=%s; not disturbing",
+                    agent_id, exit_code, crashed_pid, reg["pid"],
+                )
+                alive.append(agent_id)
+                continue
+            # Clear any stale registration (our own crashed instance's row)
+            # so start_agent doesn't see a leftover 'healthy' row from
+            # before the crash and short-circuit to ``already_running``.
             self.db.deregister_agent(agent_id)
             result = self._start_process(installed)
             if result.get("status") == "started":
@@ -443,23 +462,50 @@ class BusServer:
             while True:
                 try:
                     self.supervise_once()
-                except Exception as e:
-                    logger.warning("Supervisor sweep raised: %s", e)
+                except Exception:
+                    # ``logger.exception`` preserves the traceback in the
+                    # bus log — important because the supervisor swallows
+                    # the error and keeps looping, so the only signal of a
+                    # genuine bug here is the log line.
+                    logger.exception("Supervisor sweep raised")
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             logger.info("Supervisor loop cancelled")
             raise
 
+    # Minimum supervisor sweep cadence. Below this, ``asyncio.sleep`` either
+    # raises (negative) or effectively spins (zero, very small positive),
+    # which would peg the event loop and flood logs. 0.1s is small enough
+    # for tight tests but still a true delay.
+    _SUPERVISOR_MIN_INTERVAL_S: float = 0.1
+
     def start_supervisor(self, interval: float | None = None) -> asyncio.Task:
         """Launch the supervision loop as a background task. Idempotent —
-        returns the existing task if one is already running."""
+        returns the existing task if one is already running.
+
+        Raises ``ValueError`` if ``interval`` (or
+        ``config.supervisor_interval_s``) is below
+        :attr:`_SUPERVISOR_MIN_INTERVAL_S` — a non-positive interval
+        would silently disable supervision by spinning the event loop
+        or raising deep inside ``asyncio.sleep``.
+        """
         if self._supervisor_task is not None and not self._supervisor_task.done():
             return self._supervisor_task
-        secs = float(
+        raw = (
             interval
             if interval is not None
             else self.config.get("supervisor_interval_s", 5.0)
         )
+        try:
+            secs = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"supervisor interval must be a positive number, got {raw!r}"
+            ) from exc
+        if secs < self._SUPERVISOR_MIN_INTERVAL_S:
+            raise ValueError(
+                f"supervisor interval must be >= {self._SUPERVISOR_MIN_INTERVAL_S}s, got {secs}"
+            )
         self._supervisor_task = asyncio.create_task(self._supervision_loop(secs))
         return self._supervisor_task
 
