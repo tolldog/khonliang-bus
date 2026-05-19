@@ -983,7 +983,7 @@ class BusServer:
                     canonical_args = None
 
         if not runtime:
-            return {
+            return _maybe_redact_provenance({
                 "agent_id": agent_id,
                 "registration_type": "none",
                 "process": None,
@@ -991,7 +991,7 @@ class BusServer:
                 "canonical_install": canonical_install,
                 "match": None,
                 "notes": [],
-            }
+            }, redact_sensitive)
 
         spec = runtime.get("launch_spec")
         info = runtime.get("launch_info")
@@ -1035,26 +1035,7 @@ class BusServer:
             )
             registration_type = "canonical" if match else "adhoc"
 
-        if redact_sensitive:
-            if process:
-                for sensitive in ("executable", "cwd", "config"):
-                    if process.get(sensitive) is not None:
-                        process[sensitive] = "<redacted>"
-                if isinstance(process.get("args"), list) and process["args"]:
-                    process["args"] = ["<redacted>"]
-            # Drop the whole code block — commit SHA + branch + dirty are all
-            # disclosure-sensitive in environments where the redact flag is on.
-            if code is not None:
-                code = None
-            # Canonical install discloses /opt paths too; redact those.
-            if canonical_install:
-                for sensitive in ("command", "cwd", "config"):
-                    if canonical_install.get(sensitive) is not None:
-                        canonical_install[sensitive] = "<redacted>"
-                if isinstance(canonical_install.get("args"), list) and canonical_install["args"]:
-                    canonical_install["args"] = ["<redacted>"]
-
-        return {
+        return _maybe_redact_provenance({
             "agent_id": agent_id,
             "registration_type": registration_type,
             "process": process,
@@ -1062,7 +1043,7 @@ class BusServer:
             "canonical_install": canonical_install,
             "match": match,
             "notes": notes,
-        }
+        }, redact_sensitive)
 
     def get_platform_status(self) -> dict:
         installed = self.db.get_installed_agents()
@@ -1593,6 +1574,64 @@ class BusServer:
             return {"escalated": True, "gap_id": gap_id, "trace_id": req.trace_id}
 
         return {"verdict": req.verdict, "trace_id": req.trace_id}
+
+
+_REDACTED = "<redacted>"
+_PROCESS_SENSITIVE = ("executable", "cwd", "config")
+_INSTALL_SENSITIVE = ("command", "cwd", "config")
+
+
+def _redact_field(payload: dict, key: str) -> None:
+    """Replace ``payload[key]`` with the standard placeholder if the field
+    is present (i.e. not None / not absent). Type-agnostic: applies to any
+    non-None value (str, list, dict, number) so a malicious agent can't
+    bypass redaction by sending an unexpected JSON shape.
+    """
+    if payload.get(key) is not None:
+        payload[key] = _REDACTED
+
+
+def _maybe_redact_provenance(payload: dict, redact: bool) -> dict:
+    """Apply the redaction policy to a provenance payload at every return
+    path. Used by ``BusServer.get_agent_provenance`` so the early-return
+    case (``registration_type == "none"``) cannot bypass the same masking
+    the main flow applies.
+
+    Fields cleared (when ``redact=True``):
+      - ``process.executable``, ``process.cwd``, ``process.config``,
+        ``process.args`` (regardless of type — any non-None value becomes
+        the placeholder).
+      - ``code`` block dropped entirely (commit_sha + branch + dirty are
+        all disclosure-sensitive).
+      - ``canonical_install.command``, ``.cwd``, ``.config``, ``.args``
+        replaced the same way.
+
+    Fields preserved (treated as the public verdict):
+      - ``agent_id``, ``registration_type``, ``match``, ``notes``.
+      - ``process.pid``, ``process.started_at``.
+      - ``canonical_install.agent_type``, ``.installed_at``.
+    """
+    if not redact:
+        return payload
+
+    process = payload.get("process")
+    if isinstance(process, dict):
+        for k in _PROCESS_SENSITIVE:
+            _redact_field(process, k)
+        _redact_field(process, "args")
+
+    # Drop the entire code block; consumers needing commit info must
+    # use a trusted call path.
+    if payload.get("code") is not None:
+        payload["code"] = None
+
+    install = payload.get("canonical_install")
+    if isinstance(install, dict):
+        for k in _INSTALL_SENSITIVE:
+            _redact_field(install, k)
+        _redact_field(install, "args")
+
+    return payload
 
 
 def _pid_alive(pid: int) -> bool:

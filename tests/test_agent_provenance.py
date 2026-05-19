@@ -268,10 +268,11 @@ def test_provenance_args_comparison_is_deep_equality(bus, db):
 
 
 def test_rest_provenance_endpoint_returns_dict(client):
-    """The HTTP route mirrors the method output as JSON."""
-    # Install + simulate a registration via the install->start path is heavy;
-    # use the install endpoint to create a canonical row and confirm the
-    # endpoint returns ``none`` for the not-yet-running case.
+    """The HTTP route returns the expected ``none`` shape for an
+    installed-but-not-running agent. Default redaction applies — paths
+    are masked but the ``registration_type`` verdict is visible.
+    Unredacted variants are covered by ``test_rest_endpoint_discloses_full_when_opted_in``.
+    """
     client.post("/v1/install", json={
         "agent_type": "test",
         "id": "test-agent",
@@ -285,7 +286,10 @@ def test_rest_provenance_endpoint_returns_dict(client):
     body = r.json()
     assert body["agent_id"] == "test-agent"
     assert body["registration_type"] == "none"
-    assert body["canonical_install"]["command"] == "/usr/bin/python3"
+    # Default redaction applies even on the ``none`` path (Copilot R4 #1).
+    assert body["canonical_install"]["command"] == "<redacted>"
+    # Non-sensitive fields preserved.
+    assert body["canonical_install"]["agent_type"] == "test"
 
 
 def test_rest_provenance_endpoint_for_unknown_agent(client):
@@ -364,9 +368,13 @@ def test_http_register_without_launch_fields_still_works(client):
 
 
 def test_provenance_redacts_sensitive_fields_when_flagged(bus, db):
-    """When redact_sensitive=True, executable/cwd/config + the entire code
-    block are masked. Callers still see registration_type + match — the
-    verdict — without the underlying paths or commit SHA.
+    """When redact_sensitive=True, executable/cwd/config/args + the entire
+    code block are masked. Callers still see registration_type + match —
+    the verdict — without the underlying paths or commit SHA.
+
+    All sensitive fields use the same placeholder string regardless of
+    the underlying value's type (Copilot R4 #2: redaction must not be
+    bypassable by sending a non-list ``args``).
     """
     _install_canonical(db)
     spec = _canonical_spec()
@@ -383,13 +391,14 @@ def test_provenance_redacts_sensitive_fields_when_flagged(bus, db):
     assert p["process"]["executable"] == "<redacted>"
     assert p["process"]["cwd"] == "<redacted>"
     assert p["process"]["config"] == "<redacted>"
-    assert p["process"]["args"] == ["<redacted>"]
+    assert p["process"]["args"] == "<redacted>"  # type-agnostic placeholder
     # Commit/branch/dirty are dropped entirely under redaction.
     assert p["code"] is None
     # Canonical install paths also masked.
     assert p["canonical_install"]["command"] == "<redacted>"
     assert p["canonical_install"]["cwd"] == "<redacted>"
     assert p["canonical_install"]["config"] == "<redacted>"
+    assert p["canonical_install"]["args"] == "<redacted>"
 
 
 def test_provenance_unredacted_by_default(bus, db):
@@ -551,6 +560,110 @@ def test_env_bool_parsing(monkeypatch, raw, expected):
 
     monkeypatch.setenv("X", raw)
     assert _env_bool("X") is expected
+
+
+# ---------------------------------------------------------------------------
+# Redaction integrity — Copilot R4 catches: every return path must redact;
+# args redaction must not be type-narrow.
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_none_path_redacts_canonical_install(bus, db):
+    """Copilot R4 #1: when an agent is installed but not running, the
+    early-return `none` path used to leak canonical_install paths
+    verbatim even with redact_sensitive=True. The unified redaction
+    helper must apply to this branch too.
+    """
+    _install_canonical(db)  # installs but does NOT register
+    p = bus.get_agent_provenance("x-primary", redact_sensitive=True)
+    assert p["registration_type"] == "none"
+    # All canonical paths must be masked, not leaked.
+    assert p["canonical_install"]["command"] == "<redacted>"
+    assert p["canonical_install"]["cwd"] == "<redacted>"
+    assert p["canonical_install"]["config"] == "<redacted>"
+    assert p["canonical_install"]["args"] == "<redacted>"
+
+
+def test_provenance_none_path_unredacted_under_disclose_full(bus, db):
+    """Sanity counterpart: redact=False on the `none` path returns the
+    full canonical install. (Confirms the fix doesn't over-redact.)
+    """
+    _install_canonical(db)
+    p = bus.get_agent_provenance("x-primary", redact_sensitive=False)
+    assert p["registration_type"] == "none"
+    assert p["canonical_install"]["command"] == "/opt/x/.venv/bin/python"
+
+
+def test_rest_none_path_redacts_canonical_install(tmp_path):
+    """End-to-end: HTTP route on the default (redacted) listener must not
+    leak the canonical install paths when the agent isn't running.
+    """
+    from bus.server import create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app(db_path=str(tmp_path / "none-redact.db"))
+    c = TestClient(app)
+    c.post("/v1/install", json={
+        "agent_type": "x", "id": "x-primary",
+        "command": "/opt/x/python", "args": ["-m", "x"],
+        "cwd": "/opt/x", "config": "/opt/x/config.yaml",
+    })
+    body = c.get("/v1/agent/x-primary/provenance").json()
+    assert body["registration_type"] == "none"
+    assert body["canonical_install"]["command"] == "<redacted>"
+    assert body["canonical_install"]["cwd"] == "<redacted>"
+
+
+@pytest.mark.parametrize(
+    "malicious_args",
+    [
+        "/super/secret/string-form",                    # string instead of list
+        {"hidden": "/super/secret/dict-form"},          # dict instead of list
+        ["normal-arg-1", "normal-arg-2"],               # list (canonical form)
+        [],                                             # empty list — also must be redacted
+        42,                                             # surprise integer
+    ],
+)
+def test_provenance_redacts_args_regardless_of_type(bus, db, malicious_args):
+    """Copilot R4 #2: redaction must not be bypassed by an agent that
+    sends ``launch_spec.args`` as a non-list value. The bus's
+    register accepts ``dict[str, Any]`` for launch_spec — the agent
+    could supply anything. Any non-None value in ``args`` must be
+    replaced with the placeholder.
+    """
+    _install_canonical(db)
+    db.register_agent(
+        "x-primary", "x", "ws://connected", 1, "0.1.0",
+        launch_spec={
+            "executable": "/opt/x/python",
+            "args": malicious_args,
+            "cwd": "/opt/x",
+            "config": "/opt/x/config.yaml",
+        },
+    )
+    p = bus.get_agent_provenance("x-primary", redact_sensitive=True)
+    # ``args`` is replaced with the placeholder regardless of input type.
+    assert p["process"]["args"] == "<redacted>"
+
+
+def test_provenance_redaction_preserves_verdict_fields(bus, db):
+    """Public verdict fields (agent_id, registration_type, match, pid,
+    started_at, notes) survive redaction — callers without disclosure
+    privileges can still tell if a process is canonical or ad-hoc.
+    """
+    _install_canonical(db)
+    db.register_agent(
+        "x-primary", "x", "ws://connected", 4242, "0.1.0",
+        launch_spec=_canonical_spec(),
+        launch_info={"started_at": 1234.0, "commit_sha": "abc", "branch": "main", "dirty": False},
+    )
+    p = bus.get_agent_provenance("x-primary", redact_sensitive=True)
+    assert p["agent_id"] == "x-primary"
+    assert p["registration_type"] == "canonical"
+    assert p["match"] is True
+    assert p["process"]["pid"] == 4242
+    assert p["process"]["started_at"] == 1234.0
+    assert isinstance(p["notes"], list)
 
 
 def test_main_cli_flag_disclose_full_on_via_env(monkeypatch):
