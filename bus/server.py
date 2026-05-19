@@ -239,6 +239,12 @@ class BusServer:
         # agent_id → error message; populated by autostart_installed_agents()
         # on bus boot. Reset on each bus restart (runtime-only, not persisted).
         self._autostart_failures: dict[str, str] = {}
+        # agent_id → count of times the supervisor re-started this agent in
+        # the current bus lifetime. Reset on each bus restart. v1: pure
+        # counter for visibility / log signal — no max-failures cap or
+        # backoff (sibling fr_khonliang-bus_dc4ef3e9 follow-up).
+        self._supervisor_restart_counts: dict[str, int] = {}
+        self._supervisor_task: asyncio.Task | None = None
         self._http = httpx.AsyncClient(timeout=30.0)
         self._subscribers: dict[str, list[WebSocket]] = {}  # topic → websockets
         self._agent_connections: dict[str, WebSocket] = {}  # agent_id → WebSocket
@@ -265,6 +271,13 @@ class BusServer:
         self.scheduler = SchedulerIntegration(db)
 
     async def shutdown(self) -> None:
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._supervisor_task = None
         if self._async_request_tasks:
             for task in list(self._async_request_tasks):
                 task.cancel()
@@ -355,6 +368,100 @@ class BusServer:
             "skipped": skipped,
             "failed": dict(self._autostart_failures),
         }
+
+    def supervise_once(self) -> dict:
+        """Single-pass supervision sweep: walk ``self._processes`` and re-launch
+        any whose underlying subprocess has exited.
+
+        Only attaches to processes the CURRENT bus instance spawned (per
+        ``feedback_supervision_asymmetry_bus_vs_agents`` — agents stay
+        ephemeral; bus is systemd-managed). Across a bus restart, the
+        ``_processes`` dict is fresh and supervision picks up whatever
+        autostart spawned in this lifetime.
+
+        v1 scope (fr_khonliang-bus_dc4ef3e9): detect + restart. No backoff,
+        no per-agent max-failures threshold, no operator notification — all
+        explicit follow-ups. Restart count tracked in
+        ``self._supervisor_restart_counts`` for log / visibility signal.
+
+        Returns ``{restarted: [...], alive: [...], lost: {id: reason}}``.
+        ``lost`` covers cases where the agent was found dead but the
+        restart attempt also failed.
+        """
+        restarted: list[str] = []
+        alive: list[str] = []
+        lost: dict[str, str] = {}
+        # Snapshot keys: restart_dead may mutate self._processes via _start_process.
+        for agent_id in list(self._processes.keys()):
+            proc = self._processes.get(agent_id)
+            if proc is None:
+                continue
+            if proc.poll() is None:
+                alive.append(agent_id)
+                continue
+            # Process exited. Pop the dead entry before relaunching so the
+            # new Popen replaces it cleanly.
+            exit_code = proc.returncode
+            self._processes.pop(agent_id, None)
+            installed = self.db.get_installed_agent(agent_id)
+            if installed is None:
+                # Agent was uninstalled while supervised — don't relaunch.
+                lost[agent_id] = "no longer installed"
+                logger.warning("Supervisor: %s exited (code=%s) and is no longer installed", agent_id, exit_code)
+                continue
+            # Clear any stale registration so start_agent doesn't see a
+            # leftover 'healthy' row from before the crash.
+            self.db.deregister_agent(agent_id)
+            result = self._start_process(installed)
+            if result.get("status") == "started":
+                count = self._supervisor_restart_counts.get(agent_id, 0) + 1
+                self._supervisor_restart_counts[agent_id] = count
+                restarted.append(agent_id)
+                logger.info(
+                    "Supervisor: %s exited (code=%s), restarted (pid=%s, restart_count=%d)",
+                    agent_id, exit_code, result.get("pid"), count,
+                )
+            else:
+                err = result.get("error", f"unexpected _start_process result: {result!r}")
+                lost[agent_id] = err
+                logger.warning(
+                    "Supervisor: %s exited (code=%s); restart failed: %s",
+                    agent_id, exit_code, err,
+                )
+        return {"restarted": restarted, "alive": alive, "lost": lost}
+
+    async def _supervision_loop(self, interval: float) -> None:
+        """Background task: call :meth:`supervise_once` every ``interval`` seconds.
+
+        Cancelled in :meth:`shutdown`. A v1 deliberate trade-off: poll
+        rather than SIGCHLD because the supervised set is small (~10 agents)
+        and we want bus restart semantics to remain trivial (no signal
+        handler ownership tangle with FastAPI / uvicorn).
+        """
+        logger.info("Supervisor loop started (interval=%.1fs)", interval)
+        try:
+            while True:
+                try:
+                    self.supervise_once()
+                except Exception as e:
+                    logger.warning("Supervisor sweep raised: %s", e)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info("Supervisor loop cancelled")
+            raise
+
+    def start_supervisor(self, interval: float | None = None) -> asyncio.Task:
+        """Launch the supervision loop as a background task. Idempotent —
+        returns the existing task if one is already running."""
+        if self._supervisor_task is not None and not self._supervisor_task.done():
+            return self._supervisor_task
+        secs = float(
+            interval
+            if interval is not None
+            else self.config.get("supervisor_interval_s", 5.0)
+        )
+        self._supervisor_task = asyncio.create_task(self._supervision_loop(secs))
+        return self._supervisor_task
 
     async def diagnose(self, agent_id: str, detail: str = "brief") -> dict:
         """Probe an agent across multiple failure axes.
@@ -1891,6 +1998,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     async def lifespan(app):
         bus.reconcile_on_boot()
         bus.autostart_installed_agents()
+        bus.start_supervisor()
         yield
         await bus.shutdown()
 
