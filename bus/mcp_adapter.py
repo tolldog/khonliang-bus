@@ -188,6 +188,58 @@ class BusMCPAdapter:
             return "\n".join(lines)
 
         @mcp.tool()
+        async def bus_diagnose(agent_id: str, detail: str = "brief") -> str:
+            """Probe an agent and report a verdict on its current state.
+
+            Disambiguates four common failure modes from one call:
+
+            - ``ok`` — agent is registered, reachable, responding.
+            - ``crashed`` — registered but process is gone and WebSocket
+              is down.
+            - ``agent_wedged`` — process or WebSocket is alive but the
+              health probe times out or errors. Usually wants
+              ``bus_restart_agent``.
+            - ``not_registered`` — bus has no record of this agent.
+
+            Use this BEFORE retrying a skill that just failed to figure
+            out whether the agent needs restarting, whether the bus
+            forgot it, or whether the failure was elsewhere
+            (fr_khonliang-bus_8fe376c7). The returned ``recommendation``
+            quotes the exact bus command to run next.
+
+            v1 reports bus-side state only. Adapter-side routing sync,
+            agent-internal worker state, and recent logs are deferred to
+            follow-up FRs.
+
+            Args:
+                agent_id: The agent to diagnose (e.g. ``reviewer-primary``).
+                detail: ``brief`` (default) or ``full`` — accepted for API
+                    stability; v1 returns the same shape for both.
+
+            Returns a multi-line summary with the verdict, recommendation,
+            and the underlying registry / health-probe fields.
+            """
+            params = {"detail": detail} if detail else None
+            d = adapter._get(f"/v1/diagnose/{agent_id}", params=params)
+            if not isinstance(d, dict):
+                return f"unexpected response: {d!r}"
+            reg = d.get("bus_registry") or {}
+            probe = d.get("health_probe") or {}
+            lines = [
+                f"agent_id: {d.get('agent_id')}",
+                f"verdict: {d.get('verdict')}",
+                f"recommendation: {d.get('recommendation')}",
+                f"pid: {d.get('pid')}",
+                f"bus_registry: registered={reg.get('registered')} "
+                f"skill_count={reg.get('skill_count')} "
+                f"last_heartbeat={reg.get('last_heartbeat')}",
+                f"health_probe: ok={probe.get('ok')} "
+                f"latency_ms={probe.get('latency_ms')} "
+                f"error={probe.get('error')}",
+            ]
+            return "\n".join(lines)
+
+        @mcp.tool()
         async def bus_matrix() -> str:
             """Interaction matrix: agents, solo skills, collaborative flows."""
             m = adapter._get("/v1/matrix")

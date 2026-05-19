@@ -285,6 +285,97 @@ class BusServer:
         logger.info("Boot reconciliation: pids_reaped=%d kept=%d", pids_reaped, kept)
         return {"pids_reaped": pids_reaped, "kept": kept}
 
+    async def diagnose(self, agent_id: str, detail: str = "brief") -> dict:
+        """Probe an agent across multiple failure axes.
+
+        v1 covers bus-side fields only — registration view, WebSocket
+        health probe, verdict synthesis. Adapter-side routing sync,
+        agent-internal worker state, and recent logs are deferred to
+        follow-up FRs (the full Diagnosis envelope is in
+        fr_khonliang-bus_8fe376c7).
+
+        ``detail`` is accepted for API stability with future fields but
+        currently behaves the same for ``brief`` and ``full``.
+        """
+        reg = self.db.get_registration(agent_id)
+        if not reg:
+            return {
+                "agent_id": agent_id,
+                "pid": None,
+                "bus_registry": {
+                    "registered": False,
+                    "skill_count": 0,
+                    "last_heartbeat": None,
+                },
+                "health_probe": {
+                    "ok": False,
+                    "latency_ms": None,
+                    "error": "not registered",
+                },
+                "verdict": "not_registered",
+                "recommendation": f"install + bus_start_agent('{agent_id}')",
+            }
+
+        pid = reg.get("pid")
+        pid_alive = bool(pid and int(pid) > 0 and _pid_alive(int(pid)))
+        ws_connected = self.is_agent_ws_connected(agent_id)
+        skill_count = len(self.db.get_skills(agent_id))
+
+        bus_registry = {
+            "registered": True,
+            "skill_count": skill_count,
+            "last_heartbeat": reg.get("last_heartbeat"),
+        }
+
+        health_probe: dict = {"ok": False, "latency_ms": None, "error": None}
+        if ws_connected:
+            correlation_id = f"diag-{uuid.uuid4().hex[:12]}"
+            t0 = time.monotonic()
+            result = await self.send_request_to_agent_ws(
+                agent_id=agent_id,
+                operation="health_check",
+                args={},
+                correlation_id=correlation_id,
+                timeout=5.0,
+            )
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            if isinstance(result, dict) and "error" in result:
+                health_probe = {"ok": False, "latency_ms": latency_ms, "error": result["error"]}
+            else:
+                health_probe = {"ok": True, "latency_ms": latency_ms, "error": None}
+        else:
+            health_probe["error"] = "no WebSocket connection"
+
+        if health_probe["ok"]:
+            verdict = "ok"
+            recommendation = "no action needed"
+        elif not pid_alive and not ws_connected:
+            verdict = "crashed"
+            recommendation = f"bus_start_agent('{agent_id}')"
+        elif ws_connected and health_probe["error"] == "timeout":
+            verdict = "agent_wedged"
+            recommendation = f"bus_restart_agent('{agent_id}')"
+        elif ws_connected:
+            # WS up but probe returned an error — agent is responding but unhealthy.
+            verdict = "agent_wedged"
+            recommendation = f"bus_restart_agent('{agent_id}')"
+        elif pid_alive and not ws_connected:
+            # Process exists but isn't connected to the bus.
+            verdict = "agent_wedged"
+            recommendation = f"bus_restart_agent('{agent_id}')"
+        else:
+            verdict = "unknown"
+            recommendation = "investigate manually"
+
+        return {
+            "agent_id": agent_id,
+            "pid": pid if pid_alive else None,
+            "bus_registry": bus_registry,
+            "health_probe": health_probe,
+            "verdict": verdict,
+            "recommendation": recommendation,
+        }
+
     # -- agent lifecycle --
 
     def install_agent(self, req: InstallRequest) -> dict:
@@ -1505,6 +1596,10 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.get("/v1/services")
     def services():
         return bus.get_services()
+
+    @app.get("/v1/diagnose/{agent_id}")
+    async def diagnose(agent_id: str, detail: str = "brief"):
+        return await bus.diagnose(agent_id, detail=detail)
 
     # -- request/reply --
 

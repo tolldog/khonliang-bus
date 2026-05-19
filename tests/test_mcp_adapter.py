@@ -122,12 +122,13 @@ def test_build_registers_flow_tools(adapter):
 def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
-    # 15 bus tools (12 non-artifact + 2 distill + 1 bus_topics) +
-    # 3 skills + 1 flow = 19. The seven read-side bus_artifact_*
-    # tools were retired with khonliang-store Phase 4c
-    # (`fr_khonliang-bus_9151395d`); ``bus_topics`` was added to
-    # close fr_bus_7b2d41d2 (event-surface introspection).
-    assert len(tools) == 19
+    # 16 bus tools (12 non-artifact + 2 distill + 1 bus_topics +
+    # 1 bus_diagnose) + 3 skills + 1 flow = 20. The seven read-side
+    # bus_artifact_* tools were retired with khonliang-store Phase 4c
+    # (`fr_khonliang-bus_9151395d`); ``bus_topics`` closed
+    # fr_bus_7b2d41d2; ``bus_diagnose`` closes fr_khonliang-bus_8fe376c7
+    # (v1, bus-side fields only).
+    assert len(tools) == 20
 
 
 def test_bus_services_tool(adapter):
