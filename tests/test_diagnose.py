@@ -177,6 +177,54 @@ async def test_diagnose_detail_full_same_shape_as_brief(tmp_path, fake_alive):
     assert brief["verdict"] == full["verdict"]
 
 
+async def test_diagnose_crashed_short_circuits_past_stale_ws(tmp_path, fake_alive, monkeypatch):
+    """If the registered PID is gone but a stale entry still lingers in
+    ``_agent_connections`` (WS cleanup hasn't run yet), the verdict must
+    still be ``crashed`` (recommend ``bus_start_agent``), not ``agent_wedged``
+    (which would recommend ``bus_restart_agent``). PID death is the
+    load-bearing signal — the probe is skipped entirely."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _register(db, "agent-1", pid=12345)
+    bus = _bus(db)
+    bus._agent_connections["agent-1"] = object()  # stale WS lingering
+
+    probe_calls: list = []
+
+    async def _should_not_run(**kw):
+        probe_calls.append(kw)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(bus, "send_request_to_agent_ws", _should_not_run)
+
+    d = await bus.diagnose("agent-1")
+
+    assert d["verdict"] == "crashed"
+    assert d["pid"] == 12345
+    assert d["pid_alive"] is False
+    assert "bus_start_agent" in d["recommendation"]
+    assert "bus_restart_agent" not in d["recommendation"]
+    assert probe_calls == [], "probe must be skipped when PID is known-dead"
+
+
+async def test_diagnose_wedged_no_ws_no_health_check_skill_blames_ws(tmp_path, fake_alive):
+    """Missing-health_check recommendation must NOT fire when the actual
+    problem is a dropped WebSocket. The WS is the load-bearing failure;
+    blaming the agent's skill list for that is misdirection."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _register(db, "legacy-agent", pid=12345, include_health_check=False)
+    fake_alive.add(12345)
+    bus = _bus(db)
+    # No entry in _agent_connections — WS is the load-bearing problem.
+
+    d = await bus.diagnose("legacy-agent")
+
+    assert d["verdict"] == "agent_wedged"
+    assert "health_check" not in d["recommendation"]
+    assert "bus-lib" not in d["recommendation"]
+    assert "BaseAgent" not in d["recommendation"]
+    assert "bus_restart_agent" in d["recommendation"]
+
+
 async def test_diagnose_missing_health_check_redirects_recommendation(tmp_path, fake_alive, monkeypatch):
     """Non-conforming agent (no health_check skill) gets a recommendation
     pointing at the agent — not at ``bus_restart_agent`` — so callers don't

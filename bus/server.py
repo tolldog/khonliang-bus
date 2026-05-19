@@ -334,7 +334,9 @@ class BusServer:
             }
 
         pid = reg.get("pid")
-        pid_alive = bool(pid and int(pid) > 0 and _pid_alive(int(pid)))
+        pid_int = int(pid) if pid is not None else 0
+        pid_alive = pid_int > 0 and _pid_alive(pid_int)
+        pid_known_dead = pid_int > 0 and not pid_alive
         ws_connected = self.is_agent_ws_connected(agent_id)
         skills = self.db.get_skills(agent_id)
         has_health_check = any(s.get("name") == "health_check" for s in skills)
@@ -344,6 +346,26 @@ class BusServer:
             "skill_count": len(skills),
             "last_heartbeat": reg.get("last_heartbeat"),
         }
+
+        # Short-circuit: if the registered PID exists in /proc terms but is
+        # gone, the agent IS crashed regardless of any stale entry that may
+        # still linger in ``_agent_connections``. Skip the probe — a write
+        # to a dead WS would only churn ``correlation_id`` and recover the
+        # same verdict the caller will get faster from here.
+        if pid_known_dead:
+            return {
+                "agent_id": agent_id,
+                "pid": pid,
+                "pid_alive": False,
+                "bus_registry": bus_registry,
+                "health_probe": {
+                    "ok": False,
+                    "latency_ms": None,
+                    "error": f"pid {pid} not alive (skipped probe)",
+                },
+                "verdict": "crashed",
+                "recommendation": f"bus_start_agent('{agent_id}')",
+            }
 
         health_probe: dict = {"ok": False, "latency_ms": None, "error": None}
         if ws_connected:
@@ -367,17 +389,16 @@ class BusServer:
         if health_probe["ok"]:
             verdict = "ok"
             recommendation = "no action needed"
-        elif not pid_alive and not ws_connected:
-            # Process and WS both gone — start it.
-            verdict = "crashed"
-            recommendation = f"bus_start_agent('{agent_id}')"
-        elif not has_health_check:
-            # Probe failed against an agent that doesn't advertise the
-            # ``health_check`` skill. That skill is provided by
-            # ``khonliang_bus.BaseAgent`` for every conforming agent, so a
-            # missing one is itself the diagnosis: this agent isn't
-            # bus-lib-compliant. Recommend fixing the agent, not restarting
-            # the bus, so callers don't chase a phantom wedge.
+        elif ws_connected and not has_health_check:
+            # Probe failed against an agent that's connected over WS but
+            # doesn't advertise the ``health_check`` skill. That skill is
+            # provided by ``khonliang_bus.BaseAgent`` for every conforming
+            # agent, so a missing one is itself the diagnosis: this agent
+            # isn't bus-lib-compliant. Recommend fixing the agent, not
+            # restarting the bus, so callers don't chase a phantom wedge.
+            # Gated on ``ws_connected`` — if the WS is also down, the WS is
+            # the load-bearing issue and falls through to the wedged branch
+            # below.
             verdict = "agent_wedged"
             recommendation = (
                 f"{agent_id} did not register a 'health_check' skill; "
@@ -385,12 +406,11 @@ class BusServer:
                 f"BaseAgent or register a health_check skill on the agent."
             )
         else:
-            # Any other path means something on the agent side is alive
-            # (process and/or WebSocket) but not responding cleanly. Folded
-            # into one wedged branch in v1 — when sub-verdicts gain distinct
-            # recommendations (e.g. ``wedged_in_request`` vs
-            # ``worker_down``) they belong with the worker / adapter sub-
-            # field FRs, not here.
+            # PID is alive (we'd have short-circuited otherwise) but the
+            # probe failed — agent process is running but isn't responding
+            # cleanly, OR the WS is down. Folded into one wedged branch in
+            # v1; sub-verdicts (``wedged_in_request`` vs ``worker_down``)
+            # belong with the worker / adapter sub-field FRs, not here.
             verdict = "agent_wedged"
             recommendation = f"bus_restart_agent('{agent_id}')"
 
