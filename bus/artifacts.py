@@ -425,7 +425,7 @@ class ArtifactStore:
                   AND json_extract(metadata, '$.max_chars') = ?
                   AND json_extract(metadata, '$.distiller_version') = ?
                   AND (ttl IS NULL OR ttl > ?)
-                ORDER BY created_at DESC, id DESC
+                ORDER BY created_at DESC, rowid DESC
                 LIMIT 1
                 """,
                 (

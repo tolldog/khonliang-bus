@@ -498,9 +498,15 @@ class BusMCPAdapter:
             Distillation is deterministic for a given
             ``(source, mode, purpose, max_chars)``; when ``cache`` is True
             (default) a matching non-expired prior result is returned in
-            place of a fresh artifact. Set ``cache_ttl_seconds`` to expire
-            the cache entry after that many seconds (positive int) or leave
-            it unset for no expiry.
+            place of a fresh artifact.
+
+            ``cache_ttl_seconds`` applies at creation time only: on a cache
+            miss the freshly stored artifact's ``ttl`` is set to that many
+            seconds from now. On a cache hit the existing entry's TTL is
+            returned as-is — the caller's ``cache_ttl_seconds`` is *not*
+            retroactively narrowed onto an existing forever-cached entry.
+            Callers needing a guaranteed-fresh artifact or a tight TTL on
+            the stored row must pass ``cache=False``.
             """
             result = await adapter._async_post(
                 f"/v1/artifacts/{id}/distill",

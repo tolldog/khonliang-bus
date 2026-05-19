@@ -305,6 +305,60 @@ def test_artifact_distill_cache_hit_does_not_retroactively_apply_caller_ttl(db):
     assert second["distilled_artifact"]["ttl"] is None  # original TTL preserved
 
 
+def test_artifact_distill_cache_lookup_breaks_ties_by_rowid_not_id(db):
+    """Same-second cache rows must be ordered by insertion (rowid), not random id.
+
+    SQLite's `datetime('now')` is second-precision, and `id` is a random
+    `art_<hex>` slug. If `id DESC` is used as the tiebreaker, the lookup
+    can return the older row when its random id happens to sort higher
+    than the newer one — for example preserving a no-TTL entry over a
+    just-inserted TTL-bound entry.
+    """
+    store = ArtifactStore(db)
+    source = store.create(kind="log", title="log", content="src")
+    cache_metadata = {
+        "mode": "brief",
+        "purpose": "p",
+        "source_kind": "log",
+        "max_chars": 200,
+        "distiller_version": "v1",
+    }
+
+    # Plant two rows via _create with explicit ids chosen so that
+    # lexicographic id-order is the OPPOSITE of insertion order.
+    older = store._create(
+        kind="distillation",
+        title="older",
+        content="OLDER",
+        producer="bus",
+        metadata=cache_metadata,
+        source_artifacts=[source["id"]],
+        artifact_id="art_zzzzzzzzzzzz",  # lex-highest id but inserted first
+    )
+    newer = store._create(
+        kind="distillation",
+        title="newer",
+        content="NEWER",
+        producer="bus",
+        metadata=cache_metadata,
+        source_artifacts=[source["id"]],
+        artifact_id="art_aaaaaaaaaaaa",  # lex-lowest id but inserted second
+    )
+
+    # Force identical created_at so the second-precision tie kicks in.
+    with db.conn() as c:
+        c.execute(
+            "UPDATE artifacts SET created_at = ? WHERE id IN (?, ?)",
+            ("2026-01-01 00:00:00", older["id"], newer["id"]),
+        )
+
+    # Cache hit must return the row inserted second (highest rowid), not
+    # the row whose random id happens to sort higher.
+    hit = store.distill(source["id"], purpose="p", max_chars=200)
+    assert hit["distilled_artifact"]["id"] == newer["id"]
+    assert hit["digest"] == "NEWER"
+
+
 def test_artifact_distill_rejects_cache_ttl_above_upper_bound(db):
     """cache_ttl_seconds above the upper bound must be rejected before timedelta overflow."""
     store = ArtifactStore(db)
