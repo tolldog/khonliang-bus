@@ -18,11 +18,7 @@ The bus-lib side (BaseAgent forwarding welcome on register) is tested in
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
-
-from bus.db import BusDB
 
 
 # ---------------------------------------------------------------------------
