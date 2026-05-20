@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 import uuid
 from typing import Any
@@ -236,6 +237,13 @@ class BusServer:
         self.db = db
         self.config = config or {}
         self._processes: dict[str, subprocess.Popen] = {}  # agent_id → process
+        # FastAPI runs sync ``def`` lifecycle handlers (install/start/stop/
+        # restart) in a thread pool while the supervisor loop runs on the
+        # event loop — both mutate ``_processes``. A ``threading.Lock``
+        # works for both (sync threadpool callers and async-loop callers
+        # use the same ``with`` syntax) and keeps the lock surface small
+        # compared to flipping every lifecycle handler to ``async def``.
+        self._processes_lock = threading.Lock()
         # agent_id → error message; populated by autostart_installed_agents()
         # on bus boot. Reset on each bus restart (runtime-only, not persisted).
         self._autostart_failures: dict[str, str] = {}
@@ -395,11 +403,15 @@ class BusServer:
         restarted: list[str] = []
         alive: list[str] = []
         lost: dict[str, str] = {}
-        # Snapshot keys: restart_dead may mutate self._processes via _start_process.
-        for agent_id in list(self._processes.keys()):
-            proc = self._processes.get(agent_id)
-            if proc is None:
-                continue
+        # Snapshot under the lock so the supervisor's view of the world
+        # doesn't change underfoot while a threadpool-served lifecycle
+        # handler mutates ``_processes``. Inspecting dead Popens and
+        # calling ``_start_process`` happen outside the lock — they
+        # don't need it (Popen.poll is per-process) and ``_start_process``
+        # re-acquires the lock for its own write.
+        with self._processes_lock:
+            tracked = list(self._processes.items())
+        for agent_id, proc in tracked:
             if proc.poll() is None:
                 alive.append(agent_id)
                 continue
@@ -407,7 +419,18 @@ class BusServer:
             # new Popen replaces it cleanly.
             exit_code = proc.returncode
             crashed_pid = proc.pid
-            self._processes.pop(agent_id, None)
+            with self._processes_lock:
+                # Re-check under the lock: a concurrent stop_agent may have
+                # already removed/replaced the entry.
+                current = self._processes.get(agent_id)
+                if current is proc:
+                    self._processes.pop(agent_id, None)
+                elif current is not None:
+                    # Someone else replaced our tracked Popen with a new one
+                    # — that's the new canonical process. Don't touch it.
+                    alive.append(agent_id)
+                    continue
+                # current is None: another sweep already cleared us.
             installed = self.db.get_installed_agent(agent_id)
             if installed is None:
                 # Agent was uninstalled while supervised — don't relaunch.
@@ -417,13 +440,24 @@ class BusServer:
             # If a different instance has already registered against this
             # agent_id (operator manually started a replacement between the
             # crash and this sweep, or another supervisor instance got there
-            # first), don't touch its registration. Drop our tracking and
-            # move on — the replacement is now canonical.
+            # first), don't touch its registration. WS-register payloads
+            # may legitimately carry ``pid=0`` (see ``handle_agent_ws``
+            # default), so the PID-mismatch check alone isn't sufficient
+            # — also short-circuit if there's an active WebSocket
+            # connection for this agent_id, which always means a live
+            # peer is talking to the bus right now.
             reg = self.db.get_registration(agent_id)
-            if reg is not None and reg.get("pid") and int(reg["pid"]) != crashed_pid:
+            ws_active = self.is_agent_ws_connected(agent_id)
+            different_pid = (
+                reg is not None
+                and reg.get("pid")
+                and int(reg["pid"]) != crashed_pid
+            )
+            if ws_active or different_pid:
                 logger.info(
-                    "Supervisor: %s exited (code=%s, pid=%s) but a replacement registered as pid=%s; not disturbing",
-                    agent_id, exit_code, crashed_pid, reg["pid"],
+                    "Supervisor: %s exited (code=%s, pid=%s) but a replacement is present (ws=%s, reg_pid=%s); not disturbing",
+                    agent_id, exit_code, crashed_pid, ws_active,
+                    (reg or {}).get("pid"),
                 )
                 alive.append(agent_id)
                 continue
@@ -703,7 +737,8 @@ class BusServer:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self._processes[agent_id] = proc
+            with self._processes_lock:
+                self._processes[agent_id] = proc
             logger.info("Started agent %s (pid=%d)", agent_id, proc.pid)
             return {"id": agent_id, "pid": proc.pid, "status": "started"}
         except Exception as e:
@@ -711,7 +746,8 @@ class BusServer:
             return {"id": agent_id, "error": str(e)}
 
     def _stop_process(self, agent_id: str) -> None:
-        proc = self._processes.pop(agent_id, None)
+        with self._processes_lock:
+            proc = self._processes.pop(agent_id, None)
         if proc and proc.poll() is None:
             proc.terminate()
             try:

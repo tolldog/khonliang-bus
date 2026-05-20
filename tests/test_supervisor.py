@@ -59,19 +59,38 @@ def test_supervise_once_alive_process_is_noop(tmp_path):
     assert bus._supervisor_restart_counts == {}
 
 
-def test_supervise_once_restarts_dead_process(tmp_path):
+def _patch_fake_start_process(monkeypatch, bus: BusServer) -> list[str]:
+    """Make ``_start_process`` return a fake-Popen success without spawning
+    a real subprocess. Returns the list that gets populated with agent_ids
+    each fake-start call processes."""
+    spawned: list[str] = []
+
+    def _fake_start(installed):
+        new_proc = _FakePopen(alive=True)
+        with bus._processes_lock:
+            bus._processes[installed["id"]] = new_proc
+        spawned.append(installed["id"])
+        return {"id": installed["id"], "pid": new_proc.pid, "status": "started"}
+
+    monkeypatch.setattr(bus, "_start_process", _fake_start)
+    return spawned
+
+
+def test_supervise_once_restarts_dead_process(tmp_path, monkeypatch):
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
     bus = _bus(db)
     fake = _FakePopen(alive=False, returncode=1)
     bus._processes["a1"] = fake
+    spawned = _patch_fake_start_process(monkeypatch, bus)
 
     result = bus.supervise_once()
 
     assert result["restarted"] == ["a1"]
     assert result["lost"] == {}
-    # Dead Popen replaced with a fresh real subprocess. _processes still
-    # has the agent — the new Popen IS the restart.
+    assert spawned == ["a1"]
+    # Dead Popen replaced with a fresh fake. ``_processes`` still has the
+    # agent — the new Popen IS the restart.
     assert "a1" in bus._processes
     assert bus._processes["a1"] is not fake
     assert bus._supervisor_restart_counts["a1"] == 1
@@ -107,11 +126,12 @@ def test_supervise_once_records_restart_failure(tmp_path):
     assert bus._supervisor_restart_counts.get("broken", 0) == 0
 
 
-def test_supervise_once_counts_repeated_restarts(tmp_path):
+def test_supervise_once_counts_repeated_restarts(tmp_path, monkeypatch):
     """Restart counter accumulates across calls so operators can spot a flapping agent."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "flapper")
     bus = _bus(db)
+    _patch_fake_start_process(monkeypatch, bus)
 
     # First crash + restart.
     bus._processes["flapper"] = _FakePopen(alive=False, returncode=1)
@@ -123,12 +143,13 @@ def test_supervise_once_counts_repeated_restarts(tmp_path):
     assert bus._supervisor_restart_counts["flapper"] == 2
 
 
-def test_supervise_once_clears_stale_registration_before_restart(tmp_path):
+def test_supervise_once_clears_stale_registration_before_restart(tmp_path, monkeypatch):
     """Without deregister, ``start_agent`` would short-circuit to
     ``already_running`` because the prior crash left a 'healthy' registration."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
     bus = _bus(db)
+    _patch_fake_start_process(monkeypatch, bus)
 
     # Simulate a prior successful run: agent registered + heartbeat'd healthy
     # with the SAME pid that's now dead, so the PID-match check upholds
@@ -148,18 +169,53 @@ def test_supervise_once_clears_stale_registration_before_restart(tmp_path):
     result = bus.supervise_once()
 
     assert "a1" in result["restarted"]
-    # The stale 'healthy' row WAS cleared. /bin/true won't re-register
-    # (it doesn't speak WS), so the table stays empty afterwards.
+    # The stale 'healthy' row WAS cleared. The fake ``_start_process`` doesn't
+    # re-register, so the table stays empty afterwards.
     assert db.get_registration("a1") is None
 
 
-def test_supervise_once_skips_when_replacement_is_already_registered(tmp_path):
+def test_supervise_once_skips_when_active_ws_connection_with_zero_pid(tmp_path, monkeypatch):
+    """WS register payloads can legitimately carry ``pid=0``
+    (see ``handle_agent_ws``). The replacement guard must short-circuit on
+    an active WS connection regardless of the registration's pid, so a
+    pid-0 replacement doesn't get its row wiped."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus(db)
+    _patch_fake_start_process(monkeypatch, bus)
+
+    crashed = _FakePopen(pid=11111, alive=False, returncode=1)
+    bus._processes["a1"] = crashed
+
+    # WS-registered replacement with pid=0 + active WS connection.
+    db.register_agent(
+        agent_id="a1",
+        agent_type="test",
+        callback_url="ws://...",
+        pid=0,
+        version="0.1.0",
+        skills=[{"name": "do_thing", "description": "", "parameters": {}}],
+    )
+    bus._agent_connections["a1"] = object()  # active WS sentinel
+
+    result = bus.supervise_once()
+
+    assert "a1" in result["alive"]
+    assert "a1" not in result["restarted"]
+    reg = db.get_registration("a1")
+    assert reg is not None
+    assert len(db.get_skills("a1")) == 1
+    assert "a1" not in bus._processes
+
+
+def test_supervise_once_skips_when_replacement_is_already_registered(tmp_path, monkeypatch):
     """If something else already registered against the same ``agent_id``
     with a different PID between the crash and this sweep, the supervisor
     must NOT deregister it — the replacement is canonical now."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
     bus = _bus(db)
+    spawned = _patch_fake_start_process(monkeypatch, bus)
 
     crashed = _FakePopen(pid=11111, alive=False, returncode=1)
     bus._processes["a1"] = crashed
@@ -180,6 +236,7 @@ def test_supervise_once_skips_when_replacement_is_already_registered(tmp_path):
     # trigger a restart — would have wiped the replacement's skills.
     assert "a1" in result["alive"]
     assert "a1" not in result["restarted"]
+    assert spawned == []  # restart never fired
     reg = db.get_registration("a1")
     assert reg is not None
     assert int(reg["pid"]) == 22222
