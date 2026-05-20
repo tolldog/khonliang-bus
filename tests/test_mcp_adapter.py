@@ -77,7 +77,7 @@ def test_build_registers_bus_tools(adapter):
     # remain because store doesn't have an equivalent yet.
     for bus_tool in (
         "bus_services", "bus_status", "bus_matrix", "bus_flows",
-        "bus_topics",
+        "bus_topics", "bus_welcome",
         "bus_trace", "bus_skills", "bus_feedback",
         "bus_artifact_distill", "bus_artifact_distill_many",
         "bus_start_agent", "bus_stop_agent", "bus_restart_agent",
@@ -175,20 +175,23 @@ def test_total_tool_count(adapter):
     mcp = adapter.build()
     tools = asyncio.run(mcp.list_tools())
     names = {t.name for t in tools}
-    # 17 bus tools (12 non-artifact + 2 distill + 1 bus_topics +
-    # 1 bus_agent_provenance + 1 bus_diagnose) + 3 skills + 1 flow = 21.
+    # 18 bus tools (12 non-artifact + 2 distill + 1 bus_topics +
+    # 1 bus_agent_provenance + 1 bus_diagnose + 1 bus_welcome) +
+    # 3 skills + 1 flow = 22.
     # The seven read-side bus_artifact_* tools were retired with
     # khonliang-store Phase 4c (`fr_khonliang-bus_9151395d`);
     # ``bus_topics`` closed fr_bus_7b2d41d2; ``bus_agent_provenance``
     # closes fr_khonliang-bus_aa096048 (Tier 1 visibility);
     # ``bus_diagnose`` closes fr_khonliang-bus_8fe376c7 (v1, bus-side
-    # fields only).
-    assert len(tools) == 21
+    # fields only); ``bus_welcome`` closes fr_khonliang-bus_37498850
+    # (super-skill cold-start discovery).
+    assert len(tools) == 22
     # Spot-check load-bearing names so the aggregate count alone can't
     # mask a rename / replacement (per Copilot R3 on PR #34).
     expected_named = {
         "bus_services", "bus_status", "bus_matrix", "bus_flows",
         "bus_skills", "bus_topics", "bus_agent_provenance", "bus_diagnose",
+        "bus_welcome",
     }
     assert expected_named.issubset(names), (
         f"missing required tool names: {expected_named - names}"
@@ -243,6 +246,29 @@ def test_bus_diagnose_tool_present_and_callable(adapter):
     ), f"description missing core concept: {tool.description[:200]!r}"
     schema = tool.inputSchema
     assert "agent_id" in schema.get("properties", {})
+    assert "detail" in schema.get("properties", {})
+
+
+def test_bus_welcome_tool_present_and_callable(adapter):
+    """``bus_welcome`` is the user-facing MCP face of
+    fr_khonliang-bus_37498850 — the one-call cold-start discovery
+    super-skill. Parallel structure to the agent_provenance and
+    bus_diagnose presence tests so a rename gets caught at the name
+    level, not just the aggregate count."""
+    mcp = adapter.build()
+    tools = asyncio.run(mcp.list_tools())
+    matches = [t for t in tools if t.name == "bus_welcome"]
+    assert len(matches) == 1, "bus_welcome not registered"
+    tool = matches[0]
+    assert tool.description, "bus_welcome is missing a description"
+    desc_lower = tool.description.lower()
+    # Description should mention core concepts a cold-start caller
+    # cares about: platform / agents / cold-start orientation.
+    assert any(
+        kw in desc_lower
+        for kw in ("cold-start", "platform", "agents", "discovery", "welcome")
+    ), f"description missing core concept: {tool.description[:200]!r}"
+    schema = tool.inputSchema
     assert "detail" in schema.get("properties", {})
 
 
