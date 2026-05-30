@@ -252,6 +252,12 @@ class BusServer:
         # agent_id → error message; populated by autostart_installed_agents()
         # on bus boot. Reset on each bus restart (runtime-only, not persisted).
         self._autostart_failures: dict[str, str] = {}
+        # Wall-clock start time of this BusServer instance — used by
+        # ``get_bus_welcome`` to report ``bus_uptime_s`` so cold-start
+        # callers know whether the bus just rebooted (likely dead agents
+        # haven't been respawned yet) vs has been up long enough that
+        # missing agents are real outages. fr_khonliang-bus_37498850.
+        self._started_at = time.time()
         # agent_id → count of times the supervisor re-started this agent in
         # the current bus lifetime. Reset on each bus restart. v1: pure
         # counter for visibility / log signal — no max-failures cap or
@@ -1496,6 +1502,161 @@ class BusServer:
             "notes": notes,
         }, redact_sensitive)
 
+    #: Wire schema version for ``get_bus_welcome``. Bump when the response
+    #: shape changes in a way callers must adapt to (additive fields don't
+    #: warrant a bump — clients should ignore unknown keys per
+    #: ``feedback_cheap_irreversible_principle``).
+    BUS_WELCOME_SCHEMA_VERSION = 1
+
+    def get_bus_welcome(self, detail: str = "brief") -> dict:
+        """One-call cold-start discovery of the platform.
+
+        Joins three data sources into a single response a fresh Claude
+        session (or any cold-context caller) can use to learn what's
+        registered, what each agent does, what state it's in, and what
+        to do next:
+
+        - ``registrations`` + ``self._autostart_failures`` (live state,
+          via :meth:`get_services` — single source of truth so
+          ``bus_welcome.agents[].state`` and ``bus_services`` never
+          disagree, per ``fr_khonliang-bus_37498850`` acceptance #3).
+        - ``installed_agents`` (canonical catalog — surfaces dead agents
+          callers may want to ``bus_start_agent``).
+        - ``welcomes`` (per-agent editorial content cached by bus-lib
+          on register, ``fr_khonliang-bus_f96722dd``).
+
+        Args:
+            detail: ``"brief"`` (default) returns role + state + skill_count
+                per agent; ``"full"`` adds mission, full skills list, and
+                the welcome's editorial fields (boundaries, entry_points,
+                guide_skill).
+
+        Returns:
+            See ``fr_khonliang-bus_37498850`` for the canonical shape.
+            ``platform`` always includes ``schema_version`` so consumers
+            can branch on it.
+
+        No live-probe is performed — state comes from heartbeat-driven
+        ``registrations.status`` + ``installed_agents`` + the failed-
+        autostart table. Bus_welcome is meant to be cheap (single call
+        every cold-start session); explicit liveness checks live on
+        ``bus_services`` / dedicated probe endpoints.
+        """
+        if detail not in {"brief", "full"}:
+            return {"error": f"detail must be one of brief|full (got {detail!r})"}
+
+        services = self.get_services()
+        services_by_id = {s["id"]: s for s in services}
+        installed = self.db.get_installed_agents()
+        installed_by_id = {a["id"]: a for a in installed}
+        welcomes = {w["agent_id"]: w for w in self.db.list_agent_welcomes()}
+
+        agents: list[dict] = []
+        # Union of all known agent_ids — registered, installed, or
+        # welcome-only. Sorted for deterministic output.
+        all_ids = sorted(
+            set(services_by_id) | set(installed_by_id) | set(welcomes)
+        )
+
+        for agent_id in all_ids:
+            svc = services_by_id.get(agent_id)
+            inst = installed_by_id.get(agent_id)
+            welcome_record = welcomes.get(agent_id)
+            welcome_dict = (welcome_record or {}).get("welcome") or {}
+
+            # State: prefer the runtime svc.status (single source of truth
+            # per FR acceptance #3); fall back to cataloged_dead when the
+            # agent is installed but absent from runtime.
+            if svc:
+                state = svc["status"]  # 'healthy' / 'unhealthy' / 'dead' /
+                                       # 'autostart_failed' (from get_services)
+            elif inst:
+                state = "cataloged_dead"
+            else:
+                # Welcome-only: an agent that registered, published a
+                # welcome, then deregistered without an install row. Rare
+                # but possible (ad-hoc registrations per
+                # ``feedback_adhoc_agents_are_first_class``).
+                state = "deregistered"
+
+            entry: dict = {
+                "agent_id": agent_id,
+                "agent_type": (
+                    (svc or {}).get("agent_type")
+                    or (inst or {}).get("agent_type")
+                    or welcome_dict.get("agent_type", "unknown")
+                ),
+                "role": welcome_dict.get("role", ""),
+                # Prefer the live svc count; only fall back to the cached
+                # welcome when svc omits it. ``is not None`` (not truthiness)
+                # so a live ``0`` is preserved rather than masked by the cache.
+                "skill_count": (
+                    live_skill_count
+                    if (live_skill_count := (svc or {}).get("skill_count")) is not None
+                    else welcome_dict.get("skill_count", 0)
+                ),
+                "state": state,
+                "pid": (svc or {}).get("pid"),
+                "welcome_cached_at": (welcome_record or {}).get("updated_at"),
+            }
+            if detail == "full":
+                entry["mission"] = welcome_dict.get("mission", "")
+                # Skills list: prefer the live one (richer than the cached
+                # welcome's catalog summary), fall back to welcome's
+                # skills_by_category, last fall back to skill_count only.
+                if svc and svc.get("skills"):
+                    entry["skills"] = svc["skills"]
+                elif welcome_dict.get("skills_by_category"):
+                    entry["skills_by_category"] = welcome_dict["skills_by_category"]
+                # Editorial fields (only present when the agent populated them).
+                for k in ("boundaries", "entry_points", "guide_skill"):
+                    if k in welcome_dict:
+                        entry[k] = welcome_dict[k]
+                # Autostart error, when applicable.
+                if svc and svc.get("autostart_error"):
+                    entry["autostart_error"] = svc["autostart_error"]
+            agents.append(entry)
+
+        # suggested_next: hints that turn the response into a runnable
+        # decision tree for a cold-start LLM.
+        suggested: list[str] = []
+        dead_with_install = [
+            a["agent_id"] for a in agents
+            if a["state"] in {"cataloged_dead", "dead", "autostart_failed"}
+            and a["agent_id"] in installed_by_id
+        ]
+        if dead_with_install:
+            suggested.append(
+                f"bus_start_agent(agent_id=<id>) for any of "
+                f"{dead_with_install} before invoking their skills"
+            )
+        live = [a["agent_id"] for a in agents if a["state"] == "healthy"]
+        if live and detail == "brief":
+            suggested.append(
+                "bus_welcome(detail='full') for mission + skill catalog "
+                "per agent"
+            )
+        if live:
+            suggested.append(
+                "<agent_id>.welcome for richer drill-in once an agent is live"
+            )
+        suggested.append("bus_skills(agent_id=<id>) for full per-agent skill schemas")
+        suggested.append("bus_topics for the event surface (subscribe via bus_wait_for_event)")
+
+        return {
+            "platform": {
+                "name": "khonliang",
+                "identity": (
+                    "externalized-memory ecosystem; bus = durable hub, "
+                    "agents = peer services"
+                ),
+                "bus_uptime_s": int(time.time() - self._started_at),
+                "schema_version": self.BUS_WELCOME_SCHEMA_VERSION,
+            },
+            "agents": agents,
+            "suggested_next": suggested,
+        }
+
     def get_platform_status(self) -> dict:
         installed = self.db.get_installed_agents()
         regs = self.db.get_registrations()
@@ -2230,6 +2391,20 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         except ValueError as e:
             raise HTTPException(status_code=413, detail=str(e))
         return {"agent_id": agent_id, "status": "stored"}
+
+    @app.get("/v1/welcome")
+    def bus_welcome(detail: str = "brief"):
+        # fr_khonliang-bus_37498850: one-call cold-start discovery — platform
+        # info + per-agent {role, mission, skills, state}. Defaults to brief;
+        # pass ?detail=full for the full skill catalog + editorial fields.
+        # Reject invalid detail with 400 (mirrors /v1/diagnose) rather than
+        # forwarding get_bus_welcome's error dict as an HTTP 200 body.
+        if detail not in ("brief", "full"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"detail must be 'brief' or 'full', got {detail!r}",
+            )
+        return bus.get_bus_welcome(detail=detail)
 
     @app.get("/v1/agents/welcomes")
     def list_welcomes():

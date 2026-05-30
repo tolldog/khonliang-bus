@@ -189,6 +189,69 @@ class BusMCPAdapter:
             return "=== AGENTS ===\n" + "\n".join(lines)
 
         @mcp.tool()
+        async def bus_welcome(detail: str = "brief") -> str:
+            """One-call cold-start discovery of the khonliang platform.
+
+            For a fresh Claude session (or any cold-context caller): returns
+            platform identity + per-agent {role, mission, skills, state} +
+            ``suggested_next`` hints so the response is a runnable decision
+            tree, not just data. Closes ``fr_khonliang-bus_37498850``.
+
+            Args:
+                detail: ``"brief"`` (default) for role + state + skill_count
+                    per agent; ``"full"`` for mission + full skills list +
+                    editorial fields (boundaries, entry_points, guide_skill).
+
+            Use case (load-bearing): an LLM that wants a skill on a
+            cataloged-but-dead agent sees ``state="cataloged_dead"`` and the
+            ``suggested_next`` hint telling it to ``bus_start_agent(...)``
+            first. No CLAUDE.md spelunking required to bootstrap.
+            """
+            w = adapter._get("/v1/welcome", params={"detail": detail})
+            # ``_get`` returns None on any HTTP/transport failure; guard so a
+            # transient error surfaces as a readable message rather than an
+            # AttributeError on the next ``.get`` (mirrors bus_diagnose).
+            if not isinstance(w, dict):
+                return f"unexpected response: {w!r}"
+            lines = []
+            p = w.get("platform", {})
+            lines.append(
+                f"=== {p.get('name', 'platform')} "
+                f"(schema_v{p.get('schema_version', '?')}, "
+                f"up {p.get('bus_uptime_s', 0)}s) ==="
+            )
+            if p.get("identity"):
+                lines.append(p["identity"])
+            lines.append("")
+            lines.append("AGENTS:")
+            for a in w.get("agents", []):
+                state_mark = {
+                    "healthy": "✓",
+                    "unhealthy": "!",
+                    "dead": "✗",
+                    "cataloged_dead": "○",
+                    "autostart_failed": "✗",
+                    "deregistered": "·",
+                }.get(a.get("state"), "?")
+                line = (
+                    f"  {state_mark} {a['agent_id']} "
+                    f"[{a.get('state', '?')}] "
+                    f"— {a.get('role') or '(no role)'} "
+                    f"({a.get('skill_count', 0)} skills)"
+                )
+                lines.append(line)
+                if detail == "full" and a.get("mission"):
+                    lines.append(f"      mission: {a['mission']}")
+                if a.get("autostart_error"):
+                    lines.append(f"      autostart_error: {a['autostart_error']}")
+            if w.get("suggested_next"):
+                lines.append("")
+                lines.append("SUGGESTED NEXT:")
+                for s in w["suggested_next"]:
+                    lines.append(f"  - {s}")
+            return "\n".join(lines)
+
+        @mcp.tool()
         async def bus_agent_provenance(agent_id: str) -> str:
             """Show what process is serving ``agent_id`` and whether it matches
             the canonical install.
@@ -1127,9 +1190,14 @@ def main():
     adapter = BusMCPAdapter(args.bus, default_timeout_s=default_timeout)
     mcp = adapter.build()
 
+    # Count the tools actually registered on the server rather than a
+    # hardcoded built-in offset, which silently drifts whenever a built-in
+    # tool is added or removed. At startup no agent skills are registered
+    # yet, so this reflects the built-in surface and stays correct as it grows.
+    tool_count = len(asyncio.run(mcp.list_tools()))
     logger.info(
         "Bus-MCP adapter started. %d tools registered. Bus: %s Default timeout: %.1fs",
-        len(adapter._registered_tools) + 21,  # +21 for built-in bus tools
+        tool_count,
         args.bus,
         default_timeout,
     )
