@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -1335,21 +1336,77 @@ class BusServer:
 
         return {"id": agent_id, "status": reg["status"], "pid": pid}
 
+    #: Default heartbeat-freshness threshold (seconds). Beyond this age since
+    #: the last heartbeat, a row the catalog still marks 'healthy' is reported
+    #: as 'stale' — its process is gone or wedged even though the last status
+    #: write said healthy. ~3 missed beats at a 30s cadence; tune via
+    #: config['heartbeat_stale_threshold_s'].
+    _DEFAULT_HEARTBEAT_STALE_S: float = 90.0
+
+    @staticmethod
+    def _heartbeat_age_s(last_heartbeat: str | None, now: float | None = None) -> float | None:
+        """Seconds since ``last_heartbeat`` (a SQLite ``datetime('now')`` UTC
+        text stamp, ``'YYYY-MM-DD HH:MM:SS'``), or ``None`` when the value is
+        missing/unparseable. ``now`` (epoch seconds, UTC) is injectable for
+        deterministic tests."""
+        if not last_heartbeat:
+            return None
+        try:
+            dt = datetime.strptime(last_heartbeat, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+        except (ValueError, TypeError):
+            # Defensive: last_heartbeat is always machine-written by SQLite
+            # datetime('now'), so this should never fire. Log at debug (not
+            # error) to surface the offending value for diagnosis without
+            # spamming — get_services parses on every services listing.
+            logger.debug("unparseable last_heartbeat %r; treating age as unknown", last_heartbeat)
+            return None
+        ref = now if now is not None else time.time()
+        return ref - dt.timestamp()
+
     def get_services(self) -> list[dict]:
         regs = self.db.get_registrations()
         registered_ids = {reg["id"] for reg in regs}
+        threshold = float(
+            self.config.get("heartbeat_stale_threshold_s", self._DEFAULT_HEARTBEAT_STALE_S)
+        )
         result = []
         for reg in regs:
             skills = self.db.get_skills(reg["id"])
+            # Derive LIVE state instead of echoing the stored catalog status
+            # (bug_khonliang-bus_529d12df): a row stays 'healthy' from its last
+            # heartbeat write even after the process dies, so the catalog 'lies'
+            # until an operator notices. Two read-time signals, strongest first;
+            # both only DOWNGRADE — an already-worse row is never resurrected to
+            # 'healthy'. This is the single source of truth consumed by
+            # bus_welcome, the supervisor, and the lazy-loader (fr_..._7bf5ce84).
+            #   1. dead  — the registered PID is gone from /proc (definitive;
+            #              local single-host check, same as boot reconciliation
+            #              and diagnose). pid=0 (WS reg without a PID) skips it.
+            #   2. stale — no PID signal, but the heartbeat is older than the
+            #              configurable freshness threshold.
+            age = self._heartbeat_age_s(reg.get("last_heartbeat"))
+            stored = reg["status"]
+            pid = reg.get("pid")
+            pid_int = int(pid) if pid else 0
+            if pid_int > 0 and not _pid_alive(pid_int):
+                status = "dead"
+            elif stored == "healthy" and age is not None and age > threshold:
+                status = "stale"
+            else:
+                status = stored
             result.append({
                 "id": reg["id"],
                 "agent_type": reg["agent_type"],
-                "status": reg["status"],
+                "status": status,
                 "version": reg["version"],
                 "callback_url": reg["callback_url"],
                 "pid": reg["pid"],
                 "skill_count": len(skills),
                 "skills": [s["name"] for s in skills],
+                "last_heartbeat": reg.get("last_heartbeat"),
+                "heartbeat_age_s": round(age, 1) if age is not None else None,
             })
         # Surface autostart failures alongside live registrations so the
         # services list reflects the FULL post-boot picture, not just the
