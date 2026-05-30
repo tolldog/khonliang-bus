@@ -158,3 +158,16 @@ def test_start_agent_restarts_dead_healthy_row(tmp_path, monkeypatch):
     # Don't actually spawn — assert the guard fell through to a (re)start.
     monkeypatch.setattr(bus, "_start_process", lambda installed: {"id": "a1", "status": "started"})
     assert bus.start_agent("a1")["status"] == "started"
+
+
+def test_autostart_failed_entry_has_uniform_shape(tmp_path):
+    # Synthetic autostart_failed entries must carry the same liveness fields as
+    # live rows so /v1/services clients can read them unconditionally.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db, "ghost")
+    bus = _bus(db)
+    bus._autostart_failures["ghost"] = "boom: bad config"
+    entry = {s["id"]: s for s in bus.get_services()}["ghost"]
+    assert entry["status"] == "autostart_failed"
+    assert entry["last_heartbeat"] is None
+    assert entry["heartbeat_age_s"] is None

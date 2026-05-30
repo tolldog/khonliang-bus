@@ -135,15 +135,17 @@ def test_start_agent_no_longer_already_running_after_reconcile(tmp_path, fake_al
     # Observe the guard's decision without spawning a real process.
     monkeypatch.setattr(bus, "_start_process", lambda installed: {"id": "my-agent", "status": "started"})
 
-    # Layer 1: the liveness-aware guard refuses the false 'already_running'.
+    # Layer 1: the liveness-aware guard refuses the false 'already_running' and
+    # falls through to the (stubbed) restart path — assert the exact status so
+    # the test fails if the guard ever stops reaching _start_process.
     pre = bus.start_agent("my-agent")
-    assert pre.get("status") != "already_running", f"guard should not short-circuit a dead-PID row: {pre}"
+    assert pre.get("status") == "started", f"guard should fall through to restart a dead-PID row: {pre}"
 
     # Layer 2: reconcile deregisters the stale row outright.
     bus.reconcile_on_boot()
     assert db.get_registration("my-agent") is None
     after = bus.start_agent("my-agent")
-    assert after.get("status") != "already_running", f"post-reconcile should not short-circuit: {after}"
+    assert after.get("status") == "started", f"post-reconcile should restart, not short-circuit: {after}"
 
 
 # -- _pid_alive helper semantics ---------------------------------------------

@@ -1440,6 +1440,10 @@ class BusServer:
                 "pid": None,
                 "skill_count": 0,
                 "skills": [],
+                # Keep the entry shape uniform with live registrations so
+                # /v1/services clients can read these fields unconditionally.
+                "last_heartbeat": None,
+                "heartbeat_age_s": None,
                 "autostart_error": error,
             })
         return result
