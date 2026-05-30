@@ -171,30 +171,47 @@ def test_bus_artifact_distill_tool_forwards_cache_args(adapter):
     assert captured["body"]["max_chars"] == 1000
 
 
-def test_total_tool_count(adapter):
-    mcp = adapter.build()
-    tools = asyncio.run(mcp.list_tools())
-    names = {t.name for t in tools}
-    # 18 bus tools (12 non-artifact + 2 distill + 1 bus_topics +
-    # 1 bus_agent_provenance + 1 bus_diagnose + 1 bus_welcome) +
-    # 3 skills + 1 flow = 22.
-    # The seven read-side bus_artifact_* tools were retired with
-    # khonliang-store Phase 4c (`fr_khonliang-bus_9151395d`);
-    # ``bus_topics`` closed fr_bus_7b2d41d2; ``bus_agent_provenance``
-    # closes fr_khonliang-bus_aa096048 (Tier 1 visibility);
-    # ``bus_diagnose`` closes fr_khonliang-bus_8fe376c7 (v1, bus-side
-    # fields only); ``bus_welcome`` closes fr_khonliang-bus_37498850
-    # (super-skill cold-start discovery).
-    assert len(tools) == 22
-    # Spot-check load-bearing names so the aggregate count alone can't
-    # mask a rename / replacement (per Copilot R3 on PR #34).
+def test_total_tool_count(adapter, tmp_path):
+    """Registering agents adds exactly one tool per skill + per flow on top of
+    the built-in bus tools.
+
+    Asserted as a dynamic delta against the built-in surface (derived from an
+    adapter pointed at an empty bus) rather than a hardcoded total, so adding
+    or removing a built-in tool flows through automatically — no magic number
+    to bump here or in the startup log.
+    """
+    names = {t.name for t in asyncio.run(adapter.build().list_tools())}
+
+    # Baseline: an adapter pointed at a bus with NO registered agents exposes
+    # only the built-in bus tools. This is the single source of truth for the
+    # built-in surface; the populated adapter must equal it plus the fixture's
+    # dynamically-registered skills/flows.
+    empty_app = create_app(db_path=str(tmp_path / "empty-bus.db"))
+    empty = BusMCPAdapter("http://testserver")
+    empty._http = TestClient(empty_app)
+    builtin = {t.name for t in asyncio.run(empty.build().list_tools())}
+
+    # The `adapter` fixture registers 3 agent skills + 1 collaboration flow.
+    dynamic_expected = {
+        "researcher-primary.find_papers",
+        "researcher-primary.synergize",
+        "developer-primary.read_spec",
+        "evaluate_spec",
+    }
+    assert names == builtin | dynamic_expected, (
+        f"unexpected tool set delta: "
+        f"missing={(builtin | dynamic_expected) - names}, extra={names - (builtin | dynamic_expected)}"
+    )
+
+    # Spot-check load-bearing built-in names so a rename / replacement can't
+    # slip through the set comparison unnoticed (per Copilot R3 on PR #34).
     expected_named = {
         "bus_services", "bus_status", "bus_matrix", "bus_flows",
         "bus_skills", "bus_topics", "bus_agent_provenance", "bus_diagnose",
         "bus_welcome",
     }
-    assert expected_named.issubset(names), (
-        f"missing required tool names: {expected_named - names}"
+    assert expected_named.issubset(builtin), (
+        f"missing required built-in tool names: {expected_named - builtin}"
     )
 
 

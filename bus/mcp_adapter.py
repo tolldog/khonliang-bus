@@ -1190,9 +1190,14 @@ def main():
     adapter = BusMCPAdapter(args.bus, default_timeout_s=default_timeout)
     mcp = adapter.build()
 
+    # Count the tools actually registered on the server rather than a
+    # hardcoded built-in offset, which silently drifts whenever a built-in
+    # tool is added or removed. At startup no agent skills are registered
+    # yet, so this reflects the built-in surface and stays correct as it grows.
+    tool_count = len(asyncio.run(mcp.list_tools()))
     logger.info(
         "Bus-MCP adapter started. %d tools registered. Bus: %s Default timeout: %.1fs",
-        len(adapter._registered_tools) + 21,  # +21 for built-in bus tools
+        tool_count,
         args.bus,
         default_timeout,
     )
