@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 import uuid
 from typing import Any
@@ -241,9 +242,22 @@ class BusServer:
         self.db = db
         self.config = config or {}
         self._processes: dict[str, subprocess.Popen] = {}  # agent_id → process
+        # FastAPI runs sync ``def`` lifecycle handlers (install/start/stop/
+        # restart) in a thread pool while the supervisor loop runs on the
+        # event loop — both mutate ``_processes``. A ``threading.Lock``
+        # works for both (sync threadpool callers and async-loop callers
+        # use the same ``with`` syntax) and keeps the lock surface small
+        # compared to flipping every lifecycle handler to ``async def``.
+        self._processes_lock = threading.Lock()
         # agent_id → error message; populated by autostart_installed_agents()
         # on bus boot. Reset on each bus restart (runtime-only, not persisted).
         self._autostart_failures: dict[str, str] = {}
+        # agent_id → count of times the supervisor re-started this agent in
+        # the current bus lifetime. Reset on each bus restart. v1: pure
+        # counter for visibility / log signal — no max-failures cap or
+        # backoff (sibling fr_khonliang-bus_dc4ef3e9 follow-up).
+        self._supervisor_restart_counts: dict[str, int] = {}
+        self._supervisor_task: asyncio.Task | None = None
         self._http = httpx.AsyncClient(timeout=30.0)
         self._subscribers: dict[str, list[WebSocket]] = {}  # topic → websockets
         self._agent_connections: dict[str, WebSocket] = {}  # agent_id → WebSocket
@@ -270,6 +284,17 @@ class BusServer:
         self.scheduler = SchedulerIntegration(db)
 
     async def shutdown(self) -> None:
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # Don't blanket-swallow: a real supervisor crash should be
+                # diagnosable in the bus log. Preserve the traceback.
+                logger.exception("Supervisor task raised during shutdown")
+            self._supervisor_task = None
         if self._async_request_tasks:
             for task in list(self._async_request_tasks):
                 task.cancel()
@@ -360,6 +385,187 @@ class BusServer:
             "skipped": skipped,
             "failed": dict(self._autostart_failures),
         }
+
+    def supervise_once(self) -> dict:
+        """Single-pass supervision sweep: walk ``self._processes`` and re-launch
+        any whose underlying subprocess has exited.
+
+        Only attaches to processes the CURRENT bus instance spawned (per
+        ``feedback_supervision_asymmetry_bus_vs_agents`` — agents stay
+        ephemeral; bus is systemd-managed). Across a bus restart, the
+        ``_processes`` dict is fresh and supervision picks up whatever
+        autostart spawned in this lifetime.
+
+        v1 scope (fr_khonliang-bus_dc4ef3e9): detect + restart. No backoff,
+        no per-agent max-failures threshold, no operator notification — all
+        explicit follow-ups. Restart count tracked in
+        ``self._supervisor_restart_counts`` for log / visibility signal.
+
+        Returns ``{restarted: [...], alive: [...], lost: {id: reason}}``.
+        ``lost`` covers cases where the agent was found dead but the
+        restart attempt also failed.
+        """
+        restarted: list[str] = []
+        alive: list[str] = []
+        lost: dict[str, str] = {}
+        # Snapshot under the lock so the supervisor's view of the world
+        # doesn't change underfoot while a threadpool-served lifecycle
+        # handler mutates ``_processes``. Inspecting dead Popens and
+        # calling ``_start_process`` happen outside the lock — they
+        # don't need it (Popen.poll is per-process) and ``_start_process``
+        # re-acquires the lock for its own write.
+        with self._processes_lock:
+            tracked = list(self._processes.items())
+        for agent_id, proc in tracked:
+            if proc.poll() is None:
+                alive.append(agent_id)
+                continue
+            # Process exited. Pop the dead entry before relaunching so the
+            # new Popen replaces it cleanly.
+            exit_code = proc.returncode
+            crashed_pid = proc.pid
+            with self._processes_lock:
+                # Re-check under the lock: a concurrent stop_agent may have
+                # already removed/replaced the entry.
+                current = self._processes.get(agent_id)
+                if current is proc:
+                    self._processes.pop(agent_id, None)
+                elif current is not None:
+                    # Someone else replaced our tracked Popen with a new one
+                    # — that's the new canonical process. Don't touch it.
+                    alive.append(agent_id)
+                    continue
+                else:
+                    # current is None: a concurrent stop_agent / restart /
+                    # uninstall already popped our tracked entry. That path
+                    # now owns this agent_id — don't resurrect a deliberately
+                    # stopped agent. (Sweeps are serialized on the supervisor
+                    # task, so this is never a competing supervisor pass.)
+                    continue
+            installed = self.db.get_installed_agent(agent_id)
+            if installed is None:
+                # Agent was uninstalled while supervised — don't relaunch.
+                lost[agent_id] = "no longer installed"
+                logger.warning("Supervisor: %s exited (code=%s) and is no longer installed", agent_id, exit_code)
+                continue
+            # If a different instance has already registered against this
+            # agent_id (operator manually started a replacement between the
+            # crash and this sweep, or another supervisor instance got there
+            # first), don't touch its registration. WS-register payloads
+            # may legitimately carry ``pid=0`` (see ``handle_agent_ws``
+            # default), so the PID-mismatch check alone isn't sufficient
+            # — also short-circuit if there's an active WebSocket
+            # connection for this agent_id, which always means a live
+            # peer is talking to the bus right now.
+            reg = self.db.get_registration(agent_id)
+            ws_active = self.is_agent_ws_connected(agent_id)
+            different_pid = (
+                reg is not None
+                and reg.get("pid")
+                and int(reg["pid"]) != crashed_pid
+            )
+            if ws_active or different_pid:
+                logger.info(
+                    "Supervisor: %s exited (code=%s, pid=%s) but a replacement is present (ws=%s, reg_pid=%s); not disturbing",
+                    agent_id, exit_code, crashed_pid, ws_active,
+                    (reg or {}).get("pid"),
+                )
+                alive.append(agent_id)
+                continue
+            # Clear the stale registration (our own crashed instance's row) so
+            # start_agent doesn't see a leftover 'healthy' row and short-circuit
+            # to ``already_running``. Only delete when a row actually exists:
+            # ``deregister_agent`` also drops the agent's skills/flows, so an
+            # unconditional delete would wipe a replacement that registered in
+            # the (near-zero, no-I/O) window since the guard above. When reg is
+            # None there's nothing of ours to clear — go straight to restart.
+            # Full atomicity (a pid-conditional DB delete) is out of v1 scope
+            # (fr_khonliang-bus_dc4ef3e9).
+            if reg is not None:
+                self.db.deregister_agent(agent_id)
+            result = self._start_process(installed)
+            if result.get("status") == "started":
+                count = self._supervisor_restart_counts.get(agent_id, 0) + 1
+                self._supervisor_restart_counts[agent_id] = count
+                restarted.append(agent_id)
+                logger.info(
+                    "Supervisor: %s exited (code=%s), restarted (pid=%s, restart_count=%d)",
+                    agent_id, exit_code, result.get("pid"), count,
+                )
+            else:
+                err = result.get("error", f"unexpected _start_process result: {result!r}")
+                lost[agent_id] = err
+                logger.warning(
+                    "Supervisor: %s exited (code=%s); restart failed: %s",
+                    agent_id, exit_code, err,
+                )
+        return {"restarted": restarted, "alive": alive, "lost": lost}
+
+    async def _supervision_loop(self, interval: float) -> None:
+        """Background task: call :meth:`supervise_once` every ``interval`` seconds.
+
+        Cancelled in :meth:`shutdown`. A v1 deliberate trade-off: poll
+        rather than SIGCHLD because the supervised set is small (~10 agents)
+        and we want bus restart semantics to remain trivial (no signal
+        handler ownership tangle with FastAPI / uvicorn).
+        """
+        logger.info("Supervisor loop started (interval=%.1fs)", interval)
+        try:
+            while True:
+                try:
+                    # Run the sweep in a worker thread: supervise_once does
+                    # sqlite I/O and may spawn subprocesses, which would
+                    # otherwise block the event loop (WS/HTTP handling) for
+                    # the duration. ``_processes_lock`` is a threading.Lock
+                    # precisely so this off-loop access stays safe alongside
+                    # the threadpool-served lifecycle endpoints.
+                    await asyncio.to_thread(self.supervise_once)
+                except Exception:
+                    # ``logger.exception`` preserves the traceback in the
+                    # bus log — important because the supervisor swallows
+                    # the error and keeps looping, so the only signal of a
+                    # genuine bug here is the log line.
+                    logger.exception("Supervisor sweep raised")
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info("Supervisor loop cancelled")
+            raise
+
+    # Minimum supervisor sweep cadence. Below this, ``asyncio.sleep`` either
+    # raises (negative) or effectively spins (zero, very small positive),
+    # which would peg the event loop and flood logs. 0.1s is small enough
+    # for tight tests but still a true delay.
+    _SUPERVISOR_MIN_INTERVAL_S: float = 0.1
+
+    def start_supervisor(self, interval: float | None = None) -> asyncio.Task:
+        """Launch the supervision loop as a background task. Idempotent —
+        returns the existing task if one is already running.
+
+        Raises ``ValueError`` if ``interval`` (or
+        ``config.supervisor_interval_s``) is below
+        :attr:`_SUPERVISOR_MIN_INTERVAL_S` — a non-positive interval
+        would silently disable supervision by spinning the event loop
+        or raising deep inside ``asyncio.sleep``.
+        """
+        if self._supervisor_task is not None and not self._supervisor_task.done():
+            return self._supervisor_task
+        raw = (
+            interval
+            if interval is not None
+            else self.config.get("supervisor_interval_s", 5.0)
+        )
+        try:
+            secs = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"supervisor interval must be a positive number, got {raw!r}"
+            ) from exc
+        if secs < self._SUPERVISOR_MIN_INTERVAL_S:
+            raise ValueError(
+                f"supervisor interval must be >= {self._SUPERVISOR_MIN_INTERVAL_S}s, got {secs}"
+            )
+        self._supervisor_task = asyncio.create_task(self._supervision_loop(secs))
+        return self._supervisor_task
 
     async def diagnose(self, agent_id: str, detail: str = "brief") -> dict:
         """Probe an agent across multiple failure axes.
@@ -555,7 +761,8 @@ class BusServer:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self._processes[agent_id] = proc
+            with self._processes_lock:
+                self._processes[agent_id] = proc
             logger.info("Started agent %s (pid=%d)", agent_id, proc.pid)
             return {"id": agent_id, "pid": proc.pid, "status": "started"}
         except Exception as e:
@@ -563,7 +770,8 @@ class BusServer:
             return {"id": agent_id, "error": str(e)}
 
     def _stop_process(self, agent_id: str) -> None:
-        proc = self._processes.pop(agent_id, None)
+        with self._processes_lock:
+            proc = self._processes.pop(agent_id, None)
         if proc and proc.poll() is None:
             proc.terminate()
             try:
@@ -1928,6 +2136,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     async def lifespan(app):
         bus.reconcile_on_boot()
         bus.autostart_installed_agents()
+        bus.start_supervisor()
         yield
         await bus.shutdown()
 
