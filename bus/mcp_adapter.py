@@ -208,6 +208,11 @@ class BusMCPAdapter:
             first. No CLAUDE.md spelunking required to bootstrap.
             """
             w = adapter._get("/v1/welcome", params={"detail": detail})
+            # ``_get`` returns None on any HTTP/transport failure; guard so a
+            # transient error surfaces as a readable message rather than an
+            # AttributeError on the next ``.get`` (mirrors bus_diagnose).
+            if not isinstance(w, dict):
+                return f"unexpected response: {w!r}"
             lines = []
             p = w.get("platform", {})
             lines.append(
