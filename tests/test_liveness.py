@@ -125,3 +125,36 @@ def test_pid_zero_falls_back_to_heartbeat(tmp_path):
     _set_heartbeat(db, "a1", "2000-01-01 00:00:00")
     svc = _svc(_bus(db))
     assert svc["status"] == "stale"
+
+
+# -- start_agent guard consumes the same derivation ----------------------
+
+
+def _install(db: BusDB, agent_id: str = "a1") -> None:
+    db.install_agent(
+        agent_id=agent_id,
+        agent_type="test",
+        command="/bin/true",
+        args=[],
+        cwd="/tmp",
+        config="/tmp/cfg.yaml",
+    )
+
+
+def test_start_agent_already_running_only_when_derived_live(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db)
+    _register(db)  # healthy row, live pid
+    bus = _bus(db)
+    assert bus.start_agent("a1")["status"] == "already_running"
+
+
+def test_start_agent_restarts_dead_healthy_row(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db)
+    _register(db)  # stored 'healthy', but the process is gone
+    bus = _bus(db)
+    monkeypatch.setattr(server_mod, "_pid_alive", lambda pid: False)
+    # Don't actually spawn — assert the guard fell through to a (re)start.
+    monkeypatch.setattr(bus, "_start_process", lambda installed: {"id": "a1", "status": "started"})
+    assert bus.start_agent("a1")["status"] == "started"

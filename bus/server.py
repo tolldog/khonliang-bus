@@ -740,7 +740,12 @@ class BusServer:
         if not installed:
             return {"id": agent_id, "error": "not installed"}
         reg = self.db.get_registration(agent_id)
-        if reg and reg["status"] == "healthy":
+        # Guard on DERIVED liveness, not the stored status: a row left 'healthy'
+        # by a crashed/rebooted process must not block its restart with a false
+        # 'already_running' (bug_khonliang-bus_529d12df; the runtime form of the
+        # post-reboot no-op in dog_8b70cbe3). Only a genuinely-live row short-
+        # circuits; dead/stale ones fall through to a real (re)start.
+        if reg and self._derive_live_status(reg) == "healthy":
             return {"id": agent_id, "status": "already_running"}
         return self._start_process(installed)
 
@@ -1365,37 +1370,46 @@ class BusServer:
         ref = now if now is not None else time.time()
         return ref - dt.timestamp()
 
+    def _derive_live_status(self, reg: dict) -> str:
+        """Live per-agent state derived from PID liveness + heartbeat freshness
+        — the SINGLE source of truth for "is this agent really up" used by
+        get_services, the start_agent ``already_running`` guard, and (read-time)
+        bus_welcome (fr_khonliang-bus_7bf5ce84 / bug_khonliang-bus_529d12df).
+
+        Two signals, strongest first; both only DOWNGRADE a row's stored status
+        — an already-worse row is never resurrected to 'healthy':
+          1. dead  — the registered PID is gone from /proc (definitive; local
+                     single-host check via _pid_alive, the same primitive boot
+                     reconciliation and diagnose use). pid=0 (WS registration
+                     without a PID) skips this and falls through to (2).
+          2. stale — a 'healthy' row whose last_heartbeat is older than the
+                     configurable freshness threshold.
+        """
+        stored = reg.get("status")
+        pid = reg.get("pid")
+        pid_int = int(pid) if pid else 0
+        if pid_int > 0 and not _pid_alive(pid_int):
+            return "dead"
+        if stored == "healthy":
+            threshold = float(
+                self.config.get("heartbeat_stale_threshold_s", self._DEFAULT_HEARTBEAT_STALE_S)
+            )
+            age = self._heartbeat_age_s(reg.get("last_heartbeat"))
+            if age is not None and age > threshold:
+                return "stale"
+        return stored
+
     def get_services(self) -> list[dict]:
         regs = self.db.get_registrations()
         registered_ids = {reg["id"] for reg in regs}
-        threshold = float(
-            self.config.get("heartbeat_stale_threshold_s", self._DEFAULT_HEARTBEAT_STALE_S)
-        )
         result = []
         for reg in regs:
             skills = self.db.get_skills(reg["id"])
-            # Derive LIVE state instead of echoing the stored catalog status
-            # (bug_khonliang-bus_529d12df): a row stays 'healthy' from its last
-            # heartbeat write even after the process dies, so the catalog 'lies'
-            # until an operator notices. Two read-time signals, strongest first;
-            # both only DOWNGRADE — an already-worse row is never resurrected to
-            # 'healthy'. This is the single source of truth consumed by
-            # bus_welcome, the supervisor, and the lazy-loader (fr_..._7bf5ce84).
-            #   1. dead  — the registered PID is gone from /proc (definitive;
-            #              local single-host check, same as boot reconciliation
-            #              and diagnose). pid=0 (WS reg without a PID) skips it.
-            #   2. stale — no PID signal, but the heartbeat is older than the
-            #              configurable freshness threshold.
+            # Live state derived at read time so the services list never reports
+            # a 'healthy' agent whose process is gone / heartbeat is stale
+            # (bug_khonliang-bus_529d12df). See _derive_live_status.
             age = self._heartbeat_age_s(reg.get("last_heartbeat"))
-            stored = reg["status"]
-            pid = reg.get("pid")
-            pid_int = int(pid) if pid else 0
-            if pid_int > 0 and not _pid_alive(pid_int):
-                status = "dead"
-            elif stored == "healthy" and age is not None and age > threshold:
-                status = "stale"
-            else:
-                status = stored
+            status = self._derive_live_status(reg)
             result.append({
                 "id": reg["id"],
                 "agent_type": reg["agent_type"],
