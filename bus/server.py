@@ -430,7 +430,13 @@ class BusServer:
                     # — that's the new canonical process. Don't touch it.
                     alive.append(agent_id)
                     continue
-                # current is None: another sweep already cleared us.
+                else:
+                    # current is None: a concurrent stop_agent / restart /
+                    # uninstall already popped our tracked entry. That path
+                    # now owns this agent_id — don't resurrect a deliberately
+                    # stopped agent. (Sweeps are serialized on the supervisor
+                    # task, so this is never a competing supervisor pass.)
+                    continue
             installed = self.db.get_installed_agent(agent_id)
             if installed is None:
                 # Agent was uninstalled while supervised — don't relaunch.
@@ -461,10 +467,17 @@ class BusServer:
                 )
                 alive.append(agent_id)
                 continue
-            # Clear any stale registration (our own crashed instance's row)
-            # so start_agent doesn't see a leftover 'healthy' row from
-            # before the crash and short-circuit to ``already_running``.
-            self.db.deregister_agent(agent_id)
+            # Clear the stale registration (our own crashed instance's row) so
+            # start_agent doesn't see a leftover 'healthy' row and short-circuit
+            # to ``already_running``. Only delete when a row actually exists:
+            # ``deregister_agent`` also drops the agent's skills/flows, so an
+            # unconditional delete would wipe a replacement that registered in
+            # the (near-zero, no-I/O) window since the guard above. When reg is
+            # None there's nothing of ours to clear — go straight to restart.
+            # Full atomicity (a pid-conditional DB delete) is out of v1 scope
+            # (fr_khonliang-bus_dc4ef3e9).
+            if reg is not None:
+                self.db.deregister_agent(agent_id)
             result = self._start_process(installed)
             if result.get("status") == "started":
                 count = self._supervisor_restart_counts.get(agent_id, 0) + 1
@@ -495,7 +508,13 @@ class BusServer:
         try:
             while True:
                 try:
-                    self.supervise_once()
+                    # Run the sweep in a worker thread: supervise_once does
+                    # sqlite I/O and may spawn subprocesses, which would
+                    # otherwise block the event loop (WS/HTTP handling) for
+                    # the duration. ``_processes_lock`` is a threading.Lock
+                    # precisely so this off-loop access stays safe alongside
+                    # the threadpool-served lifecycle endpoints.
+                    await asyncio.to_thread(self.supervise_once)
                 except Exception:
                     # ``logger.exception`` preserves the traceback in the
                     # bus log — important because the supervisor swallows

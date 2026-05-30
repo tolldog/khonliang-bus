@@ -244,6 +244,33 @@ def test_supervise_once_skips_when_replacement_is_already_registered(tmp_path, m
     assert "a1" not in bus._processes
 
 
+def test_supervise_once_does_not_restart_after_concurrent_stop(tmp_path, monkeypatch):
+    """If a concurrent stop_agent / restart pops the tracked entry between the
+    snapshot and the per-agent re-check, the supervisor must treat the agent as
+    no longer its own and NOT restart it — restarting would undo an operator
+    stop (the ``current is None`` branch of supervise_once)."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus(db)
+    spawned = _patch_fake_start_process(monkeypatch, bus)
+
+    class _SelfPoppingPopen(_FakePopen):
+        # poll() runs after the snapshot; popping here makes the re-check
+        # under the lock see ``current is None`` (a concurrent stop won the
+        # race to remove the entry).
+        def poll(self):
+            bus._processes.pop("a1", None)
+            return self.returncode
+
+    bus._processes["a1"] = _SelfPoppingPopen(pid=11111, alive=False, returncode=1)
+
+    result = bus.supervise_once()
+
+    assert spawned == []  # restart never fired
+    assert "a1" not in result["restarted"]
+    assert "a1" not in bus._processes
+
+
 async def test_start_supervisor_returns_running_task_and_is_idempotent(tmp_path):
     db = BusDB(str(tmp_path / "test-bus.db"))
     bus = _bus(db)
