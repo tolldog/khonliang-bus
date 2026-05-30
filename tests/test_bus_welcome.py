@@ -205,5 +205,6 @@ def test_rest_welcome_endpoint_honors_detail_query(client):
 
 
 def test_rest_welcome_endpoint_rejects_bad_detail(client):
-    body = client.get("/v1/welcome?detail=garbage").json()
-    assert "error" in body
+    r = client.get("/v1/welcome?detail=garbage")
+    assert r.status_code == 400
+    assert "detail" in r.json()["detail"]

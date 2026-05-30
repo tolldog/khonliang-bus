@@ -207,7 +207,7 @@ class BusMCPAdapter:
             ``suggested_next`` hint telling it to ``bus_start_agent(...)``
             first. No CLAUDE.md spelunking required to bootstrap.
             """
-            w = adapter._get(f"/v1/welcome?detail={detail}")
+            w = adapter._get("/v1/welcome", params={"detail": detail})
             lines = []
             p = w.get("platform", {})
             lines.append(

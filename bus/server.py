@@ -1379,7 +1379,14 @@ class BusServer:
                     or welcome_dict.get("agent_type", "unknown")
                 ),
                 "role": welcome_dict.get("role", ""),
-                "skill_count": (svc or {}).get("skill_count") or welcome_dict.get("skill_count", 0),
+                # Prefer the live svc count; only fall back to the cached
+                # welcome when svc omits it. ``is not None`` (not truthiness)
+                # so a live ``0`` is preserved rather than masked by the cache.
+                "skill_count": (
+                    live_skill_count
+                    if (live_skill_count := (svc or {}).get("skill_count")) is not None
+                    else welcome_dict.get("skill_count", 0)
+                ),
                 "state": state,
                 "pid": (svc or {}).get("pid"),
                 "welcome_cached_at": (welcome_record or {}).get("updated_at"),
@@ -2181,6 +2188,13 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         # fr_khonliang-bus_37498850: one-call cold-start discovery — platform
         # info + per-agent {role, mission, skills, state}. Defaults to brief;
         # pass ?detail=full for the full skill catalog + editorial fields.
+        # Reject invalid detail with 400 (mirrors /v1/diagnose) rather than
+        # forwarding get_bus_welcome's error dict as an HTTP 200 body.
+        if detail not in ("brief", "full"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"detail must be 'brief' or 'full', got {detail!r}",
+            )
         return bus.get_bus_welcome(detail=detail)
 
     @app.get("/v1/agents/welcomes")
