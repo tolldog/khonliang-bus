@@ -127,6 +127,15 @@ def test_pid_zero_falls_back_to_heartbeat(tmp_path):
     assert svc["status"] == "stale"
 
 
+def test_negative_pid_reports_dead(tmp_path):
+    # A negative PID is a malformed registration; it must be treated as dead
+    # WITHOUT probing (os.kill(-N, 0) would signal a whole process group).
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=-1)
+    svc = _svc(_bus(db))
+    assert svc["status"] == "dead"
+
+
 # -- start_agent guard consumes the same derivation ----------------------
 
 
@@ -158,6 +167,22 @@ def test_start_agent_restarts_dead_healthy_row(tmp_path, monkeypatch):
     # Don't actually spawn — assert the guard fell through to a (re)start.
     monkeypatch.setattr(bus, "_start_process", lambda installed: {"id": "a1", "status": "started"})
     assert bus.start_agent("a1")["status"] == "started"
+
+
+def test_start_agent_does_not_double_launch_stale_but_alive(tmp_path, monkeypatch):
+    # 'stale' = a live PID merely late on heartbeats. Restarting would spawn a
+    # second copy racing to register the same id, so the guard must still report
+    # already_running and NOT reach _start_process.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db)
+    _register(db)  # live pid (os.getpid)
+    _set_heartbeat(db, "a1", "2000-01-01 00:00:00")  # ancient → derived 'stale'
+    bus = _bus(db)
+    calls: list[int] = []
+    monkeypatch.setattr(bus, "_start_process", lambda installed: calls.append(1) or {"status": "started"})
+    res = bus.start_agent("a1")
+    assert res["status"] == "already_running"
+    assert calls == []  # did not double-launch
 
 
 def test_autostart_failed_entry_has_uniform_shape(tmp_path):

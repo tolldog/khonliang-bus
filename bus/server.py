@@ -740,12 +740,16 @@ class BusServer:
         if not installed:
             return {"id": agent_id, "error": "not installed"}
         reg = self.db.get_registration(agent_id)
-        # Guard on DERIVED liveness, not the stored status: a row left 'healthy'
-        # by a crashed/rebooted process must not block its restart with a false
-        # 'already_running' (bug_khonliang-bus_529d12df; the runtime form of the
-        # post-reboot no-op in dog_8b70cbe3). Only a genuinely-live row short-
-        # circuits; dead/stale ones fall through to a real (re)start.
-        if reg and self._derive_live_status(reg) == "healthy":
+        # Guard on DERIVED liveness, not the stored status. Short-circuit to
+        # already_running whenever a process is PRESENT — both 'healthy' and
+        # 'stale' qualify: 'stale' is alive-but-late-on-heartbeats (a positive
+        # live PID, or a pid-less row that was healthy), so (re)starting would
+        # double-launch and race to register the same agent id. Only a 'dead'
+        # derivation (PID gone) falls through to a real restart — the runtime
+        # form of the post-reboot no-op (bug_khonliang-bus_529d12df,
+        # dog_8b70cbe3). Stored statuses other than 'healthy' (e.g. 'unhealthy')
+        # are not 'stale'/'healthy' here, so they restart as before.
+        if reg and self._derive_live_status(reg) in ("healthy", "stale"):
             return {"id": agent_id, "status": "already_running"}
         return self._start_process(installed)
 
@@ -1388,6 +1392,13 @@ class BusServer:
         stored = reg.get("status")
         pid = reg.get("pid")
         pid_int = int(pid) if pid else 0
+        # A negative PID is a malformed registration — os.kill(-N, 0) targets a
+        # process GROUP, so never probe it; treat as dead (matches boot
+        # reconciliation, which reaps negative PIDs). pid_int == 0 (WS reg
+        # without a PID) skips the check and falls through to the heartbeat
+        # signal.
+        if pid_int < 0:
+            return "dead"
         if pid_int > 0 and not _pid_alive(pid_int):
             return "dead"
         if stored == "healthy":
