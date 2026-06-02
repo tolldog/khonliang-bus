@@ -185,6 +185,48 @@ def test_start_agent_does_not_double_launch_stale_but_alive(tmp_path, monkeypatc
     assert calls == []  # did not double-launch
 
 
+def test_start_agent_does_not_double_launch_unhealthy_but_alive(tmp_path, monkeypatch):
+    # An 'unhealthy' agent whose process is still alive must not be duplicated;
+    # only a dead PID restarts (operators use restart_agent to force).
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db)
+    _register(db)  # live pid
+    db.set_agent_status("a1", "unhealthy")
+    bus = _bus(db)
+    calls: list[int] = []
+    monkeypatch.setattr(bus, "_start_process", lambda installed: calls.append(1) or {"status": "started"})
+    res = bus.start_agent("a1")
+    assert res["status"] == "already_running"
+    assert calls == []
+
+
+def test_threshold_falls_back_on_bad_config(tmp_path):
+    # A malformed config value must not raise (would break /v1/services +
+    # start_agent); it falls back to the default threshold.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=0)  # pid 0 → derivation uses heartbeat + threshold
+    _set_heartbeat(db, "a1", "2000-01-01 00:00:00")
+    bus = _bus(db, heartbeat_stale_threshold_s="not-a-number")
+    assert bus._heartbeat_threshold_s() == BusServer._DEFAULT_HEARTBEAT_STALE_S
+    assert _svc(bus)["status"] == "stale"  # ancient heartbeat vs default 90s
+
+
+def test_check_agent_health_safe_for_pid_zero(tmp_path):
+    # pid=0 must NOT be probed via os.kill(0, 0) (caller's own process group);
+    # the derivation uses the heartbeat instead.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=0)  # fresh heartbeat from register
+    assert _bus(db).check_agent_health("a1")["status"] == "healthy"
+
+
+def test_check_agent_health_persists_dead_for_negative_pid(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=-1)  # malformed → dead, never probed
+    bus = _bus(db)
+    assert bus.check_agent_health("a1")["status"] == "dead"
+    assert db.get_registration("a1")["status"] == "dead"  # written back
+
+
 def test_autostart_failed_entry_has_uniform_shape(tmp_path):
     # Synthetic autostart_failed entries must carry the same liveness fields as
     # live rows so /v1/services clients can read them unconditionally.

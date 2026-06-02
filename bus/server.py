@@ -740,16 +740,17 @@ class BusServer:
         if not installed:
             return {"id": agent_id, "error": "not installed"}
         reg = self.db.get_registration(agent_id)
-        # Guard on DERIVED liveness, not the stored status. Short-circuit to
-        # already_running whenever a process is PRESENT — both 'healthy' and
-        # 'stale' qualify: 'stale' is alive-but-late-on-heartbeats (a positive
-        # live PID, or a pid-less row that was healthy), so (re)starting would
-        # double-launch and race to register the same agent id. Only a 'dead'
-        # derivation (PID gone) falls through to a real restart — the runtime
+        # Guard on DERIVED liveness, not the stored status. start_agent must not
+        # spawn a duplicate of an agent whose process is already PRESENT —
+        # _start_process never stops/probes an existing PID first, so a second
+        # copy would race to register the same id. Any non-'dead' derivation
+        # means a process is (or is presumed) up — 'healthy', 'stale' (alive but
+        # late on heartbeats), or 'unhealthy' (alive but degraded) — so only a
+        # 'dead' row (PID gone) falls through to a real (re)start, the runtime
         # form of the post-reboot no-op (bug_khonliang-bus_529d12df,
-        # dog_8b70cbe3). Stored statuses other than 'healthy' (e.g. 'unhealthy')
-        # are not 'stale'/'healthy' here, so they restart as before.
-        if reg and self._derive_live_status(reg) in ("healthy", "stale"):
+        # dog_8b70cbe3). To force a restart of a live-but-degraded agent, use
+        # restart_agent (stop + start).
+        if reg and self._derive_live_status(reg) != "dead":
             return {"id": agent_id, "status": "already_running"}
         return self._start_process(installed)
 
@@ -1336,14 +1337,14 @@ class BusServer:
         if not reg:
             return {"id": agent_id, "status": "not_registered"}
 
-        pid = reg["pid"]
-        pid_alive = _pid_alive(pid)
-
-        if not pid_alive:
+        # Reuse the derived-liveness logic rather than probing the PID directly:
+        # _derive_live_status guards pid<=0 (a bare _pid_alive(0) would probe the
+        # caller's OWN process group, and negative PIDs probe a group), and keeps
+        # this endpoint consistent with /v1/services + start_agent.
+        status = self._derive_live_status(reg)
+        if status == "dead":
             self.db.set_agent_status(agent_id, "dead")
-            return {"id": agent_id, "status": "dead", "pid": pid}
-
-        return {"id": agent_id, "status": reg["status"], "pid": pid}
+        return {"id": agent_id, "status": status, "pid": reg["pid"]}
 
     #: Default heartbeat-freshness threshold (seconds). Beyond this age since
     #: the last heartbeat, a row the catalog still marks 'healthy' is reported
@@ -1374,6 +1375,27 @@ class BusServer:
         ref = now if now is not None else time.time()
         return ref - dt.timestamp()
 
+    def _heartbeat_threshold_s(self) -> float:
+        """``config['heartbeat_stale_threshold_s']`` as a float, falling back to
+        the default on a missing/malformed value. A bad config value must not
+        raise — _derive_live_status runs on every /v1/services read and inside
+        start_agent. Memoized (config is fixed at construction) so the parse and
+        the warn-on-bad-value happen once, not per-agent-per-request."""
+        cached = getattr(self, "_heartbeat_threshold_cache", None)
+        if cached is not None:
+            return cached
+        raw = self.config.get("heartbeat_stale_threshold_s", self._DEFAULT_HEARTBEAT_STALE_S)
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "invalid heartbeat_stale_threshold_s %r; using default %ss",
+                raw, self._DEFAULT_HEARTBEAT_STALE_S,
+            )
+            val = self._DEFAULT_HEARTBEAT_STALE_S
+        self._heartbeat_threshold_cache = val
+        return val
+
     def _derive_live_status(self, reg: dict) -> str:
         """Live per-agent state derived from PID liveness + heartbeat freshness
         — the SINGLE source of truth for "is this agent really up" used by
@@ -1402,11 +1424,8 @@ class BusServer:
         if pid_int > 0 and not _pid_alive(pid_int):
             return "dead"
         if stored == "healthy":
-            threshold = float(
-                self.config.get("heartbeat_stale_threshold_s", self._DEFAULT_HEARTBEAT_STALE_S)
-            )
             age = self._heartbeat_age_s(reg.get("last_heartbeat"))
-            if age is not None and age > threshold:
+            if age is not None and age > self._heartbeat_threshold_s():
                 return "stale"
         return stored
 
