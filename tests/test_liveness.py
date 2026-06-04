@@ -1,0 +1,253 @@
+"""Live-liveness derivation for get_services (fr_khonliang-bus_7bf5ce84).
+
+bug_khonliang-bus_529d12df: bus_services echoed the stored catalog status, so a
+registration row stayed ``healthy`` from its last heartbeat write even after the
+process died. get_services now derives state at read time from two signals,
+strongest first — a registered PID with no live process (os.kill(pid, 0)) →
+``dead``; otherwise a
+``healthy`` row whose ``last_heartbeat`` exceeds a configurable threshold →
+``stale``. It only downgrades; an already-unhealthy row is never resurrected.
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+
+import bus.server as server_mod
+from bus.db import BusDB
+from bus.server import BusServer
+
+
+def _bus(db: BusDB, **cfg) -> BusServer:
+    return BusServer(db, config={"bus_url": "http://localhost:9999", **cfg})
+
+
+def _register(db: BusDB, agent_id: str = "a1", pid: int | None = None) -> None:
+    # Default to this test process's PID so _pid_alive() is True and the
+    # heartbeat path (not the dead-PID path) is what's under test.
+    db.register_agent(
+        agent_id=agent_id,
+        agent_type="test",
+        callback_url="http://localhost:9001",
+        pid=os.getpid() if pid is None else pid,
+        version="0.1.0",
+        skills=[{"name": "do_thing", "description": "", "parameters": {}}],
+    )
+
+
+def _set_heartbeat(db: BusDB, agent_id: str, when_sql: str) -> None:
+    with db.conn() as c:
+        c.execute(
+            "UPDATE registrations SET last_heartbeat = ? WHERE id = ?",
+            (when_sql, agent_id),
+        )
+
+
+def _svc(bus: BusServer, agent_id: str = "a1") -> dict:
+    return {s["id"]: s for s in bus.get_services()}[agent_id]
+
+
+# -- helper --------------------------------------------------------------
+
+
+def test_heartbeat_age_parses_utc_text():
+    base = datetime(2026, 5, 30, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert BusServer._heartbeat_age_s("2026-05-30 12:00:00", now=base + 60) == 60.0
+
+
+def test_heartbeat_age_none_when_missing_or_unparseable():
+    assert BusServer._heartbeat_age_s(None) is None
+    assert BusServer._heartbeat_age_s("") is None
+    assert BusServer._heartbeat_age_s("not-a-timestamp") is None
+
+
+# -- heartbeat-freshness path (live PID) --------------------------------
+
+
+def test_fresh_heartbeat_reports_healthy(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db)  # register stamps last_heartbeat = now; pid = live
+    svc = _svc(_bus(db))
+    assert svc["status"] == "healthy"
+    assert svc["heartbeat_age_s"] is not None
+
+
+def test_stale_heartbeat_downgrades_healthy_to_stale(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db)
+    _set_heartbeat(db, "a1", "2000-01-01 00:00:00")  # ancient
+    svc = _svc(_bus(db))
+    assert svc["status"] == "stale"
+    assert svc["heartbeat_age_s"] > 90
+
+
+def test_threshold_is_configurable(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db)
+    _set_heartbeat(db, "a1", "2000-01-01 00:00:00")  # ancient
+    # A huge threshold means even an ancient heartbeat is still healthy —
+    # proves the config value is honored, not a hardcoded default.
+    svc = _svc(_bus(db, heartbeat_stale_threshold_s=10**12))
+    assert svc["status"] == "healthy"
+
+
+def test_does_not_upgrade_non_healthy_rows(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db)
+    db.set_agent_status("a1", "unhealthy")  # live pid + fresh hb, but unhealthy
+    svc = _svc(_bus(db))
+    assert svc["status"] == "unhealthy"
+
+
+# -- dead-PID path -------------------------------------------------------
+
+
+def test_dead_pid_reports_dead(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db)  # fresh heartbeat, but pretend the process is gone
+    monkeypatch.setattr(server_mod, "_pid_alive", lambda pid: False)
+    svc = _svc(_bus(db))
+    assert svc["status"] == "dead"
+
+
+def test_dead_pid_wins_over_stale_heartbeat(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db)
+    _set_heartbeat(db, "a1", "2000-01-01 00:00:00")  # would be 'stale'...
+    monkeypatch.setattr(server_mod, "_pid_alive", lambda pid: False)
+    svc = _svc(_bus(db))
+    assert svc["status"] == "dead"  # ...but a dead PID is the stronger signal
+
+
+def test_pid_zero_falls_back_to_heartbeat(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=0)  # WS registration without a PID — skip the liveness probe
+    _set_heartbeat(db, "a1", "2000-01-01 00:00:00")
+    svc = _svc(_bus(db))
+    assert svc["status"] == "stale"
+
+
+def test_negative_pid_reports_dead(tmp_path):
+    # A negative PID is a malformed registration; it must be treated as dead
+    # WITHOUT probing (os.kill(-N, 0) would signal a whole process group).
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=-1)
+    svc = _svc(_bus(db))
+    assert svc["status"] == "dead"
+
+
+# -- start_agent guard consumes the same derivation ----------------------
+
+
+def _install(db: BusDB, agent_id: str = "a1") -> None:
+    db.install_agent(
+        agent_id=agent_id,
+        agent_type="test",
+        command="/bin/true",
+        args=[],
+        cwd="/tmp",
+        config="/tmp/cfg.yaml",
+    )
+
+
+def test_start_agent_already_running_only_when_derived_live(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db)
+    _register(db)  # healthy row, live pid
+    bus = _bus(db)
+    assert bus.start_agent("a1")["status"] == "already_running"
+
+
+def test_start_agent_restarts_dead_healthy_row(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db)
+    _register(db)  # stored 'healthy', but the process is gone
+    bus = _bus(db)
+    monkeypatch.setattr(server_mod, "_pid_alive", lambda pid: False)
+    # Don't actually spawn — assert the guard fell through to a (re)start.
+    monkeypatch.setattr(bus, "_start_process", lambda installed: {"id": "a1", "status": "started"})
+    assert bus.start_agent("a1")["status"] == "started"
+
+
+def test_start_agent_does_not_double_launch_stale_but_alive(tmp_path, monkeypatch):
+    # 'stale' = a live PID merely late on heartbeats. Restarting would spawn a
+    # second copy racing to register the same id, so the guard must still report
+    # already_running and NOT reach _start_process.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db)
+    _register(db)  # live pid (os.getpid)
+    _set_heartbeat(db, "a1", "2000-01-01 00:00:00")  # ancient → derived 'stale'
+    bus = _bus(db)
+    calls: list[int] = []
+    monkeypatch.setattr(bus, "_start_process", lambda installed: calls.append(1) or {"status": "started"})
+    res = bus.start_agent("a1")
+    assert res["status"] == "already_running"
+    assert calls == []  # did not double-launch
+
+
+def test_start_agent_does_not_double_launch_unhealthy_but_alive(tmp_path, monkeypatch):
+    # An 'unhealthy' agent whose process is still alive must not be duplicated;
+    # only a dead PID restarts (operators use restart_agent to force).
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db)
+    _register(db)  # live pid
+    db.set_agent_status("a1", "unhealthy")
+    bus = _bus(db)
+    calls: list[int] = []
+    monkeypatch.setattr(bus, "_start_process", lambda installed: calls.append(1) or {"status": "started"})
+    res = bus.start_agent("a1")
+    assert res["status"] == "already_running"
+    assert calls == []
+
+
+def test_threshold_falls_back_on_bad_config(tmp_path):
+    # A malformed config value must not raise (would break /v1/services +
+    # start_agent); it falls back to the default threshold.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=0)  # pid 0 → derivation uses heartbeat + threshold
+    _set_heartbeat(db, "a1", "2000-01-01 00:00:00")
+    bus = _bus(db, heartbeat_stale_threshold_s="not-a-number")
+    assert bus._heartbeat_threshold_s() == BusServer._DEFAULT_HEARTBEAT_STALE_S
+    assert _svc(bus)["status"] == "stale"  # ancient heartbeat vs default 90s
+
+
+def test_threshold_rejects_bool_nonfinite_and_nonpositive(tmp_path):
+    # float() alone accepts bool / "nan" / "inf" / <=0, which would silently
+    # break staleness (nan disables it; <=0 marks everything stale). All must
+    # fall back to the default; a valid value is honored.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=0)
+    default = BusServer._DEFAULT_HEARTBEAT_STALE_S
+    for bad in (True, False, "nan", "inf", float("nan"), float("inf"), 0, -5, "0"):
+        assert _bus(db, heartbeat_stale_threshold_s=bad)._heartbeat_threshold_s() == default, f"{bad!r}"
+    assert _bus(db, heartbeat_stale_threshold_s=45)._heartbeat_threshold_s() == 45.0
+
+
+def test_check_agent_health_safe_for_pid_zero(tmp_path):
+    # pid=0 must NOT be probed via os.kill(0, 0) (caller's own process group);
+    # the derivation uses the heartbeat instead.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=0)  # fresh heartbeat from register
+    assert _bus(db).check_agent_health("a1")["status"] == "healthy"
+
+
+def test_check_agent_health_persists_dead_for_negative_pid(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=-1)  # malformed → dead, never probed
+    bus = _bus(db)
+    assert bus.check_agent_health("a1")["status"] == "dead"
+    assert db.get_registration("a1")["status"] == "dead"  # written back
+
+
+def test_autostart_failed_entry_has_uniform_shape(tmp_path):
+    # Synthetic autostart_failed entries must carry the same liveness fields as
+    # live rows so /v1/services clients can read them unconditionally.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _install(db, "ghost")
+    bus = _bus(db)
+    bus._autostart_failures["ghost"] = "boom: bad config"
+    entry = {s["id"]: s for s in bus.get_services()}["ghost"]
+    assert entry["status"] == "autostart_failed"
+    assert entry["last_heartbeat"] is None
+    assert entry["heartbeat_age_s"] is None

@@ -14,11 +14,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -739,7 +741,17 @@ class BusServer:
         if not installed:
             return {"id": agent_id, "error": "not installed"}
         reg = self.db.get_registration(agent_id)
-        if reg and reg["status"] == "healthy":
+        # Guard on DERIVED liveness, not the stored status. start_agent must not
+        # spawn a duplicate of an agent whose process is already PRESENT —
+        # _start_process never stops/probes an existing PID first, so a second
+        # copy would race to register the same id. Any non-'dead' derivation
+        # means a process is (or is presumed) up — 'healthy', 'stale' (alive but
+        # late on heartbeats), or 'unhealthy' (alive but degraded) — so only a
+        # 'dead' row (PID gone) falls through to a real (re)start, the runtime
+        # form of the post-reboot no-op (bug_khonliang-bus_529d12df,
+        # dog_8b70cbe3). To force a restart of a live-but-degraded agent, use
+        # restart_agent (stop + start).
+        if reg and self._derive_live_status(reg) != "dead":
             return {"id": agent_id, "status": "already_running"}
         return self._start_process(installed)
 
@@ -1326,14 +1338,110 @@ class BusServer:
         if not reg:
             return {"id": agent_id, "status": "not_registered"}
 
-        pid = reg["pid"]
-        pid_alive = _pid_alive(pid)
-
-        if not pid_alive:
+        # Reuse the derived-liveness logic rather than probing the PID directly:
+        # _derive_live_status guards pid<=0 (a bare _pid_alive(0) would probe the
+        # caller's OWN process group, and negative PIDs probe a group), and keeps
+        # this endpoint consistent with /v1/services + start_agent.
+        status = self._derive_live_status(reg)
+        if status == "dead":
             self.db.set_agent_status(agent_id, "dead")
-            return {"id": agent_id, "status": "dead", "pid": pid}
+        return {"id": agent_id, "status": status, "pid": reg["pid"]}
 
-        return {"id": agent_id, "status": reg["status"], "pid": pid}
+    #: Default heartbeat-freshness threshold (seconds). Beyond this age since
+    #: the last heartbeat, a row the catalog still marks 'healthy' is reported
+    #: as 'stale' — its process is gone or wedged even though the last status
+    #: write said healthy. ~3 missed beats at a 30s cadence; tune via
+    #: config['heartbeat_stale_threshold_s'].
+    _DEFAULT_HEARTBEAT_STALE_S: float = 90.0
+
+    @staticmethod
+    def _heartbeat_age_s(last_heartbeat: str | None, now: float | None = None) -> float | None:
+        """Seconds since ``last_heartbeat`` (a SQLite ``datetime('now')`` UTC
+        text stamp, ``'YYYY-MM-DD HH:MM:SS'``), or ``None`` when the value is
+        missing/unparseable. ``now`` (epoch seconds, UTC) is injectable for
+        deterministic tests."""
+        if not last_heartbeat:
+            return None
+        try:
+            dt = datetime.strptime(last_heartbeat, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+        except (ValueError, TypeError):
+            # Defensive: last_heartbeat is always machine-written by SQLite
+            # datetime('now'), so this should never fire. Log at debug (not
+            # error) to surface the offending value for diagnosis without
+            # spamming — get_services parses on every services listing.
+            logger.debug("unparseable last_heartbeat %r; treating age as unknown", last_heartbeat)
+            return None
+        ref = now if now is not None else time.time()
+        return ref - dt.timestamp()
+
+    def _heartbeat_threshold_s(self) -> float:
+        """``config['heartbeat_stale_threshold_s']`` as a float, falling back to
+        the default on a missing/malformed value. A bad config value must not
+        raise — _derive_live_status runs on every /v1/services read and inside
+        start_agent. Memoized (config is fixed at construction) so the parse and
+        the warn-on-bad-value happen once, not per-agent-per-request."""
+        cached = getattr(self, "_heartbeat_threshold_cache", None)
+        if cached is not None:
+            return cached
+        raw = self.config.get("heartbeat_stale_threshold_s", self._DEFAULT_HEARTBEAT_STALE_S)
+        val: float | None = None
+        # ``float()`` is too permissive on its own: bool is an int subclass
+        # (float(True)==1.0), and "nan"/"inf" parse without raising — nan would
+        # silently DISABLE staleness (age > nan is always False) and a <=0 value
+        # would mark every agent stale. Accept only a finite, strictly-positive,
+        # non-bool number; anything else falls back to the default.
+        if not isinstance(raw, bool):
+            try:
+                parsed = float(raw)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None and math.isfinite(parsed) and parsed > 0:
+                val = parsed
+        if val is None:
+            logger.warning(
+                "invalid heartbeat_stale_threshold_s %r; using default %ss",
+                raw, self._DEFAULT_HEARTBEAT_STALE_S,
+            )
+            val = self._DEFAULT_HEARTBEAT_STALE_S
+        self._heartbeat_threshold_cache = val
+        return val
+
+    def _derive_live_status(self, reg: dict) -> str:
+        """Live per-agent state derived from PID liveness + heartbeat freshness
+        — the SINGLE source of truth for "is this agent really up" used by
+        get_services, the start_agent ``already_running`` guard, and (read-time)
+        bus_welcome (fr_khonliang-bus_7bf5ce84 / bug_khonliang-bus_529d12df).
+
+        Two signals, strongest first; both only DOWNGRADE a row's stored status
+        — an already-worse row is never resurrected to 'healthy':
+          1. dead  — no live process for the registered PID, i.e. _pid_alive
+                     (os.kill(pid, 0)) finds none — the same primitive boot
+                     reconciliation and diagnose use. A negative PID is treated
+                     as dead WITHOUT probing (os.kill(-N, …) targets a process
+                     group). pid=0 (WS registration without a PID) skips this and
+                     falls through to (2).
+          2. stale — a 'healthy' row whose last_heartbeat is older than the
+                     configurable freshness threshold.
+        """
+        stored = reg.get("status")
+        pid = reg.get("pid")
+        pid_int = int(pid) if pid else 0
+        # A negative PID is a malformed registration — os.kill(-N, 0) targets a
+        # process GROUP, so never probe it; treat as dead (matches boot
+        # reconciliation, which reaps negative PIDs). pid_int == 0 (WS reg
+        # without a PID) skips the check and falls through to the heartbeat
+        # signal.
+        if pid_int < 0:
+            return "dead"
+        if pid_int > 0 and not _pid_alive(pid_int):
+            return "dead"
+        if stored == "healthy":
+            age = self._heartbeat_age_s(reg.get("last_heartbeat"))
+            if age is not None and age > self._heartbeat_threshold_s():
+                return "stale"
+        return stored
 
     def get_services(self) -> list[dict]:
         regs = self.db.get_registrations()
@@ -1341,15 +1449,22 @@ class BusServer:
         result = []
         for reg in regs:
             skills = self.db.get_skills(reg["id"])
+            # Live state derived at read time so the services list never reports
+            # a 'healthy' agent whose process is gone / heartbeat is stale
+            # (bug_khonliang-bus_529d12df). See _derive_live_status.
+            age = self._heartbeat_age_s(reg.get("last_heartbeat"))
+            status = self._derive_live_status(reg)
             result.append({
                 "id": reg["id"],
                 "agent_type": reg["agent_type"],
-                "status": reg["status"],
+                "status": status,
                 "version": reg["version"],
                 "callback_url": reg["callback_url"],
                 "pid": reg["pid"],
                 "skill_count": len(skills),
                 "skills": [s["name"] for s in skills],
+                "last_heartbeat": reg.get("last_heartbeat"),
+                "heartbeat_age_s": round(age, 1) if age is not None else None,
             })
         # Surface autostart failures alongside live registrations so the
         # services list reflects the FULL post-boot picture, not just the
@@ -1369,6 +1484,10 @@ class BusServer:
                 "pid": None,
                 "skill_count": 0,
                 "skills": [],
+                # Keep the entry shape uniform with live registrations so
+                # /v1/services clients can read these fields unconditionally.
+                "last_heartbeat": None,
+                "heartbeat_age_s": None,
                 "autostart_error": error,
             })
         return result

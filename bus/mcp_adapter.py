@@ -227,6 +227,7 @@ class BusMCPAdapter:
             for a in w.get("agents", []):
                 state_mark = {
                     "healthy": "✓",
+                    "stale": "~",
                     "unhealthy": "!",
                     "dead": "✗",
                     "cataloged_dead": "○",

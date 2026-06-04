@@ -110,10 +110,14 @@ def test_reconcile_treats_negative_pid_as_dead(tmp_path, fake_alive):
     assert db.get_registration("neg-group") is None
 
 
-def test_start_agent_no_longer_already_running_after_reconcile(tmp_path, fake_alive):
-    """Load-bearing regression: a stale ``healthy`` registration with a dead PID
-    used to short-circuit ``start_agent`` to ``already_running``; reconciliation
-    must clear that path before the operator's first ``bus_start_agent`` call."""
+def test_start_agent_no_longer_already_running_after_reconcile(tmp_path, fake_alive, monkeypatch):
+    """A stale ``healthy`` registration with a dead PID must not short-circuit
+    ``start_agent`` to ``already_running``. This is now defended at two layers:
+    (1) ``start_agent`` derives liveness at call time (fr_khonliang-bus_7bf5ce84),
+        so even BEFORE reconcile a dead-PID row falls through to a real (re)start
+        — this also covers a mid-life crash, which boot reconciliation (boot-only)
+        does not; and
+    (2) boot reconciliation deregisters the stale row outright."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     db.install_agent(
         agent_id="my-agent",
@@ -128,14 +132,20 @@ def test_start_agent_no_longer_already_running_after_reconcile(tmp_path, fake_al
     # fake_alive empty: 12345 is dead.
 
     bus = _bus(db)
+    # Observe the guard's decision without spawning a real process.
+    monkeypatch.setattr(bus, "_start_process", lambda installed: {"id": "my-agent", "status": "started"})
 
+    # Layer 1: the liveness-aware guard refuses the false 'already_running' and
+    # falls through to the (stubbed) restart path — assert the exact status so
+    # the test fails if the guard ever stops reaching _start_process.
     pre = bus.start_agent("my-agent")
-    assert pre.get("status") == "already_running", f"pre-reconcile state should be the bug: {pre}"
+    assert pre.get("status") == "started", f"guard should fall through to restart a dead-PID row: {pre}"
 
+    # Layer 2: reconcile deregisters the stale row outright.
     bus.reconcile_on_boot()
-
+    assert db.get_registration("my-agent") is None
     after = bus.start_agent("my-agent")
-    assert after.get("status") != "already_running", f"post-reconcile should not short-circuit: {after}"
+    assert after.get("status") == "started", f"post-reconcile should restart, not short-circuit: {after}"
 
 
 # -- _pid_alive helper semantics ---------------------------------------------
