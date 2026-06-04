@@ -3,7 +3,8 @@
 bug_khonliang-bus_529d12df: bus_services echoed the stored catalog status, so a
 registration row stayed ``healthy`` from its last heartbeat write even after the
 process died. get_services now derives state at read time from two signals,
-strongest first — a registered PID gone from /proc → ``dead``; otherwise a
+strongest first — a registered PID with no live process (os.kill(pid, 0)) →
+``dead``; otherwise a
 ``healthy`` row whose ``last_heartbeat`` exceeds a configurable threshold →
 ``stale``. It only downgrades; an already-unhealthy row is never resurrected.
 """
@@ -121,7 +122,7 @@ def test_dead_pid_wins_over_stale_heartbeat(tmp_path, monkeypatch):
 
 def test_pid_zero_falls_back_to_heartbeat(tmp_path):
     db = BusDB(str(tmp_path / "bus.db"))
-    _register(db, pid=0)  # WS registration without a PID — skip the /proc check
+    _register(db, pid=0)  # WS registration without a PID — skip the liveness probe
     _set_heartbeat(db, "a1", "2000-01-01 00:00:00")
     svc = _svc(_bus(db))
     assert svc["status"] == "stale"
@@ -209,6 +210,18 @@ def test_threshold_falls_back_on_bad_config(tmp_path):
     bus = _bus(db, heartbeat_stale_threshold_s="not-a-number")
     assert bus._heartbeat_threshold_s() == BusServer._DEFAULT_HEARTBEAT_STALE_S
     assert _svc(bus)["status"] == "stale"  # ancient heartbeat vs default 90s
+
+
+def test_threshold_rejects_bool_nonfinite_and_nonpositive(tmp_path):
+    # float() alone accepts bool / "nan" / "inf" / <=0, which would silently
+    # break staleness (nan disables it; <=0 marks everything stale). All must
+    # fall back to the default; a valid value is honored.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=0)
+    default = BusServer._DEFAULT_HEARTBEAT_STALE_S
+    for bad in (True, False, "nan", "inf", float("nan"), float("inf"), 0, -5, "0"):
+        assert _bus(db, heartbeat_stale_threshold_s=bad)._heartbeat_threshold_s() == default, f"{bad!r}"
+    assert _bus(db, heartbeat_stale_threshold_s=45)._heartbeat_threshold_s() == 45.0
 
 
 def test_check_agent_health_safe_for_pid_zero(tmp_path):

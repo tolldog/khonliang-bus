@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import subprocess
 import threading
@@ -1385,9 +1386,20 @@ class BusServer:
         if cached is not None:
             return cached
         raw = self.config.get("heartbeat_stale_threshold_s", self._DEFAULT_HEARTBEAT_STALE_S)
-        try:
-            val = float(raw)
-        except (TypeError, ValueError):
+        val: float | None = None
+        # ``float()`` is too permissive on its own: bool is an int subclass
+        # (float(True)==1.0), and "nan"/"inf" parse without raising — nan would
+        # silently DISABLE staleness (age > nan is always False) and a <=0 value
+        # would mark every agent stale. Accept only a finite, strictly-positive,
+        # non-bool number; anything else falls back to the default.
+        if not isinstance(raw, bool):
+            try:
+                parsed = float(raw)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None and math.isfinite(parsed) and parsed > 0:
+                val = parsed
+        if val is None:
             logger.warning(
                 "invalid heartbeat_stale_threshold_s %r; using default %ss",
                 raw, self._DEFAULT_HEARTBEAT_STALE_S,
@@ -1404,10 +1416,12 @@ class BusServer:
 
         Two signals, strongest first; both only DOWNGRADE a row's stored status
         — an already-worse row is never resurrected to 'healthy':
-          1. dead  — the registered PID is gone from /proc (definitive; local
-                     single-host check via _pid_alive, the same primitive boot
-                     reconciliation and diagnose use). pid=0 (WS registration
-                     without a PID) skips this and falls through to (2).
+          1. dead  — no live process for the registered PID, i.e. _pid_alive
+                     (os.kill(pid, 0)) finds none — the same primitive boot
+                     reconciliation and diagnose use. A negative PID is treated
+                     as dead WITHOUT probing (os.kill(-N, …) targets a process
+                     group). pid=0 (WS registration without a PID) skips this and
+                     falls through to (2).
           2. stale — a 'healthy' row whose last_heartbeat is older than the
                      configurable freshness threshold.
         """
