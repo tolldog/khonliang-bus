@@ -498,6 +498,29 @@ class BusDB:
                 (status, agent_id),
             )
 
+    def set_agent_status_cas(
+        self,
+        agent_id: str,
+        new_status: str,
+        *,
+        expected_status: str | None,
+        expected_last_heartbeat: str | None,
+        expected_pid: int | None,
+    ) -> bool:
+        """Compare-and-set the status: only update when the row still matches the
+        ``(status, last_heartbeat, pid)`` the caller observed. Lets the liveness
+        reconciler downgrade a row to stale/dead without clobbering a concurrent
+        heartbeat or re-registration that landed between the read and the write
+        (those run in the FastAPI threadpool while reconcile runs off-loop).
+        ``IS`` is NULL-safe equality. Returns True iff a row was updated."""
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE registrations SET status = ? "
+                "WHERE id = ? AND status IS ? AND last_heartbeat IS ? AND pid IS ?",
+                (new_status, agent_id, expected_status, expected_last_heartbeat, expected_pid),
+            )
+            return cur.rowcount > 0
+
     def get_registrations(self) -> list[dict[str, Any]]:
         with self.conn() as c:
             rows = c.execute("SELECT * FROM registrations").fetchall()

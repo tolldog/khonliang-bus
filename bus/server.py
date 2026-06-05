@@ -509,8 +509,51 @@ class BusServer:
                 )
         return {"restarted": restarted, "alive": alive, "lost": lost}
 
+    def reconcile_liveness(self) -> dict:
+        """Persist derived live state to the stored registration status so the
+        db-SQL readers that filter on ``status='healthy'`` stop selecting agents
+        whose process is gone or whose heartbeat is stale.
+
+        The read-time derivation (``get_services`` / ``start_agent`` /
+        ``bus_welcome``) reflects liveness immediately, but the SQL-only
+        consumers — ``get_healthy_agent_for_type`` used by request routing in
+        :meth:`handle_request`, the orchestrator, and collaboration flows — read
+        the stored column directly. Without this write-back they keep routing
+        work to dead/stale agents (bug_khonliang-bus_529d12df). Run periodically
+        from :meth:`_supervision_loop`.
+
+        Idempotent and self-healing: only writes when the derived status differs
+        from what's stored, and a recovered agent's next heartbeat resets its
+        status to 'healthy' (which also refreshes ``last_heartbeat``). Returns
+        ``{updated: {agent_id: new_status}}``.
+
+        The write is a compare-and-set against the ``(status, last_heartbeat,
+        pid)`` observed for the row: reconcile runs off-loop (asyncio.to_thread)
+        while /v1/heartbeat and re-register run in the FastAPI threadpool, so an
+        unconditional write could clobber a fresh heartbeat that landed between
+        the read and the write and wrongly downgrade a now-live agent. When the
+        CAS misses (the row changed under us) the downgrade is skipped — the next
+        tick re-evaluates against the new state.
+        """
+        updated: dict[str, str] = {}
+        for reg in self.db.get_registrations():
+            derived = self._derive_live_status(reg)
+            if derived != reg.get("status") and self.db.set_agent_status_cas(
+                reg["id"],
+                derived,
+                expected_status=reg.get("status"),
+                expected_last_heartbeat=reg.get("last_heartbeat"),
+                expected_pid=reg.get("pid"),
+            ):
+                updated[reg["id"]] = derived
+        if updated:
+            logger.info("Liveness reconcile updated %d agent(s): %s", len(updated), updated)
+        return {"updated": updated}
+
     async def _supervision_loop(self, interval: float) -> None:
-        """Background task: call :meth:`supervise_once` every ``interval`` seconds.
+        """Background task: every ``interval`` seconds, run :meth:`supervise_once`
+        (restart crashed bus-spawned agents) then :meth:`reconcile_liveness`
+        (persist derived stale/dead status so SQL routing readers stay honest).
 
         Cancelled in :meth:`shutdown`. A v1 deliberate trade-off: poll
         rather than SIGCHLD because the supervised set is small (~10 agents)
@@ -534,6 +577,15 @@ class BusServer:
                     # the error and keeps looping, so the only signal of a
                     # genuine bug here is the log line.
                     logger.exception("Supervisor sweep raised")
+                try:
+                    # Persist derived liveness so the SQL-only routing readers
+                    # (get_healthy_agent_for_type) exclude dead/stale agents
+                    # (fr_khonliang-bus_7bf5ce84). Also off-loop (sqlite writes),
+                    # and isolated from the sweep so one failing doesn't skip
+                    # the other.
+                    await asyncio.to_thread(self.reconcile_liveness)
+                except Exception:
+                    logger.exception("Liveness reconcile raised")
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             logger.info("Supervisor loop cancelled")
