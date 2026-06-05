@@ -1544,6 +1544,65 @@ class BusServer:
             })
         return result
 
+    #: Per-agent timeout (seconds) for the active WS health probe, and the cap on
+    #: how many agents are probed concurrently — so one wedged agent can't stall
+    #: the whole ``bus_services(probe=true)`` listing.
+    _PROBE_TIMEOUT_S: float = 5.0
+    _PROBE_CONCURRENCY: int = 8
+
+    async def _probe_agent_reachable(self, agent_id: str, timeout: float) -> bool:
+        """Active liveness probe: send ``health_check`` over the agent's
+        WebSocket and return True iff it answers within ``timeout``. False when
+        there is no live WS connection or the probe errors/times out. Mirrors the
+        health probe in :meth:`diagnose` (health_check is a BaseAgent built-in,
+        so any conforming agent accepts it)."""
+        if not self.is_agent_ws_connected(agent_id):
+            return False
+        result = await self.send_request_to_agent_ws(
+            agent_id=agent_id,
+            operation="health_check",
+            args={},
+            correlation_id=f"probe-{uuid.uuid4().hex[:12]}",
+            timeout=timeout,
+        )
+        return not (isinstance(result, dict) and "error" in result)
+
+    async def get_services_probed(
+        self, timeout: float | None = None, concurrency: int | None = None
+    ) -> list[dict]:
+        """:meth:`get_services` plus an ACTIVE per-agent WS health probe
+        (fr_khonliang-bus_7bf5ce84 acceptance #3). For each entry the passive
+        derivation reports as up ('healthy'/'stale'), send a ``health_check`` and,
+        if it doesn't answer in time, downgrade it to ``unreachable`` — a wedged
+        agent whose PID may be alive but that can't serve. 'dead' / 'unhealthy' /
+        'autostart_failed' entries are left as-is (nothing to confirm).
+
+        Bounded fan-out (a semaphore) + per-agent timeout keep one wedged agent
+        from stalling the listing. Each probed entry gains a ``probe_ok`` bool.
+        """
+        services = self.get_services()
+        t = timeout if timeout is not None else self._PROBE_TIMEOUT_S
+        sem = asyncio.Semaphore(max(1, concurrency or self._PROBE_CONCURRENCY))
+
+        async def _probe(entry: dict) -> None:
+            if entry["status"] not in ("healthy", "stale"):
+                return
+            try:
+                async with sem:
+                    ok = await self._probe_agent_reachable(entry["id"], t)
+            except Exception:
+                # One agent's probe blowing up must not fail the whole listing
+                # (the bounded fan-out already keeps it from stalling). Treat an
+                # unexpected error the same as a failed probe: unreachable.
+                logger.exception("Active probe of %s raised", entry["id"])
+                ok = False
+            entry["probe_ok"] = ok
+            if not ok:
+                entry["status"] = "unreachable"
+
+        await asyncio.gather(*(_probe(e) for e in services))
+        return services
+
     def get_agent_provenance(self, agent_id: str, redact_sensitive: bool = False) -> dict:
         """Surface what process is currently serving ``agent_id`` and whether
         it matches the canonical install (``installed_agents``).
@@ -2515,7 +2574,12 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         return bus.heartbeat(req)
 
     @app.get("/v1/services")
-    def services():
+    async def services(probe: bool = False):
+        # probe=true adds an active WS health-ping per agent and reports
+        # 'unreachable' for ones that don't answer (fr_khonliang-bus_7bf5ce84
+        # acceptance #3). Default false: the cheap read-time derivation only.
+        if probe:
+            return await bus.get_services_probed()
         return bus.get_services()
 
     @app.get("/v1/diagnose/{agent_id}")

@@ -159,15 +159,23 @@ class BusMCPAdapter:
             return f"{agent_id}: {op} {status}"
 
         @mcp.tool()
-        async def bus_services() -> str:
+        async def bus_services(probe: bool = False) -> str:
             """List all registered agents with their skills and status.
+
+            Status is derived live, not just echoed from the catalog: an agent
+            whose process is gone reads ``dead`` and one past its heartbeat
+            window reads ``stale`` (fr_khonliang-bus_7bf5ce84). Pass
+            ``probe=true`` to additionally send each up-looking agent an active
+            WS health-ping; one that doesn't answer is reported ``unreachable``
+            (a wedged process). Probing is bounded + per-agent-timed, but costs a
+            round-trip per agent, so it defaults off.
 
             Also surfaces ``autostart_failed`` entries — agents installed in
             the bus catalog but whose autostart attempt failed at boot
             (per fr_khonliang-bus_fc904c3e). These rows carry an
             ``autostart_error`` field with the failure reason.
             """
-            services = adapter._get("/v1/services")
+            services = adapter._get("/v1/services", params={"probe": probe})
             if not services:
                 return "no agents registered"
             lines = []
@@ -175,6 +183,10 @@ class BusMCPAdapter:
                 status_str = svc.get("status", "unknown")
                 if status_str == "healthy":
                     marker = "✓"
+                elif status_str == "stale":
+                    marker = "~"
+                elif status_str == "unreachable":
+                    marker = "?"
                 elif status_str == "autostart_failed":
                     marker = "⚠"
                 else:
