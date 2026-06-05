@@ -526,12 +526,25 @@ class BusServer:
         from what's stored, and a recovered agent's next heartbeat resets its
         status to 'healthy' (which also refreshes ``last_heartbeat``). Returns
         ``{updated: {agent_id: new_status}}``.
+
+        The write is a compare-and-set against the ``(status, last_heartbeat,
+        pid)`` observed for the row: reconcile runs off-loop (asyncio.to_thread)
+        while /v1/heartbeat and re-register run in the FastAPI threadpool, so an
+        unconditional write could clobber a fresh heartbeat that landed between
+        the read and the write and wrongly downgrade a now-live agent. When the
+        CAS misses (the row changed under us) the downgrade is skipped — the next
+        tick re-evaluates against the new state.
         """
         updated: dict[str, str] = {}
         for reg in self.db.get_registrations():
             derived = self._derive_live_status(reg)
-            if derived != reg.get("status"):
-                self.db.set_agent_status(reg["id"], derived)
+            if derived != reg.get("status") and self.db.set_agent_status_cas(
+                reg["id"],
+                derived,
+                expected_status=reg.get("status"),
+                expected_last_heartbeat=reg.get("last_heartbeat"),
+                expected_pid=reg.get("pid"),
+            ):
                 updated[reg["id"]] = derived
         if updated:
             logger.info("Liveness reconcile updated %d agent(s): %s", len(updated), updated)

@@ -86,20 +86,54 @@ def test_reconcile_is_idempotent(tmp_path):
     assert bus.reconcile_liveness() == {"updated": {}}  # already 'dead'; no re-write
 
 
+def test_cas_applies_when_row_unchanged(tmp_path):
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=5)
+    reg = db.get_registration("a1")
+    applied = db.set_agent_status_cas(
+        "a1", "dead",
+        expected_status=reg["status"],
+        expected_last_heartbeat=reg["last_heartbeat"],
+        expected_pid=reg["pid"],
+    )
+    assert applied is True
+    assert db.get_registration("a1")["status"] == "dead"
+
+
+def test_cas_skips_when_row_changed_concurrently(tmp_path):
+    # A heartbeat / re-register landing between reconcile's read and write must
+    # not be clobbered: the CAS observes the changed row and declines the write.
+    db = BusDB(str(tmp_path / "bus.db"))
+    _register(db, pid=5)
+    reg = db.get_registration("a1")  # observed snapshot
+    _set_heartbeat(db, "a1", "2099-01-01 00:00:00")  # concurrent change
+    applied = db.set_agent_status_cas(
+        "a1", "dead",
+        expected_status=reg["status"],
+        expected_last_heartbeat=reg["last_heartbeat"],
+        expected_pid=reg["pid"],
+    )
+    assert applied is False
+    assert db.get_registration("a1")["status"] == reg["status"]  # not downgraded
+
+
 @pytest.mark.asyncio
 async def test_supervision_loop_runs_reconcile(tmp_path, monkeypatch):
     """The periodic loop drives reconcile_liveness, not just supervise_once."""
     db = BusDB(str(tmp_path / "bus.db"))
     bus = _bus(db)
 
+    loop = asyncio.get_running_loop()
     fired_twice = asyncio.Event()
     calls = 0
 
     def _count():
+        # Runs in a worker thread (asyncio.to_thread); asyncio.Event isn't
+        # thread-safe, so hop back to the loop thread to set it.
         nonlocal calls
         calls += 1
         if calls >= 2:
-            fired_twice.set()
+            loop.call_soon_threadsafe(fired_twice.set)
         return {"updated": {}}
 
     monkeypatch.setattr(bus, "reconcile_liveness", _count)
