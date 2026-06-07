@@ -1028,8 +1028,8 @@ class BusMCPAdapter:
             return r.json()
         except asyncio.CancelledError:
             # Never swallow cancellation — let shutdown / timeout propagate.
-            # (CancelledError is BaseException on 3.8+ so ``except Exception``
-            # already excludes it; this makes the intent explicit.)
+            # (CancelledError is a BaseException, so ``except Exception`` already
+            # excludes it; the explicit clause just makes the intent clear.)
             raise
         except Exception as e:
             logger.warning("Bus request failed: GET %s: %s", path, e)
