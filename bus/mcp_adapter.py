@@ -112,6 +112,12 @@ class BusMCPAdapter:
         self._async_http = httpx.AsyncClient(timeout=httpx.Timeout(self.default_timeout_s))
         self.mcp = FastMCP("khonliang-bus")
         self._registered_tools: set[str] = set()
+        # Subset of _registered_tools that are collaborative-flow tools (not
+        # agent skills). Tracked explicitly so refresh_skills reconciles skill
+        # tools by TYPE (registered minus flows) rather than by name pattern —
+        # a flow named with a dot (e.g. ``evaluate_spec.v2``) must not be
+        # misread as an ``agent_id.skill`` tool (fr_khonliang-bus_f01ee092).
+        self._flow_tools: set[str] = set()
 
     def build(self) -> FastMCP:
         """Fetch bus state and generate MCP tools. Call once before run."""
@@ -610,7 +616,7 @@ class BusMCPAdapter:
 
             Returns a summary of added/removed tools.
             """
-            diff = adapter.refresh_skills()
+            diff = await adapter.refresh_skills()
             if ctx is not None and (diff["added"] or diff["removed"]):
                 await adapter._notify_list_changed(ctx)
             added = len(diff["added"])
@@ -745,7 +751,7 @@ class BusMCPAdapter:
     # Dynamic refresh — pick up new skills when agents reload
     # ------------------------------------------------------------------
 
-    def refresh_skills(self) -> dict[str, list[str]]:
+    async def refresh_skills(self) -> dict[str, list[str]]:
         """Reconcile the MCP tool registry against current bus state.
 
         Queries ``/v1/services``, computes the diff against the set of
@@ -760,7 +766,7 @@ class BusMCPAdapter:
         MCP ``Context`` in hand should call ``_notify_list_changed`` to
         push the notification to connected clients.
         """
-        services = self._get("/v1/services") or []
+        services = await self._async_get("/v1/services") or []
         # Build the set of currently-live skill tool names
         live: set[str] = set()
         for svc in services:
@@ -770,13 +776,13 @@ class BusMCPAdapter:
             for skill_name in svc.get("skills", []):
                 live.add(f"{agent_id}.{skill_name}")
 
-        # Skill tools (namespaced agent_id.skill_name) vs bus/flow tools (no dot
-        # or a single-component flow name). We only reconcile skill tools here;
-        # bus_* and collaborative flows are owned elsewhere.
-        currently_registered = {
-            t for t in self._registered_tools
-            if "." in t and not t.startswith("bus_")
-        }
+        # Reconcile only SKILL tools. Distinguish them by type — everything in
+        # _registered_tools that isn't a tracked flow tool — rather than by name
+        # pattern, so a dotted flow name (``evaluate_spec.v2``) isn't mistaken
+        # for an ``agent_id.skill`` tool and wrongly removed
+        # (fr_khonliang-bus_f01ee092). bus_* built-ins aren't in
+        # _registered_tools, so they're already excluded.
+        currently_registered = self._registered_tools - self._flow_tools
 
         added: list[str] = []
         for tool_name in sorted(live - currently_registered):
@@ -809,7 +815,7 @@ class BusMCPAdapter:
         request context; without it we can't fire the notification (no
         session handle), but the refresh itself still happens.
         """
-        diff = self.refresh_skills()
+        diff = await self.refresh_skills()
         if ctx is not None and (diff["added"] or diff["removed"]):
             await self._notify_list_changed(ctx)
 
@@ -892,6 +898,7 @@ class BusMCPAdapter:
         if flow_name in self._registered_tools:
             return
         self._registered_tools.add(flow_name)
+        self._flow_tools.add(flow_name)
 
         adapter = self
         description = flow.get("description", "") or f"Collaborative flow: {flow_name}"
@@ -1005,6 +1012,18 @@ class BusMCPAdapter:
     def _get(self, path: str, params: dict | None = None) -> Any:
         try:
             r = self._http.get(f"{self.bus_url}{path}", params=params)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.warning("Bus request failed: GET %s: %s", path, e)
+            return None
+
+    async def _async_get(self, path: str, params: dict | None = None) -> Any:
+        """Async counterpart to :meth:`_get` — used from async handlers (e.g.
+        refresh_skills) so the bus fetch doesn't run the sync client from inside
+        the event loop (fr_khonliang-bus_f01ee092)."""
+        try:
+            r = await self._async_http.get(f"{self.bus_url}{path}", params=params)
             r.raise_for_status()
             return r.json()
         except Exception as e:

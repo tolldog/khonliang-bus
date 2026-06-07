@@ -52,16 +52,24 @@ def bus_client(tmp_path):
     return client
 
 
+def _wire_http(a: BusMCPAdapter, bus_client: TestClient) -> None:
+    """Route the adapter's sync AND async HTTP clients at the in-process test
+    app. refresh_skills uses the async client (fr_khonliang-bus_f01ee092), so
+    overriding only ``_http`` is no longer enough."""
+    a._http = bus_client
+    a._async_http = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=bus_client.app),
+        base_url="http://testserver",
+    )
+
+
 @pytest.fixture
 def adapter(bus_client, tmp_path):
     """An adapter pointing at the test bus."""
-    # The adapter uses httpx.Client directly against the bus URL.
-    # For testing, we monkey-patch it to use the TestClient instead.
+    # The adapter uses httpx clients directly against the bus URL.
+    # For testing, we monkey-patch them to route through the in-process app.
     a = BusMCPAdapter("http://testserver")
-
-    # Replace the sync HTTP client with one that routes through TestClient
-    a._http = bus_client
-
+    _wire_http(a, bus_client)
     return a
 
 
@@ -336,7 +344,7 @@ def test_bus_topics_tool_empty_message_when_prefix_matches_nothing(bus_client):
     not reachable from this test. Instead, exercise the empty path
     via a prefix filter that matches nothing — same code path."""
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     mcp = a.build()
     result = asyncio.run(mcp.call_tool("bus_topics", {"prefix": "no.such.prefix."}))
     text = _extract_text(result)
@@ -356,7 +364,7 @@ def test_bus_topics_tool_lists_published(bus_client):
         "source": "watch_pr_fleet",
     })
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     mcp = a.build()
     result = asyncio.run(mcp.call_tool("bus_topics", {}))
     text = _extract_text(result)
@@ -372,7 +380,7 @@ def test_bus_topics_tool_prefix_filter(bus_client):
     bus_client.post("/v1/publish", json={"topic": "github.push", "payload": {}, "source": "github-webhook"})
     bus_client.post("/v1/publish", json={"topic": "pr.review", "payload": {}, "source": "watch_pr_fleet"})
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     mcp = a.build()
     result = asyncio.run(mcp.call_tool("bus_topics", {"prefix": "github."}))
     text = _extract_text(result)
@@ -418,7 +426,7 @@ def test_artifact_tail_http_route_still_serves(bus_client):
 
 def test_bus_feedback_tool(bus_client):
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     posted = bus_client.post("/v1/feedback", json={
         "agent_id": "developer-primary",
         "kind": "friction",
@@ -465,7 +473,7 @@ def test_skill_proxy_returns_response_envelope(adapter):
 
 def test_skill_proxy_stores_large_result_as_artifact(bus_client):
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     large = "\n".join(f"FAILED test_{i}: AssertionError details" for i in range(1000))
 
     async def mock_request(agent_id, operation, args, timeout=None):
@@ -503,7 +511,7 @@ def test_skill_proxy_stores_large_result_as_artifact(bus_client):
 
 def test_flow_proxy_stores_large_result_as_artifact(bus_client):
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     large = {"stdout": "\n".join(f"+ changed line {i}" for i in range(800))}
 
     async def mock_post(path, body, http_timeout=None):
@@ -685,7 +693,7 @@ def test_build_registers_bus_refresh_skills_tool(adapter):
 def test_refresh_skills_adds_new_skill_after_agent_reload(bus_client):
     """An agent registering a new skill after build() becomes callable post-refresh."""
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     a.build()
     # Baseline skill count
     baseline = asyncio.run(a.mcp.list_tools())
@@ -704,7 +712,7 @@ def test_refresh_skills_adds_new_skill_after_agent_reload(bus_client):
         ],
     })
 
-    diff = a.refresh_skills()
+    diff = asyncio.run(a.refresh_skills())
     assert "researcher-primary.new_skill" in diff["added"]
     after = asyncio.run(a.mcp.list_tools())
     assert "researcher-primary.new_skill" in {t.name for t in after}
@@ -712,7 +720,7 @@ def test_refresh_skills_adds_new_skill_after_agent_reload(bus_client):
 
 def test_refresh_skills_removes_tool_when_agent_deregisters(bus_client):
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     a.build()
     assert "developer-primary.read_spec" in {
         t.name for t in asyncio.run(a.mcp.list_tools())
@@ -721,7 +729,7 @@ def test_refresh_skills_removes_tool_when_agent_deregisters(bus_client):
     # Deregister the agent — bus drops its skills from /v1/services
     bus_client.post("/v1/deregister", json={"id": "developer-primary"})
 
-    diff = a.refresh_skills()
+    diff = asyncio.run(a.refresh_skills())
     assert "developer-primary.read_spec" in diff["removed"]
     after = {t.name for t in asyncio.run(a.mcp.list_tools())}
     assert "developer-primary.read_spec" not in after
@@ -729,9 +737,9 @@ def test_refresh_skills_removes_tool_when_agent_deregisters(bus_client):
 
 def test_refresh_skills_idempotent_with_no_changes(bus_client):
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     a.build()
-    diff = a.refresh_skills()
+    diff = asyncio.run(a.refresh_skills())
     # Initial build already registered the live skills; no-op on second pass.
     assert diff == {"added": [], "removed": []}
 
@@ -739,12 +747,12 @@ def test_refresh_skills_idempotent_with_no_changes(bus_client):
 def test_refresh_skills_preserves_bus_and_flow_tools(bus_client):
     """Reconciliation only touches skill tools, not bus_* or flow tools."""
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     a.build()
     bus_client.post("/v1/deregister", json={"id": "researcher-primary"})
     bus_client.post("/v1/deregister", json={"id": "developer-primary"})
 
-    diff = a.refresh_skills()
+    diff = asyncio.run(a.refresh_skills())
     # All per-skill tools should disappear; bus_* and flow tool remain registered.
     names = {t.name for t in asyncio.run(a.mcp.list_tools())}
     assert "bus_services" in names
@@ -757,6 +765,22 @@ def test_refresh_skills_preserves_bus_and_flow_tools(bus_client):
     assert "developer-primary.read_spec" in diff["removed"]
 
 
+def test_refresh_skills_does_not_remove_dotted_flow_tool(bus_client):
+    """A collaborative flow named with a dot must not be misread as an
+    ``agent_id.skill`` tool and removed by reconciliation
+    (fr_khonliang-bus_f01ee092 — type-based, not name-pattern, disambiguation)."""
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    a._register_one_flow({"name": "evaluate_spec.v2", "description": "dotted flow"})
+    assert "evaluate_spec.v2" in a._flow_tools
+
+    diff = asyncio.run(a.refresh_skills())
+
+    assert "evaluate_spec.v2" not in diff["removed"]
+    assert "evaluate_spec.v2" in {t.name for t in asyncio.run(a.mcp.list_tools())}
+
+
 def test_bus_refresh_skills_tool_reports_no_changes(adapter):
     mcp = adapter.build()
     result = asyncio.run(mcp.call_tool("bus_refresh_skills", {}))
@@ -766,7 +790,7 @@ def test_bus_refresh_skills_tool_reports_no_changes(adapter):
 
 def test_bus_refresh_skills_tool_reports_added(bus_client):
     a = BusMCPAdapter("http://testserver")
-    a._http = bus_client
+    _wire_http(a, bus_client)
     mcp = a.build()
     bus_client.post("/v1/register", json={
         "id": "researcher-primary",
