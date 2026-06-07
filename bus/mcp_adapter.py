@@ -766,7 +766,14 @@ class BusMCPAdapter:
         MCP ``Context`` in hand should call ``_notify_list_changed`` to
         push the notification to connected clients.
         """
-        services = await self._async_get("/v1/services") or []
+        services = await self._async_get("/v1/services")
+        if services is None:
+            # The bus fetch FAILED (transient network / bus error) — distinct
+            # from an empty list (no agents). Returning [] here would make
+            # reconciliation treat every agent as gone and wipe ALL skill tools
+            # (and fire tools/list_changed) on a blip, so skip this pass instead.
+            logger.warning("refresh_skills: /v1/services fetch failed; skipping reconciliation")
+            return {"added": [], "removed": []}
         # Build the set of currently-live skill tool names
         live: set[str] = set()
         for svc in services:

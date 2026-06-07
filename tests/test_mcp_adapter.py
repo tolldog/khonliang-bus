@@ -79,6 +79,7 @@ def _wire_http(a: BusMCPAdapter, bus_client: TestClient) -> None:
     a._async_http = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=bus_client.app),
         base_url="http://testserver",
+        timeout=httpx.Timeout(a.default_timeout_s),  # match production config
     )
     _async_clients_to_close.append(a._async_http)
 
@@ -799,6 +800,24 @@ def test_refresh_skills_does_not_remove_dotted_flow_tool(bus_client):
 
     assert "evaluate_spec.v2" not in diff["removed"]
     assert "evaluate_spec.v2" in {t.name for t in asyncio.run(a.mcp.list_tools())}
+
+
+def test_refresh_skills_noop_when_fetch_fails(bus_client, monkeypatch):
+    """A transient /v1/services fetch failure must NOT wipe the skill registry —
+    None (failure) is distinct from [] (no agents)."""
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    before = {t.name for t in asyncio.run(a.mcp.list_tools())}
+
+    async def _fail(path, params=None):
+        return None
+
+    monkeypatch.setattr(a, "_async_get", _fail)
+    diff = asyncio.run(a.refresh_skills())
+
+    assert diff == {"added": [], "removed": []}
+    assert {t.name for t in asyncio.run(a.mcp.list_tools())} == before  # nothing wiped
 
 
 def test_bus_refresh_skills_tool_reports_no_changes(adapter):
