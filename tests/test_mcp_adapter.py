@@ -60,12 +60,15 @@ _async_clients_to_close: list[httpx.AsyncClient] = []
 
 
 @pytest.fixture(autouse=True)
-def _close_wired_async_clients():
+async def _close_wired_async_clients():
+    # Async fixture (asyncio_mode=auto) so teardown can `await aclose()` in the
+    # running loop — works for both sync tests and the module's async tests,
+    # unlike asyncio.run(), which raises inside an already-running loop.
     yield
     while _async_clients_to_close:
         client = _async_clients_to_close.pop()
         with contextlib.suppress(Exception):
-            asyncio.run(client.aclose())
+            await client.aclose()
 
 
 def _wire_http(a: BusMCPAdapter, bus_client: TestClient) -> None:
