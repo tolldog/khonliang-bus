@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 
 import httpx
@@ -52,15 +53,34 @@ def bus_client(tmp_path):
     return client
 
 
+# httpx AsyncClients created during wiring are closed here at test teardown so
+# they don't leak sockets / emit ResourceWarning (the adapter's __init__ clients
+# we replace are also registered for closing).
+_async_clients_to_close: list[httpx.AsyncClient] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_wired_async_clients():
+    yield
+    while _async_clients_to_close:
+        client = _async_clients_to_close.pop()
+        with contextlib.suppress(Exception):
+            asyncio.run(client.aclose())
+
+
 def _wire_http(a: BusMCPAdapter, bus_client: TestClient) -> None:
     """Route the adapter's sync AND async HTTP clients at the in-process test
     app. refresh_skills uses the async client (fr_khonliang-bus_f01ee092), so
-    overriding only ``_http`` is no longer enough."""
+    overriding only ``_http`` is no longer enough. Closes/registers the real
+    clients we replace so nothing leaks."""
+    a._http.close()  # real sync client being replaced (close is sync, safe)
+    _async_clients_to_close.append(a._async_http)  # real async client we replace
     a._http = bus_client
     a._async_http = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=bus_client.app),
         base_url="http://testserver",
     )
+    _async_clients_to_close.append(a._async_http)
 
 
 @pytest.fixture
@@ -196,7 +216,7 @@ def test_total_tool_count(adapter, tmp_path):
     # dynamically-registered skills/flows.
     empty_app = create_app(db_path=str(tmp_path / "empty-bus.db"))
     empty = BusMCPAdapter("http://testserver")
-    empty._http = TestClient(empty_app)
+    _wire_http(empty, TestClient(empty_app))
     builtin = {t.name for t in asyncio.run(empty.build().list_tools())}
 
     # The `adapter` fixture registers 3 agent skills + 1 collaboration flow.
