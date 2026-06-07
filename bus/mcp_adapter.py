@@ -1026,6 +1026,11 @@ class BusMCPAdapter:
             r = await self._async_http.get(f"{self.bus_url}{path}", params=params)
             r.raise_for_status()
             return r.json()
+        except asyncio.CancelledError:
+            # Never swallow cancellation — let shutdown / timeout propagate.
+            # (CancelledError is BaseException on 3.8+ so ``except Exception``
+            # already excludes it; this makes the intent explicit.)
+            raise
         except Exception as e:
             logger.warning("Bus request failed: GET %s: %s", path, e)
             return None
@@ -1072,6 +1077,8 @@ class BusMCPAdapter:
                 "timed_out": True,
                 "timeout_s": resolved,
             }
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return {"error": str(e)}
 
@@ -1093,6 +1100,8 @@ class BusMCPAdapter:
                 "timed_out": True,
                 "timeout_s": effective,
             }
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return {"error": str(e)}
 
