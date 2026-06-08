@@ -113,6 +113,7 @@ def test_build_registers_bus_tools(adapter):
         "bus_trace", "bus_skills", "bus_feedback",
         "bus_artifact_distill", "bus_artifact_distill_many",
         "bus_start_agent", "bus_stop_agent", "bus_restart_agent",
+        "bus_refresh_skills", "bus_force_resync",
     ):
         assert bus_tool in tool_names, f"missing bus tool: {bus_tool}"
 
@@ -900,6 +901,86 @@ def _extract_text(result) -> str:
         if hasattr(first, "text"):
             return first.text
     return str(result)
+
+
+# -- bus_force_resync (fr_khonliang-bus_20f98355) --
+
+
+def test_resync_agent_adds_and_scopes_to_one_agent(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    # researcher gains a skill; developer is untouched.
+    bus_client.post("/v1/register", json={
+        "id": "researcher-primary", "callback": "http://localhost:9001", "pid": 1,
+        "version": "0.8.0",
+        "skills": [
+            {"name": "find_papers", "description": ""},
+            {"name": "synergize", "description": ""},
+            {"name": "scoped_new", "description": ""},
+        ],
+    })
+    diff = asyncio.run(a._resync_agent("researcher-primary"))
+    assert diff["added"] == ["researcher-primary.scoped_new"]
+    assert diff["removed"] == []
+    names = {t.name for t in asyncio.run(a.mcp.list_tools())}
+    assert "researcher-primary.scoped_new" in names
+    assert "developer-primary.read_spec" in names  # other agent untouched
+
+
+def test_resync_agent_error_on_fetch_failure_does_not_wipe(bus_client, monkeypatch):
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    before = {t.name for t in asyncio.run(a.mcp.list_tools())}
+
+    async def _fail(path, params=None):
+        return None
+
+    monkeypatch.setattr(a, "_async_get", _fail)
+    diff = asyncio.run(a._resync_agent("researcher-primary"))
+    assert diff["error"] == "bus fetch failed"
+    assert {t.name for t in asyncio.run(a.mcp.list_tools())} == before
+
+
+def test_bus_force_resync_reemits_notification_with_no_changes(bus_client, monkeypatch):
+    # FastMCP injects its own Context for the `ctx` param, and ctx.session is
+    # unavailable outside a real request — so monkeypatch _notify_list_changed
+    # to assert the tool re-emits UNCONDITIONALLY (even with no tool diff).
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    calls: list[int] = []
+
+    async def _notify(ctx):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(a, "_notify_list_changed", _notify)
+    result = asyncio.run(mcp.call_tool("bus_force_resync", {"agent_id": "researcher-primary"}))
+    text = _extract_text(result)
+    assert calls == [1]  # re-emitted even though nothing changed
+    assert "resynced=True" in text
+    assert "re-emitted" in text
+
+
+def test_bus_force_resync_reports_added(bus_client):
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    bus_client.post("/v1/register", json={
+        "id": "researcher-primary", "callback": "http://localhost:9001", "pid": 1,
+        "version": "0.8.0",
+        "skills": [
+            {"name": "find_papers", "description": ""},
+            {"name": "synergize", "description": ""},
+            {"name": "freshly_added", "description": ""},
+        ],
+    })
+    result = asyncio.run(mcp.call_tool("bus_force_resync", {"agent_id": "researcher-primary"}))
+    text = _extract_text(result)
+    assert "freshly_added" in text
+    assert "+1" in text
 
 
 # -- configurable timeout (FR fr_khonliang_a3dc662d) --
