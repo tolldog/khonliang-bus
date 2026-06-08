@@ -631,6 +631,40 @@ class BusMCPAdapter:
             return " | ".join(parts)
 
         @mcp.tool()
+        async def bus_force_resync(agent_id: str, ctx: Context | None = None) -> str:
+            """Force the MCP client to re-sync its tool list for one agent.
+
+            Targeted recovery for when an agent's skills changed (it restarted /
+            re-registered outside the MCP lifecycle) but the client's tool list
+            is stale. Reconciles just ``agent_id``'s skill tools against the bus,
+            then re-emits ``tools/list_changed`` UNCONDITIONALLY — even when
+            nothing changed — to re-poke a client that missed an earlier
+            notification (the friction in fr_khonliang-bus_e933e5d4 /
+            dog_6b284884). Use ``bus_refresh_skills`` for a fleet-wide refresh.
+
+            Caveats (fr_khonliang-bus_20f98355): MCP's ``tools/list_changed`` is
+            GLOBAL — the diff is scoped to ``agent_id`` but the notification asks
+            the client to re-list ALL tools. ``resynced`` means the notification
+            was sent, not that the client re-fetched (the protocol/library
+            exposes no re-fetch confirmation).
+            """
+            diff = await adapter._resync_agent(agent_id)
+            if diff.get("error"):
+                return f"force_resync {agent_id}: failed — {diff['error']}"
+            resynced = await adapter._notify_list_changed(ctx) if ctx is not None else False
+            lines = [
+                f"force_resync {agent_id}: resynced={resynced} "
+                f"({diff['before_count']} -> {diff['after_count']} agent tools)"
+            ]
+            if diff["added"]:
+                lines.append(f"  +{len(diff['added'])}: {', '.join(diff['added'])}")
+            if diff["removed"]:
+                lines.append(f"  -{len(diff['removed'])}: {', '.join(diff['removed'])}")
+            if not diff["added"] and not diff["removed"]:
+                lines.append("  no tool changes; re-emitted tools/list_changed to re-poke the client")
+            return "\n".join(lines)
+
+        @mcp.tool()
         async def bus_skills(agent_id: str = "") -> str:
             """List skills. Optionally filter by agent_id."""
             params = {"agent_id": agent_id} if agent_id else {}
@@ -826,8 +860,60 @@ class BusMCPAdapter:
         if ctx is not None and (diff["added"] or diff["removed"]):
             await self._notify_list_changed(ctx)
 
-    async def _notify_list_changed(self, ctx: Context) -> None:
+    async def _resync_agent(self, agent_id: str) -> dict:
+        """Reconcile only ``agent_id``'s skill tools against current bus state.
+
+        Like :meth:`refresh_skills` but scoped to a single agent — the targeted
+        half of ``bus_force_resync`` (fr_khonliang-bus_20f98355). Returns
+        ``{added, removed, before_count, after_count}`` (counts of THIS agent's
+        skill tools), or ``{error: ...}`` if the bus fetch failed (so a transient
+        blip doesn't wipe the agent's tools — same guard as refresh_skills).
+        """
+        services = await self._async_get("/v1/services")
+        if services is None:
+            return {"error": "bus fetch failed", "added": [], "removed": []}
+        prefix = f"{agent_id}."
+        live: set[str] = set()
+        for svc in services:
+            if svc.get("id") != agent_id or svc.get("status") != "healthy":
+                continue
+            for skill_name in svc.get("skills", []):
+                live.add(f"{prefix}{skill_name}")
+        # This agent's currently-registered skill tools (type-based: skills, not
+        # flows; scoped by the agent_id prefix).
+        current = {
+            t for t in (self._registered_tools - self._flow_tools)
+            if t.startswith(prefix)
+        }
+        before_count = len(current)
+
+        added: list[str] = []
+        for tool_name in sorted(live - current):
+            _, _, skill_name = tool_name.partition(".")
+            self._register_one_skill(agent_id, skill_name)
+            added.append(tool_name)
+
+        removed: list[str] = []
+        for tool_name in sorted(current - live):
+            try:
+                self.mcp.remove_tool(tool_name)
+            except Exception as e:
+                logger.warning("force_resync: failed to remove %s: %s", tool_name, e)
+                continue
+            self._registered_tools.discard(tool_name)
+            removed.append(tool_name)
+
+        after_count = before_count + len(added) - len(removed)
+        return {
+            "added": added,
+            "removed": removed,
+            "before_count": before_count,
+            "after_count": after_count,
+        }
+
+    async def _notify_list_changed(self, ctx: Context) -> bool:
         """Fire MCP ``notifications/tools/list_changed`` to the active session.
+        Returns True iff the notification was sent.
 
         Best-effort: some transports / clients don't support the notification,
         and the session may not expose ``send_tool_list_changed`` on all
@@ -838,8 +924,10 @@ class BusMCPAdapter:
             send = getattr(ctx.session, "send_tool_list_changed", None)
             if send is not None:
                 await send()
+                return True
         except Exception as e:
             logger.warning("tools/list_changed notification failed: %s", e)
+        return False
 
     def _register_one_skill(self, agent_id: str, skill_name: str) -> None:
         tool_name = f"{agent_id}.{skill_name}"
