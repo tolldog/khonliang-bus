@@ -983,6 +983,54 @@ def test_bus_force_resync_reports_added(bus_client):
     assert "+1" in text
 
 
+def test_bus_force_resync_refreshes_changed_description(bus_client):
+    # An agent that re-registers the SAME skill names with a revised
+    # description must have its tool metadata refreshed — diffing live-vs-current
+    # by name alone would report success while the client keeps the stale
+    # description (codex review, fr_khonliang-bus_20f98355).
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    tool = "researcher-primary.find_papers"
+    assert a._registered_tool_description(tool) == "Search for papers"
+
+    # Re-register with the same names but a changed description for find_papers.
+    bus_client.post("/v1/register", json={
+        "id": "researcher-primary", "callback": "http://localhost:9001", "pid": 1,
+        "version": "0.6.5",
+        "skills": [
+            {"name": "find_papers", "description": "Search for papers (v2)"},
+            {"name": "synergize", "description": "Classify concepts"},
+        ],
+    })
+
+    result = asyncio.run(mcp.call_tool("bus_force_resync", {"agent_id": "researcher-primary"}))
+    text = _extract_text(result)
+    assert "metadata" in text
+    assert "find_papers" in text
+    assert "+0" not in text and "-1" not in text  # not an add/remove
+    assert a._registered_tool_description(tool) == "Search for papers (v2)"
+
+
+def test_bus_force_resync_no_refresh_when_description_unchanged(bus_client):
+    # Re-registering identical metadata must NOT churn the tool (no spurious
+    # "metadata" refresh / remove+re-add).
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    bus_client.post("/v1/register", json={
+        "id": "researcher-primary", "callback": "http://localhost:9001", "pid": 1,
+        "version": "0.6.4",
+        "skills": [
+            {"name": "find_papers", "description": "Search for papers"},
+            {"name": "synergize", "description": "Classify concepts"},
+        ],
+    })
+    result = asyncio.run(mcp.call_tool("bus_force_resync", {"agent_id": "researcher-primary"}))
+    text = _extract_text(result)
+    assert "metadata" not in text
+
+
 # -- configurable timeout (FR fr_khonliang_a3dc662d) --
 #
 # Root cause: the adapter hardcoded httpx timeouts at 30s, silently

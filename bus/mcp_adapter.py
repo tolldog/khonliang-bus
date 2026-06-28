@@ -660,7 +660,9 @@ class BusMCPAdapter:
                 lines.append(f"  +{len(diff['added'])}: {', '.join(diff['added'])}")
             if diff["removed"]:
                 lines.append(f"  -{len(diff['removed'])}: {', '.join(diff['removed'])}")
-            if not diff["added"] and not diff["removed"]:
+            if diff.get("updated"):
+                lines.append(f"  ~{len(diff['updated'])} metadata: {', '.join(diff['updated'])}")
+            if not diff["added"] and not diff["removed"] and not diff.get("updated"):
                 if resynced:
                     lines.append("  no tool changes; re-emitted tools/list_changed to re-poke the client")
                 else:
@@ -906,10 +908,45 @@ class BusMCPAdapter:
             self._registered_tools.discard(tool_name)
             removed.append(tool_name)
 
+        # Refresh tools whose NAME is unchanged but whose registry metadata
+        # (description) changed since registration. Diffing live-vs-current by
+        # name alone misses an agent that re-registered the same skill names
+        # with a revised description — the exact external-re-registration case
+        # this tool recovers from. Without this, bus_force_resync would report
+        # success and fire tools/list_changed while the client keeps re-listing
+        # the stale description (codex review, fr_khonliang-bus_20f98355).
+        updated: list[str] = []
+        unchanged = live & current
+        if unchanged:
+            skills = await self._async_get("/v1/skills", params={"agent_id": agent_id})
+            # Mirror _register_one_skill's effective description (empty falls back
+            # to the synthetic label) so an unchanged description doesn't churn.
+            want_desc: dict[str, str] = {}
+            for s in (skills or []):
+                tn = f"{prefix}{s['name']}"
+                want_desc[tn] = s.get("description", "") or f"{agent_id} skill: {s['name']}"
+            for tool_name in sorted(unchanged):
+                want = want_desc.get(tool_name)
+                if want is None:
+                    continue  # not in /v1/skills payload; leave as-is
+                have = self._registered_tool_description(tool_name)
+                if have is None or have == want:
+                    continue
+                try:
+                    self.mcp.remove_tool(tool_name)
+                except Exception as e:
+                    logger.warning("force_resync: failed to refresh %s: %s", tool_name, e)
+                    continue
+                self._registered_tools.discard(tool_name)
+                _, _, skill_name = tool_name.partition(".")
+                self._register_one_skill(agent_id, skill_name)
+                updated.append(tool_name)
+
         after_count = before_count + len(added) - len(removed)
         return {
             "added": added,
             "removed": removed,
+            "updated": updated,
             "before_count": before_count,
             "after_count": after_count,
         }
@@ -931,6 +968,19 @@ class BusMCPAdapter:
         except Exception as e:
             logger.warning("tools/list_changed notification failed: %s", e)
         return False
+
+    def _registered_tool_description(self, tool_name: str) -> str | None:
+        """Best-effort read of a registered tool's current description.
+
+        Reads FastMCP's tool registry (private API) so a resync can detect a
+        description change on an unchanged tool name. Returns None when the tool
+        isn't registered or the registry internals aren't accessible.
+        """
+        try:
+            tool = self.mcp._tool_manager._tools.get(tool_name)
+        except Exception:
+            return None
+        return getattr(tool, "description", None) if tool is not None else None
 
     def _register_one_skill(self, agent_id: str, skill_name: str) -> None:
         tool_name = f"{agent_id}.{skill_name}"
