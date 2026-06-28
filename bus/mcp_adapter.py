@@ -661,7 +661,10 @@ class BusMCPAdapter:
             if diff["removed"]:
                 lines.append(f"  -{len(diff['removed'])}: {', '.join(diff['removed'])}")
             if not diff["added"] and not diff["removed"]:
-                lines.append("  no tool changes; re-emitted tools/list_changed to re-poke the client")
+                if resynced:
+                    lines.append("  no tool changes; re-emitted tools/list_changed to re-poke the client")
+                else:
+                    lines.append("  no tool changes; tools/list_changed NOT sent (no client session)")
             return "\n".join(lines)
 
         @mcp.tool()
