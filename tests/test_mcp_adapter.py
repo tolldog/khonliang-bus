@@ -1031,6 +1031,309 @@ def test_bus_force_resync_no_refresh_when_description_unchanged(bus_client):
     assert "metadata" not in text
 
 
+# -- tool-name length cap (Claude app connector trips the 64-char API limit) --
+#
+# The MCP client exposes each tool as ``mcp__khonliang-bus__<name>``; the Claude
+# app forwards that raw to the API which rejects names >64 chars (the CLI
+# sanitizes first, so only the app breaks). _fit_tool_name caps every exposed
+# name at registration; dispatch is unaffected because the proxy routes on the
+# captured agent_id/skill_name, not the exposed name.
+
+from bus.mcp_adapter import MCP_TOOL_NAME_LIMIT, MCP_TOOL_NAME_PREFIX
+
+_LONG_SKILL = "a_very_long_skill_name_that_blows_past_the_sixty_four_char_limit"
+
+
+def test_fit_tool_name_caps_and_preserves():
+    fit = BusMCPAdapter("http://testserver")._fit_tool_name
+    budget = MCP_TOOL_NAME_LIMIT - len(MCP_TOOL_NAME_PREFIX)
+
+    short = "researcher-primary.find_papers"
+    assert fit(short) == short  # within budget → unchanged
+
+    raw = f"developer-primary.{_LONG_SKILL}"
+    fitted = fit(raw)
+    assert len(MCP_TOOL_NAME_PREFIX + fitted) <= MCP_TOOL_NAME_LIMIT
+    assert len(fitted) == budget                     # uses the full budget
+    assert fitted.startswith("developer-primary.")   # agent_id front survives
+    assert fit(raw) == fitted                         # deterministic
+
+    # Distinct raw names with the same truncated prefix get distinct fitted
+    # names (hash is of the FULL raw name).
+    a = fit("developer-primary." + "x" * 60 + "_alpha")
+    b = fit("developer-primary." + "x" * 60 + "_beta")
+    assert a != b
+
+
+def test_mcp_server_key_configurable_drives_budget(monkeypatch):
+    # The client-facing server key (which the bus can't observe) is
+    # configurable via constructor + env and drives the 64-char budget, so a
+    # client registering under a longer/shorter key still gets correct caps.
+    raw = "developer-primary." + "z" * 40  # over the default budget
+
+    default = BusMCPAdapter("http://testserver")
+    assert default._mcp_tool_prefix == "mcp__khonliang-bus__"
+
+    # Constructor override — a longer key shrinks the budget; result still fits.
+    longer = BusMCPAdapter("http://testserver", mcp_server_key="khonliang-bus-staging")
+    assert longer._mcp_tool_prefix == "mcp__khonliang-bus-staging__"
+    assert len(longer._mcp_tool_prefix + longer._fit_tool_name(raw)) <= MCP_TOOL_NAME_LIMIT
+    # Tighter budget ⇒ at least as much truncation as the default.
+    assert len(longer._fit_tool_name(raw)) < len(default._fit_tool_name(raw))
+
+    # Env override path.
+    monkeypatch.setenv("KHONLIANG_MCP_SERVER_KEY", "kb")
+    env_keyed = BusMCPAdapter("http://testserver")
+    assert env_keyed._mcp_tool_prefix == "mcp__kb__"
+    # Shorter key ⇒ wider budget: a name the default would truncate now fits.
+    name_45 = "developer-primary." + "w" * 27  # 45 chars: >44 (default) but <56 (kb)
+    assert env_keyed._fit_tool_name(name_45) == name_45
+    assert default._fit_tool_name(name_45) != name_45
+
+
+def test_mcp_server_key_too_long_rejected():
+    # A key so long it leaves no room to fit even a hashed name must fail fast,
+    # not silently emit names that still exceed the 64-char limit.
+    with pytest.raises(ValueError):
+        BusMCPAdapter("http://testserver", mcp_server_key="k" * 60)
+
+
+def test_long_server_key_overflowing_builtin_caught_at_build(bus_client):
+    # A key short enough to pass the fitting-budget guard but long enough that a
+    # fixed built-in bus_* name still exceeds 64 must be caught at build(), not
+    # silently shipped to the client (built-ins aren't fitted).
+    a = BusMCPAdapter("http://testserver", mcp_server_key="k" * 36)  # passes __init__
+    _wire_http(a, bus_client)
+    with pytest.raises(ValueError, match="exceed"):
+        a.build()
+
+
+def test_bus_matrix_unavailable_long_flow_shows_raw_name(bus_client):
+    # An unavailable flow is never registered as a tool, so bus_matrix must show
+    # its RAW name, not a fitted alias that no call_tool would resolve.
+    long_flow = "evaluate_specification_against_the_entire_research_corpus_v9"
+    bus_client.post("/v1/register", json={
+        "id": "developer-primary", "callback": "http://localhost:9002", "pid": 2,
+        "version": "0.1.0",
+        "skills": [{"name": "read_spec", "description": "Parse a spec file"}],
+        "collaborations": [{
+            "name": long_flow,
+            "description": "needs an impossible version",
+            "requires": {"researcher": ">=99.0.0"},
+            "steps": [{"call": "developer.read_spec"}],
+        }],
+    })
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    fitted = a._fit_tool_name(long_flow)
+    matrix = _extract_text(asyncio.run(mcp.call_tool("bus_matrix", {})))
+    assert long_flow in matrix      # unavailable flow advertised by its raw name
+    assert fitted not in matrix     # not the non-existent fitted alias
+
+
+def test_bus_skills_handle_gated_on_registration(bus_client):
+    # The [tool: …] handle must appear only when the fitted tool is actually
+    # registered — /v1/skills lists unhealthy agents too, whose skills have no
+    # callable tool (codex review).
+    _register_long_skill(bus_client)
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    fitted = a._fit_tool_name(f"researcher-primary.{_LONG_SKILL}")
+    assert f"[tool: {fitted}]" in _extract_text(asyncio.run(mcp.call_tool("bus_skills", {})))
+    # Simulate the skill not actually registered (unhealthy agent at build).
+    a._registered_tools.discard(fitted)
+    assert "[tool:" not in _extract_text(asyncio.run(mcp.call_tool("bus_skills", {})))
+
+
+def test_bus_flows_raw_name_when_flow_not_registered(bus_client):
+    # An available flow not registered this session (flow tools aren't refreshed
+    # post-start) must show its raw name, not a fitted alias call_tool can't
+    # resolve (codex review).
+    long_flow = "evaluate_specification_against_the_entire_research_corpus_v7"
+    bus_client.post("/v1/register", json={
+        "id": "developer-primary", "callback": "http://localhost:9002", "pid": 2,
+        "version": "0.1.0",
+        "skills": [{"name": "read_spec", "description": "Parse a spec file"}],
+        "collaborations": [{
+            "name": long_flow, "description": "long", "requires": {},
+            "steps": [{"call": "developer.read_spec"}],
+        }],
+    })
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    fitted = a._fit_tool_name(long_flow)
+    assert fitted in _extract_text(asyncio.run(mcp.call_tool("bus_flows", {})))  # registered
+    a._flow_tools.discard(fitted)
+    a._registered_tools.discard(fitted)
+    text = _extract_text(asyncio.run(mcp.call_tool("bus_flows", {})))
+    assert long_flow in text and fitted not in text  # falls back to raw
+
+
+def test_skill_flow_alias_collision_is_loud(bus_client, monkeypatch, caplog):
+    # If a skill's fitted name collides with an already-registered flow tool,
+    # drop it loudly (and return False so refresh_skills doesn't churn) rather
+    # than treating it as a harmless duplicate (codex review).
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    a._flow_tools.add("aliased_flow")
+    a._registered_tools.add("aliased_flow")
+    monkeypatch.setattr(a, "_fit_tool_name", lambda raw: "aliased_flow")
+    with caplog.at_level("ERROR"):
+        registered = a._register_one_skill("researcher-primary", "find_papers")
+    assert registered is False
+    assert "aliased_flow" not in a._skill_routes        # flow alias not claimed by a skill
+    assert any("collision" in r.message for r in caplog.records)
+
+
+def _register_long_skill(bus_client, agent="researcher-primary"):
+    bus_client.post("/v1/register", json={
+        "id": agent, "callback": "http://localhost:9001", "pid": 1,
+        "version": "0.6.4",
+        "skills": [
+            {"name": "find_papers", "description": "Search for papers"},
+            {"name": _LONG_SKILL, "description": "Long-named skill"},
+        ],
+    })
+
+
+def test_long_skill_registered_within_limit(bus_client):
+    _register_long_skill(bus_client)
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    raw = f"researcher-primary.{_LONG_SKILL}"
+    fitted = a._fit_tool_name(raw)
+
+    names = {t.name for t in asyncio.run(mcp.list_tools())}
+    assert fitted in names               # exposed under the fitted name
+    assert raw not in names              # NOT under the over-limit raw name
+    assert all(len(MCP_TOOL_NAME_PREFIX + n) <= MCP_TOOL_NAME_LIMIT
+               for n in names if "." in n)  # every skill tool fits
+
+    # bus_skills advertises the callable (fitted) tool name for capped skills.
+    text = _extract_text(asyncio.run(mcp.call_tool("bus_skills", {})))
+    assert f"[tool: {fitted}]" in text
+
+
+def test_long_skill_dispatches_to_real_skill(bus_client):
+    _register_long_skill(bus_client)
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+
+    seen = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        seen["agent_id"] = agent_id
+        seen["operation"] = operation
+        return {"result": "ok"}
+
+    a._async_request = mock_request
+    mcp = a.build()
+    fitted = a._fit_tool_name(f"researcher-primary.{_LONG_SKILL}")
+    asyncio.run(mcp.call_tool(fitted, {"args": "{}"}))
+    # Routes on the REAL identity, not the truncated exposed name.
+    assert seen == {"agent_id": "researcher-primary", "operation": _LONG_SKILL}
+
+
+def test_refresh_skills_no_churn_for_long_named_skill(bus_client):
+    # A long-named skill already registered must reconcile cleanly — the live
+    # set is fitted the same way as the registered set, so no spurious
+    # remove+re-add (which would have happened if live used raw names).
+    _register_long_skill(bus_client)
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    diff = asyncio.run(a.refresh_skills())
+    assert diff == {"added": [], "removed": []}
+
+
+def test_resync_handles_long_agent_id_truncated_into_prefix(bus_client):
+    # An agent_id long enough that _fit_tool_name truncates INSIDE the
+    # 'agent_id.' prefix must still be resync-able. Ownership is tracked
+    # explicitly (_skill_routes), not inferred from the truncated tool name —
+    # a prefix match would find nothing and leave stale tools / phantom-add
+    # (codex review).
+    long_id = "really-long-agent-identifier-exceeding-forty-chars-primary"
+    payload = lambda skills: {
+        "id": long_id, "callback": "http://localhost:9009", "pid": 7,
+        "version": "1.0.0", "skills": skills,
+    }
+    bus_client.post("/v1/register", json=payload([
+        {"name": "alpha", "description": "A"},
+        {"name": "beta", "description": "B"},
+    ]))
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+
+    fit = a._fit_tool_name
+    name_alpha = fit(f"{long_id}.alpha")
+    name_beta = fit(f"{long_id}.beta")
+    # The fit truncated past the agent_id boundary, so a prefix match fails:
+    assert not name_beta.startswith(f"{long_id}.")
+    names = {t.name for t in asyncio.run(mcp.list_tools())}
+    assert {name_alpha, name_beta} <= names
+
+    # Drop 'beta'; force_resync must remove its now-stale tool.
+    bus_client.post("/v1/register", json=payload([{"name": "alpha", "description": "A"}]))
+    asyncio.run(mcp.call_tool("bus_force_resync", {"agent_id": long_id}))
+    names_after = {t.name for t in asyncio.run(mcp.list_tools())}
+    assert name_beta not in names_after   # stale tool removed
+    assert name_alpha in names_after      # live tool retained
+
+
+def test_fitted_name_collision_is_loud_not_silent(bus_client, monkeypatch, caplog):
+    # A 48-bit hash makes collisions astronomically unlikely, but if two skills
+    # ever fit to the same exposed name the second must be logged + dropped (its
+    # route preserved for the first), never silently overwritten.
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    monkeypatch.setattr(a, "_fit_tool_name", lambda raw: "collide.name")
+    a._register_one_skill("researcher-primary", "find_papers")
+    with caplog.at_level("ERROR"):
+        a._register_one_skill("developer-primary", "read_spec")
+    assert a._skill_routes["collide.name"] == ("researcher-primary", "find_papers")
+    assert any("collision" in r.message for r in caplog.records)
+
+
+def test_long_flow_name_fitted_and_discoverable(bus_client):
+    # A long flow name is capped to fit the API limit; bus_flows must advertise
+    # the EXPOSED (callable) name, not the raw one, or the catalog points at a
+    # tool that doesn't exist (codex review).
+    long_flow = "evaluate_specification_against_the_entire_research_corpus_v2"
+    bus_client.post("/v1/register", json={
+        "id": "developer-primary", "callback": "http://localhost:9002", "pid": 2,
+        "version": "0.1.0",
+        "skills": [{"name": "read_spec", "description": "Parse a spec file"}],
+        "collaborations": [{
+            "name": long_flow,
+            "description": "long flow",
+            "requires": {},
+            "steps": [{"call": "developer.read_spec"}],
+        }],
+    })
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+
+    fitted = a._fit_tool_name(long_flow)
+    assert fitted != long_flow                                       # was capped
+    assert len(MCP_TOOL_NAME_PREFIX + fitted) <= MCP_TOOL_NAME_LIMIT
+    names = {t.name for t in asyncio.run(mcp.list_tools())}
+    assert fitted in names and long_flow not in names               # registered fitted
+
+    text = _extract_text(asyncio.run(mcp.call_tool("bus_flows", {})))
+    assert fitted in text and long_flow not in text                 # advertised fitted
+
+    matrix = _extract_text(asyncio.run(mcp.call_tool("bus_matrix", {})))
+    assert fitted in matrix and long_flow not in matrix             # matrix consistent too
+
+
 # -- configurable timeout (FR fr_khonliang_a3dc662d) --
 #
 # Root cause: the adapter hardcoded httpx timeouts at 30s, silently
