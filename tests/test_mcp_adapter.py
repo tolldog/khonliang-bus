@@ -1173,6 +1173,36 @@ def test_fitted_name_collision_is_loud_not_silent(bus_client, monkeypatch, caplo
     assert any("collision" in r.message for r in caplog.records)
 
 
+def test_long_flow_name_fitted_and_discoverable(bus_client):
+    # A long flow name is capped to fit the API limit; bus_flows must advertise
+    # the EXPOSED (callable) name, not the raw one, or the catalog points at a
+    # tool that doesn't exist (codex review).
+    long_flow = "evaluate_specification_against_the_entire_research_corpus_v2"
+    bus_client.post("/v1/register", json={
+        "id": "developer-primary", "callback": "http://localhost:9002", "pid": 2,
+        "version": "0.1.0",
+        "skills": [{"name": "read_spec", "description": "Parse a spec file"}],
+        "collaborations": [{
+            "name": long_flow,
+            "description": "long flow",
+            "requires": {},
+            "steps": [{"call": "developer.read_spec"}],
+        }],
+    })
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+
+    fitted = BusMCPAdapter._fit_tool_name(long_flow)
+    assert fitted != long_flow                                       # was capped
+    assert len(MCP_TOOL_NAME_PREFIX + fitted) <= MCP_TOOL_NAME_LIMIT
+    names = {t.name for t in asyncio.run(mcp.list_tools())}
+    assert fitted in names and long_flow not in names               # registered fitted
+
+    text = _extract_text(asyncio.run(mcp.call_tool("bus_flows", {})))
+    assert fitted in text and long_flow not in text                 # advertised fitted
+
+
 # -- configurable timeout (FR fr_khonliang_a3dc662d) --
 #
 # Root cause: the adapter hardcoded httpx timeouts at 30s, silently

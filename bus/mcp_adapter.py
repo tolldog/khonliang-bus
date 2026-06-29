@@ -438,7 +438,13 @@ class BusMCPAdapter:
                 lines.append("=== AVAILABLE ===")
                 for flow in f["available"]:
                     reqs = ", ".join(f"{k}{v}" for k, v in flow.get("requires", {}).items())
-                    lines.append(f"  {flow['name']} [{reqs}] — {flow.get('description', '')}")
+                    # Report the EXPOSED (fitted) tool name — that's what's
+                    # registered and callable. For short names this equals
+                    # flow['name']; a long name is capped to fit the 64-char API
+                    # limit, so advertising the raw name here would point callers
+                    # at a tool that doesn't exist.
+                    name = adapter._fit_tool_name(flow["name"])
+                    lines.append(f"  {name} [{reqs}] — {flow.get('description', '')}")
             if f.get("unavailable"):
                 lines.append("=== UNAVAILABLE ===")
                 for flow in f["unavailable"]:
