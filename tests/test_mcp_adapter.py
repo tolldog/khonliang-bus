@@ -1158,6 +1158,21 @@ def test_resync_handles_long_agent_id_truncated_into_prefix(bus_client):
     assert name_alpha in names_after      # live tool retained
 
 
+def test_fitted_name_collision_is_loud_not_silent(bus_client, monkeypatch, caplog):
+    # A 48-bit hash makes collisions astronomically unlikely, but if two skills
+    # ever fit to the same exposed name the second must be logged + dropped (its
+    # route preserved for the first), never silently overwritten.
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    monkeypatch.setattr(a, "_fit_tool_name", staticmethod(lambda raw: "collide.name"))
+    a._register_one_skill("researcher-primary", "find_papers")
+    with caplog.at_level("ERROR"):
+        a._register_one_skill("developer-primary", "read_spec")
+    assert a._skill_routes["collide.name"] == ("researcher-primary", "find_papers")
+    assert any("collision" in r.message for r in caplog.records)
+
+
 # -- configurable timeout (FR fr_khonliang_a3dc662d) --
 #
 # Root cause: the adapter hardcoded httpx timeouts at 30s, silently

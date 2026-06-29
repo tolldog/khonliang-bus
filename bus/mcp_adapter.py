@@ -1013,9 +1013,12 @@ class BusMCPAdapter:
         budget = MCP_TOOL_NAME_LIMIT - len(MCP_TOOL_NAME_PREFIX)
         if len(raw_name) <= budget:
             return raw_name
-        # 6 hex chars (24 bits) of a fast non-crypto hash — ample to avoid
-        # collisions among an agent's skills while staying short.
-        digest = hashlib.blake2s(raw_name.encode(), digest_size=3).hexdigest()
+        # 12 hex chars (48 bits) of a fast non-crypto hash of the FULL raw name.
+        # 48 bits keeps collisions negligible even for adversarial same-prefix
+        # names (a 24-bit suffix is small enough to construct collisions that
+        # would silently drop one tool); _register_one_skill also logs loudly if
+        # one ever occurs, so it can't be lost silently.
+        digest = hashlib.blake2s(raw_name.encode(), digest_size=6).hexdigest()
         suffix = f"_{digest}"
         return raw_name[: budget - len(suffix)] + suffix
 
@@ -1037,6 +1040,15 @@ class BusMCPAdapter:
         # routes on the captured agent_id/skill_name, so a fitted name is
         # transparent to callers.
         tool_name = self._fit_tool_name(f"{agent_id}.{skill_name}")
+        existing = self._skill_routes.get(tool_name)
+        if existing is not None and existing != (agent_id, skill_name):
+            # Two distinct skills fitted to the same exposed name (astronomically
+            # unlikely with a 48-bit hash, but never lose a tool silently).
+            logger.error(
+                "tool-name collision: %s already routes to %s; dropping (%s, %s)",
+                tool_name, existing, agent_id, skill_name,
+            )
+            return
         if tool_name in self._registered_tools:
             return
         self._registered_tools.add(tool_name)
