@@ -57,16 +57,40 @@ DEFAULT_MCP_TIMEOUT_S: float = 60.0
 # skill handler never sees it.
 MCP_TIMEOUT_ARG: str = "_mcp_timeout"
 
-# The MCP client publishes each tool as ``mcp__<server>__<name>`` where
-# ``<server>`` is the client-config key for this server (== the FastMCP server
-# name, "khonliang-bus"). The Claude app's connector path forwards that raw
-# string straight to the API, which REJECTS tool names over 64 chars — and the
-# app's chat breaks outright when it does. The bus CLI sanitizes/truncates
-# first so it never trips; the app does. We can't patch the app's validator, so
-# the cap has to hold here, at registration. ``_fit_tool_name`` enforces it for
-# every skill and flow tool, not just the handful currently over the line.
+# The MCP client publishes each tool as ``mcp__<server-key>__<name>`` where
+# ``<server-key>`` is the CLIENT's config key for this server (the ``.mcp.json``
+# / codex ``[mcp_servers.<key>]`` entry). The Claude app's connector path
+# forwards that raw string straight to the API, which REJECTS tool names over 64
+# chars — and the app's chat breaks outright when it does. The bus CLI
+# sanitizes/truncates first so it never trips; the app does. We can't patch the
+# app's validator, so the cap has to hold here, at registration.
+# ``_fit_tool_name`` enforces it for every skill and flow tool.
+#
+# The bus process can't OBSERVE the client's config key, so it's configurable
+# (constructor arg / ``KHONLIANG_MCP_SERVER_KEY`` env). The default matches the
+# README example and the deployed config; set it to match if a client registers
+# the server under a different (especially longer) key, or the budget will be
+# wrong and overlong names will still slip through.
 MCP_TOOL_NAME_LIMIT: int = 64
-MCP_TOOL_NAME_PREFIX: str = "mcp__khonliang-bus__"
+DEFAULT_MCP_SERVER_KEY: str = "khonliang-bus"
+
+
+def _mcp_tool_prefix(server_key: str) -> str:
+    """The client-applied tool-name prefix for a given server config key."""
+    return f"mcp__{server_key}__"
+
+
+def _resolve_mcp_server_key(explicit: str | None) -> str:
+    """Resolve the client-facing server key: explicit arg > env > default."""
+    for candidate in (explicit, os.environ.get("KHONLIANG_MCP_SERVER_KEY")):
+        if candidate and candidate.strip():
+            return candidate.strip()
+    return DEFAULT_MCP_SERVER_KEY
+
+
+# Default prefix (default server key) — the budget any client using the
+# documented key gets. Per-instance prefix lives on the adapter.
+MCP_TOOL_NAME_PREFIX: str = _mcp_tool_prefix(DEFAULT_MCP_SERVER_KEY)
 
 
 class BusMCPAdapter:
@@ -108,13 +132,22 @@ class BusMCPAdapter:
     skills.
     """
 
-    def __init__(self, bus_url: str, default_timeout_s: float | None = None):
+    def __init__(
+        self,
+        bus_url: str,
+        default_timeout_s: float | None = None,
+        mcp_server_key: str | None = None,
+    ):
         self.bus_url = bus_url.rstrip("/")
         self.default_timeout_s = (
             float(default_timeout_s)
             if default_timeout_s is not None
             else DEFAULT_MCP_TIMEOUT_S
         )
+        # Client-facing server key drives the 64-char tool-name budget (see
+        # module notes). Resolved once here so _fit_tool_name is cheap.
+        self._mcp_server_key = _resolve_mcp_server_key(mcp_server_key)
+        self._mcp_tool_prefix = _mcp_tool_prefix(self._mcp_server_key)
         # Construct httpx clients with the adapter default timeout as the
         # client-level cap. Call sites that need a longer window (or shorter)
         # pass a per-request ``timeout=`` kwarg which overrides the client
@@ -1007,23 +1040,25 @@ class BusMCPAdapter:
             logger.warning("tools/list_changed notification failed: %s", e)
         return False
 
-    @staticmethod
-    def _fit_tool_name(raw_name: str) -> str:
+    def _fit_tool_name(self, raw_name: str) -> str:
         """Return an exposed tool name guaranteed to fit the 64-char API limit.
 
-        If ``{MCP_TOOL_NAME_PREFIX}{raw_name}`` is within the limit, ``raw_name``
+        If ``{self._mcp_tool_prefix}{raw_name}`` is within the limit, ``raw_name``
         is returned unchanged. Otherwise the name is truncated and a short stable
         hash of the FULL raw name is appended — deterministic across restarts and
         collision-resistant, so a given skill always maps to the same exposed
         name. Only the TAIL is cut, so the ``agent_id.`` front survives and
         prefix-scoped reconcile filters stay valid.
 
+        The budget depends on the client-facing server key (``_mcp_tool_prefix``),
+        which is configurable because the bus can't observe the client's config.
+
         Dispatch is unaffected: ``_skill_proxy`` / ``_flow_proxy`` route on the
         captured agent_id/skill_name/flow_name, not the exposed name. But every
         reconcile path MUST fit names the same way so add/remove/update diffs
         still match what was registered.
         """
-        budget = MCP_TOOL_NAME_LIMIT - len(MCP_TOOL_NAME_PREFIX)
+        budget = MCP_TOOL_NAME_LIMIT - len(self._mcp_tool_prefix)
         if len(raw_name) <= budget:
             return raw_name
         # 12 hex chars (48 bits) of a fast non-crypto hash of the FULL raw name.
@@ -1448,6 +1483,19 @@ def main():
             "``_mcp_timeout`` hint embedded in the ``args`` JSON string."
         ),
     )
+    parser.add_argument(
+        "--mcp-server-key",
+        default=None,
+        help=(
+            "Client-facing MCP server key — the ``.mcp.json`` / codex "
+            "``[mcp_servers.<key>]`` name under which this server is "
+            "registered. Determines the ``mcp__<key>__`` tool-name prefix "
+            "and thus the 64-char budget used to cap long tool names. "
+            "Defaults to KHONLIANG_MCP_SERVER_KEY env, then "
+            f"'{DEFAULT_MCP_SERVER_KEY}'. Set it to match your config if you "
+            "register the server under a different (especially longer) key."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1460,7 +1508,11 @@ def main():
         default_timeout = _resolve_default_timeout(args.default_timeout)
     except ValueError as exc:
         parser.error(str(exc))
-    adapter = BusMCPAdapter(args.bus, default_timeout_s=default_timeout)
+    adapter = BusMCPAdapter(
+        args.bus,
+        default_timeout_s=default_timeout,
+        mcp_server_key=args.mcp_server_key,
+    )
     mcp = adapter.build()
 
     # Count the tools actually registered on the server rather than a

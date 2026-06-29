@@ -1045,7 +1045,7 @@ _LONG_SKILL = "a_very_long_skill_name_that_blows_past_the_sixty_four_char_limit"
 
 
 def test_fit_tool_name_caps_and_preserves():
-    fit = BusMCPAdapter._fit_tool_name
+    fit = BusMCPAdapter("http://testserver")._fit_tool_name
     budget = MCP_TOOL_NAME_LIMIT - len(MCP_TOOL_NAME_PREFIX)
 
     short = "researcher-primary.find_papers"
@@ -1065,6 +1065,32 @@ def test_fit_tool_name_caps_and_preserves():
     assert a != b
 
 
+def test_mcp_server_key_configurable_drives_budget(monkeypatch):
+    # The client-facing server key (which the bus can't observe) is
+    # configurable via constructor + env and drives the 64-char budget, so a
+    # client registering under a longer/shorter key still gets correct caps.
+    raw = "developer-primary." + "z" * 40  # over the default budget
+
+    default = BusMCPAdapter("http://testserver")
+    assert default._mcp_tool_prefix == "mcp__khonliang-bus__"
+
+    # Constructor override — a longer key shrinks the budget; result still fits.
+    longer = BusMCPAdapter("http://testserver", mcp_server_key="khonliang-bus-staging")
+    assert longer._mcp_tool_prefix == "mcp__khonliang-bus-staging__"
+    assert len(longer._mcp_tool_prefix + longer._fit_tool_name(raw)) <= MCP_TOOL_NAME_LIMIT
+    # Tighter budget ⇒ at least as much truncation as the default.
+    assert len(longer._fit_tool_name(raw)) < len(default._fit_tool_name(raw))
+
+    # Env override path.
+    monkeypatch.setenv("KHONLIANG_MCP_SERVER_KEY", "kb")
+    env_keyed = BusMCPAdapter("http://testserver")
+    assert env_keyed._mcp_tool_prefix == "mcp__kb__"
+    # Shorter key ⇒ wider budget: a name the default would truncate now fits.
+    name_45 = "developer-primary." + "w" * 27  # 45 chars: >44 (default) but <56 (kb)
+    assert env_keyed._fit_tool_name(name_45) == name_45
+    assert default._fit_tool_name(name_45) != name_45
+
+
 def _register_long_skill(bus_client, agent="researcher-primary"):
     bus_client.post("/v1/register", json={
         "id": agent, "callback": "http://localhost:9001", "pid": 1,
@@ -1082,7 +1108,7 @@ def test_long_skill_registered_within_limit(bus_client):
     _wire_http(a, bus_client)
     mcp = a.build()
     raw = f"researcher-primary.{_LONG_SKILL}"
-    fitted = BusMCPAdapter._fit_tool_name(raw)
+    fitted = a._fit_tool_name(raw)
 
     names = {t.name for t in asyncio.run(mcp.list_tools())}
     assert fitted in names               # exposed under the fitted name
@@ -1109,7 +1135,7 @@ def test_long_skill_dispatches_to_real_skill(bus_client):
 
     a._async_request = mock_request
     mcp = a.build()
-    fitted = BusMCPAdapter._fit_tool_name(f"researcher-primary.{_LONG_SKILL}")
+    fitted = a._fit_tool_name(f"researcher-primary.{_LONG_SKILL}")
     asyncio.run(mcp.call_tool(fitted, {"args": "{}"}))
     # Routes on the REAL identity, not the truncated exposed name.
     assert seen == {"agent_id": "researcher-primary", "operation": _LONG_SKILL}
@@ -1146,7 +1172,7 @@ def test_resync_handles_long_agent_id_truncated_into_prefix(bus_client):
     _wire_http(a, bus_client)
     mcp = a.build()
 
-    fit = BusMCPAdapter._fit_tool_name
+    fit = a._fit_tool_name
     name_alpha = fit(f"{long_id}.alpha")
     name_beta = fit(f"{long_id}.beta")
     # The fit truncated past the agent_id boundary, so a prefix match fails:
@@ -1169,7 +1195,7 @@ def test_fitted_name_collision_is_loud_not_silent(bus_client, monkeypatch, caplo
     a = BusMCPAdapter("http://testserver")
     _wire_http(a, bus_client)
     a.build()
-    monkeypatch.setattr(a, "_fit_tool_name", staticmethod(lambda raw: "collide.name"))
+    monkeypatch.setattr(a, "_fit_tool_name", lambda raw: "collide.name")
     a._register_one_skill("researcher-primary", "find_papers")
     with caplog.at_level("ERROR"):
         a._register_one_skill("developer-primary", "read_spec")
@@ -1197,7 +1223,7 @@ def test_long_flow_name_fitted_and_discoverable(bus_client):
     _wire_http(a, bus_client)
     mcp = a.build()
 
-    fitted = BusMCPAdapter._fit_tool_name(long_flow)
+    fitted = a._fit_tool_name(long_flow)
     assert fitted != long_flow                                       # was capped
     assert len(MCP_TOOL_NAME_PREFIX + fitted) <= MCP_TOOL_NAME_LIMIT
     names = {t.name for t in asyncio.run(mcp.list_tools())}
