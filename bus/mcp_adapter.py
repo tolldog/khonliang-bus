@@ -423,7 +423,10 @@ class BusMCPAdapter:
             for collab in m.get("collaborations", []):
                 reqs = ", ".join(f"{k}{v}" for k, v in collab.get("requires", {}).items())
                 status = "✓" if collab["status"] == "available" else "✗"
-                line = f"  {status} {collab['name']} [{reqs}]"
+                # Report the exposed (fitted) tool name — that's what's callable
+                # for an available flow; no-op for short names.
+                name = adapter._fit_tool_name(collab["name"])
+                line = f"  {status} {name} [{reqs}]"
                 if collab.get("unmet"):
                     line += f" — {'; '.join(collab['unmet'])}"
                 lines.append(line)
@@ -706,7 +709,11 @@ class BusMCPAdapter:
                 if s["agent_id"] != current_agent:
                     current_agent = s["agent_id"]
                     lines.append(f"\n  {current_agent}:")
-                lines.append(f"    {s['name']} — {s.get('description', '')}")
+                # When the callable tool name was capped to fit the API limit,
+                # show it so the caller invokes the right name (not agent.skill).
+                fitted = adapter._fit_tool_name(f"{s['agent_id']}.{s['name']}")
+                handle = "" if fitted == f"{s['agent_id']}.{s['name']}" else f"  [tool: {fitted}]"
+                lines.append(f"    {s['name']} — {s.get('description', '')}{handle}")
             return "\n".join(lines).strip()
 
         @mcp.tool()

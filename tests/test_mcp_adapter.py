@@ -1090,6 +1090,10 @@ def test_long_skill_registered_within_limit(bus_client):
     assert all(len(MCP_TOOL_NAME_PREFIX + n) <= MCP_TOOL_NAME_LIMIT
                for n in names if "." in n)  # every skill tool fits
 
+    # bus_skills advertises the callable (fitted) tool name for capped skills.
+    text = _extract_text(asyncio.run(mcp.call_tool("bus_skills", {})))
+    assert f"[tool: {fitted}]" in text
+
 
 def test_long_skill_dispatches_to_real_skill(bus_client):
     _register_long_skill(bus_client)
@@ -1201,6 +1205,9 @@ def test_long_flow_name_fitted_and_discoverable(bus_client):
 
     text = _extract_text(asyncio.run(mcp.call_tool("bus_flows", {})))
     assert fitted in text and long_flow not in text                 # advertised fitted
+
+    matrix = _extract_text(asyncio.run(mcp.call_tool("bus_matrix", {})))
+    assert fitted in matrix and long_flow not in matrix             # matrix consistent too
 
 
 # -- configurable timeout (FR fr_khonliang_a3dc662d) --
