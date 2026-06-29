@@ -194,7 +194,35 @@ class BusMCPAdapter:
         self._register_bus_tools()
         self._register_skill_tools()
         self._register_flow_tools()
+        self._assert_tool_names_within_limit()
         return self.mcp
+
+    def _assert_tool_names_within_limit(self) -> None:
+        """Fail fast if any REGISTERED tool name would exceed the API limit.
+
+        Skill/flow names are capped by _fit_tool_name, but built-in ``bus_*``
+        tools register under fixed names — for a long custom server key the
+        prefix can push those over 64 even when the fitting budget is fine. This
+        is the single backstop guaranteeing the client never receives an
+        over-limit name (no matter the surface that produced it).
+        """
+        try:
+            names = list(self.mcp._tool_manager._tools.keys())
+        except Exception:
+            names = list(self._registered_tools)
+        over = sorted(
+            n for n in names
+            if len(self._mcp_tool_prefix) + len(n) > MCP_TOOL_NAME_LIMIT
+        )
+        if over:
+            raise ValueError(
+                f"{len(over)} tool name(s) exceed the {MCP_TOOL_NAME_LIMIT}-char "
+                f"API limit under server key {self._mcp_server_key!r} (prefix "
+                f"{self._mcp_tool_prefix!r}): {over[:5]}. Skill/flow names are "
+                "capped automatically, so an over-limit name here is a built-in "
+                "bus_* tool — the server key is too long; use a shorter "
+                ".mcp.json key."
+            )
 
     def _register_bus_tools(self) -> None:
         """Register built-in bus management tools."""
@@ -474,10 +502,12 @@ class BusMCPAdapter:
             lines.append("=== COLLABORATIONS ===")
             for collab in m.get("collaborations", []):
                 reqs = ", ".join(f"{k}{v}" for k, v in collab.get("requires", {}).items())
-                status = "✓" if collab["status"] == "available" else "✗"
-                # Report the exposed (fitted) tool name — that's what's callable
-                # for an available flow; no-op for short names.
-                name = adapter._fit_tool_name(collab["name"])
+                available = collab["status"] == "available"
+                status = "✓" if available else "✗"
+                # Only available flows are registered as tools — show the fitted
+                # (callable) name for those; an unavailable flow has no tool, so
+                # advertising a fitted alias would point at a non-existent name.
+                name = adapter._fit_tool_name(collab["name"]) if available else collab["name"]
                 line = f"  {status} {name} [{reqs}]"
                 if collab.get("unmet"):
                     line += f" — {'; '.join(collab['unmet'])}"

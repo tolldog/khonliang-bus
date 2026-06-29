@@ -1098,6 +1098,40 @@ def test_mcp_server_key_too_long_rejected():
         BusMCPAdapter("http://testserver", mcp_server_key="k" * 60)
 
 
+def test_long_server_key_overflowing_builtin_caught_at_build(bus_client):
+    # A key short enough to pass the fitting-budget guard but long enough that a
+    # fixed built-in bus_* name still exceeds 64 must be caught at build(), not
+    # silently shipped to the client (built-ins aren't fitted).
+    a = BusMCPAdapter("http://testserver", mcp_server_key="k" * 36)  # passes __init__
+    _wire_http(a, bus_client)
+    with pytest.raises(ValueError, match="exceed"):
+        a.build()
+
+
+def test_bus_matrix_unavailable_long_flow_shows_raw_name(bus_client):
+    # An unavailable flow is never registered as a tool, so bus_matrix must show
+    # its RAW name, not a fitted alias that no call_tool would resolve.
+    long_flow = "evaluate_specification_against_the_entire_research_corpus_v9"
+    bus_client.post("/v1/register", json={
+        "id": "developer-primary", "callback": "http://localhost:9002", "pid": 2,
+        "version": "0.1.0",
+        "skills": [{"name": "read_spec", "description": "Parse a spec file"}],
+        "collaborations": [{
+            "name": long_flow,
+            "description": "needs an impossible version",
+            "requires": {"researcher": ">=99.0.0"},
+            "steps": [{"call": "developer.read_spec"}],
+        }],
+    })
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    fitted = a._fit_tool_name(long_flow)
+    matrix = _extract_text(asyncio.run(mcp.call_tool("bus_matrix", {})))
+    assert long_flow in matrix      # unavailable flow advertised by its raw name
+    assert fitted not in matrix     # not the non-existent fitted alias
+
+
 def test_skill_flow_alias_collision_is_loud(bus_client, monkeypatch, caplog):
     # If a skill's fitted name collides with an already-registered flow tool,
     # drop it loudly (and return False so refresh_skills doesn't churn) rather
