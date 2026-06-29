@@ -1132,6 +1132,46 @@ def test_bus_matrix_unavailable_long_flow_shows_raw_name(bus_client):
     assert fitted not in matrix     # not the non-existent fitted alias
 
 
+def test_bus_skills_handle_gated_on_registration(bus_client):
+    # The [tool: …] handle must appear only when the fitted tool is actually
+    # registered — /v1/skills lists unhealthy agents too, whose skills have no
+    # callable tool (codex review).
+    _register_long_skill(bus_client)
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    fitted = a._fit_tool_name(f"researcher-primary.{_LONG_SKILL}")
+    assert f"[tool: {fitted}]" in _extract_text(asyncio.run(mcp.call_tool("bus_skills", {})))
+    # Simulate the skill not actually registered (unhealthy agent at build).
+    a._registered_tools.discard(fitted)
+    assert "[tool:" not in _extract_text(asyncio.run(mcp.call_tool("bus_skills", {})))
+
+
+def test_bus_flows_raw_name_when_flow_not_registered(bus_client):
+    # An available flow not registered this session (flow tools aren't refreshed
+    # post-start) must show its raw name, not a fitted alias call_tool can't
+    # resolve (codex review).
+    long_flow = "evaluate_specification_against_the_entire_research_corpus_v7"
+    bus_client.post("/v1/register", json={
+        "id": "developer-primary", "callback": "http://localhost:9002", "pid": 2,
+        "version": "0.1.0",
+        "skills": [{"name": "read_spec", "description": "Parse a spec file"}],
+        "collaborations": [{
+            "name": long_flow, "description": "long", "requires": {},
+            "steps": [{"call": "developer.read_spec"}],
+        }],
+    })
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    fitted = a._fit_tool_name(long_flow)
+    assert fitted in _extract_text(asyncio.run(mcp.call_tool("bus_flows", {})))  # registered
+    a._flow_tools.discard(fitted)
+    a._registered_tools.discard(fitted)
+    text = _extract_text(asyncio.run(mcp.call_tool("bus_flows", {})))
+    assert long_flow in text and fitted not in text  # falls back to raw
+
+
 def test_skill_flow_alias_collision_is_loud(bus_client, monkeypatch, caplog):
     # If a skill's fitted name collides with an already-registered flow tool,
     # drop it loudly (and return False so refresh_skills doesn't churn) rather

@@ -502,12 +502,13 @@ class BusMCPAdapter:
             lines.append("=== COLLABORATIONS ===")
             for collab in m.get("collaborations", []):
                 reqs = ", ".join(f"{k}{v}" for k, v in collab.get("requires", {}).items())
-                available = collab["status"] == "available"
-                status = "✓" if available else "✗"
-                # Only available flows are registered as tools — show the fitted
-                # (callable) name for those; an unavailable flow has no tool, so
-                # advertising a fitted alias would point at a non-existent name.
-                name = adapter._fit_tool_name(collab["name"]) if available else collab["name"]
+                status = "✓" if collab["status"] == "available" else "✗"
+                # Show the fitted (callable) name only when the flow tool is
+                # actually registered this session; otherwise the raw name —
+                # never a fitted alias that no call_tool can resolve (unavailable
+                # flows, or available-but-not-yet-refreshed ones).
+                fitted = adapter._fit_tool_name(collab["name"])
+                name = fitted if fitted in adapter._flow_tools else collab["name"]
                 line = f"  {status} {name} [{reqs}]"
                 if collab.get("unmet"):
                     line += f" — {'; '.join(collab['unmet'])}"
@@ -523,12 +524,14 @@ class BusMCPAdapter:
                 lines.append("=== AVAILABLE ===")
                 for flow in f["available"]:
                     reqs = ", ".join(f"{k}{v}" for k, v in flow.get("requires", {}).items())
-                    # Report the EXPOSED (fitted) tool name — that's what's
-                    # registered and callable. For short names this equals
-                    # flow['name']; a long name is capped to fit the 64-char API
-                    # limit, so advertising the raw name here would point callers
-                    # at a tool that doesn't exist.
-                    name = adapter._fit_tool_name(flow["name"])
+                    # Report the actually-registered tool name. For a capped
+                    # long name that's the fitted alias; but only if it's truly
+                    # registered (flow tools aren't refreshed post-start, so a
+                    # newly-available flow may be in /v1/flows yet have no tool
+                    # this session) — otherwise show the raw name rather than a
+                    # fitted alias that call_tool can't resolve.
+                    fitted = adapter._fit_tool_name(flow["name"])
+                    name = fitted if fitted in adapter._flow_tools else flow["name"]
                     lines.append(f"  {name} [{reqs}] — {flow.get('description', '')}")
             if f.get("unavailable"):
                 lines.append("=== UNAVAILABLE ===")
@@ -793,8 +796,16 @@ class BusMCPAdapter:
                     lines.append(f"\n  {current_agent}:")
                 # When the callable tool name was capped to fit the API limit,
                 # show it so the caller invokes the right name (not agent.skill).
-                fitted = adapter._fit_tool_name(f"{s['agent_id']}.{s['name']}")
-                handle = "" if fitted == f"{s['agent_id']}.{s['name']}" else f"  [tool: {fitted}]"
+                # Only when the fitted tool is ACTUALLY registered — /v1/skills
+                # lists every agent, but registration filters to healthy ones, so
+                # a long skill on an unhealthy agent has no callable tool.
+                raw = f"{s['agent_id']}.{s['name']}"
+                fitted = adapter._fit_tool_name(raw)
+                handle = (
+                    f"  [tool: {fitted}]"
+                    if fitted != raw and fitted in adapter._registered_tools
+                    else ""
+                )
                 lines.append(f"    {s['name']} — {s.get('description', '')}{handle}")
             return "\n".join(lines).strip()
 
