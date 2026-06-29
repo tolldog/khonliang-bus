@@ -1230,6 +1230,13 @@ class BusMCPAdapter:
         # captured raw flow_name (flow_id), so a fitted name is transparent.
         tool_name = self._fit_tool_name(flow_name)
         if tool_name in self._registered_tools:
+            # Collided with an already-registered skill or flow tool
+            # (astronomically unlikely with a 48-bit hash). Log loudly,
+            # symmetric to _register_one_skill, rather than silently skip.
+            logger.error(
+                "tool-name collision: flow %r fits to %s which is already "
+                "registered; dropping flow", flow_name, tool_name,
+            )
             return
         self._registered_tools.add(tool_name)
         self._flow_tools.add(tool_name)
