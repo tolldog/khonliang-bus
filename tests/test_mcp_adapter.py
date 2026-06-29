@@ -1031,6 +1031,98 @@ def test_bus_force_resync_no_refresh_when_description_unchanged(bus_client):
     assert "metadata" not in text
 
 
+# -- tool-name length cap (Claude app connector trips the 64-char API limit) --
+#
+# The MCP client exposes each tool as ``mcp__khonliang-bus__<name>``; the Claude
+# app forwards that raw to the API which rejects names >64 chars (the CLI
+# sanitizes first, so only the app breaks). _fit_tool_name caps every exposed
+# name at registration; dispatch is unaffected because the proxy routes on the
+# captured agent_id/skill_name, not the exposed name.
+
+from bus.mcp_adapter import MCP_TOOL_NAME_LIMIT, MCP_TOOL_NAME_PREFIX
+
+_LONG_SKILL = "a_very_long_skill_name_that_blows_past_the_sixty_four_char_limit"
+
+
+def test_fit_tool_name_caps_and_preserves():
+    fit = BusMCPAdapter._fit_tool_name
+    budget = MCP_TOOL_NAME_LIMIT - len(MCP_TOOL_NAME_PREFIX)
+
+    short = "researcher-primary.find_papers"
+    assert fit(short) == short  # within budget → unchanged
+
+    raw = f"developer-primary.{_LONG_SKILL}"
+    fitted = fit(raw)
+    assert len(MCP_TOOL_NAME_PREFIX + fitted) <= MCP_TOOL_NAME_LIMIT
+    assert len(fitted) == budget                     # uses the full budget
+    assert fitted.startswith("developer-primary.")   # agent_id front survives
+    assert fit(raw) == fitted                         # deterministic
+
+    # Distinct raw names with the same truncated prefix get distinct fitted
+    # names (hash is of the FULL raw name).
+    a = fit("developer-primary." + "x" * 60 + "_alpha")
+    b = fit("developer-primary." + "x" * 60 + "_beta")
+    assert a != b
+
+
+def _register_long_skill(bus_client, agent="researcher-primary"):
+    bus_client.post("/v1/register", json={
+        "id": agent, "callback": "http://localhost:9001", "pid": 1,
+        "version": "0.6.4",
+        "skills": [
+            {"name": "find_papers", "description": "Search for papers"},
+            {"name": _LONG_SKILL, "description": "Long-named skill"},
+        ],
+    })
+
+
+def test_long_skill_registered_within_limit(bus_client):
+    _register_long_skill(bus_client)
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+    raw = f"researcher-primary.{_LONG_SKILL}"
+    fitted = BusMCPAdapter._fit_tool_name(raw)
+
+    names = {t.name for t in asyncio.run(mcp.list_tools())}
+    assert fitted in names               # exposed under the fitted name
+    assert raw not in names              # NOT under the over-limit raw name
+    assert all(len(MCP_TOOL_NAME_PREFIX + n) <= MCP_TOOL_NAME_LIMIT
+               for n in names if "." in n)  # every skill tool fits
+
+
+def test_long_skill_dispatches_to_real_skill(bus_client):
+    _register_long_skill(bus_client)
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+
+    seen = {}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        seen["agent_id"] = agent_id
+        seen["operation"] = operation
+        return {"result": "ok"}
+
+    a._async_request = mock_request
+    mcp = a.build()
+    fitted = BusMCPAdapter._fit_tool_name(f"researcher-primary.{_LONG_SKILL}")
+    asyncio.run(mcp.call_tool(fitted, {"args": "{}"}))
+    # Routes on the REAL identity, not the truncated exposed name.
+    assert seen == {"agent_id": "researcher-primary", "operation": _LONG_SKILL}
+
+
+def test_refresh_skills_no_churn_for_long_named_skill(bus_client):
+    # A long-named skill already registered must reconcile cleanly — the live
+    # set is fitted the same way as the registered set, so no spurious
+    # remove+re-add (which would have happened if live used raw names).
+    _register_long_skill(bus_client)
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    diff = asyncio.run(a.refresh_skills())
+    assert diff == {"added": [], "removed": []}
+
+
 # -- configurable timeout (FR fr_khonliang_a3dc662d) --
 #
 # Root cause: the adapter hardcoded httpx timeouts at 30s, silently

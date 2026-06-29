@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -55,6 +56,17 @@ DEFAULT_MCP_TIMEOUT_S: float = 60.0
 # Skill-arg control-plane hint. Stripped from args before forwarding so the
 # skill handler never sees it.
 MCP_TIMEOUT_ARG: str = "_mcp_timeout"
+
+# The MCP client publishes each tool as ``mcp__<server>__<name>`` where
+# ``<server>`` is the client-config key for this server (== the FastMCP server
+# name, "khonliang-bus"). The Claude app's connector path forwards that raw
+# string straight to the API, which REJECTS tool names over 64 chars — and the
+# app's chat breaks outright when it does. The bus CLI sanitizes/truncates
+# first so it never trips; the app does. We can't patch the app's validator, so
+# the cap has to hold here, at registration. ``_fit_tool_name`` enforces it for
+# every skill and flow tool, not just the handful currently over the line.
+MCP_TOOL_NAME_LIMIT: int = 64
+MCP_TOOL_NAME_PREFIX: str = "mcp__khonliang-bus__"
 
 
 class BusMCPAdapter:
@@ -813,14 +825,16 @@ class BusMCPAdapter:
             # (and fire tools/list_changed) on a blip, so skip this pass instead.
             logger.warning("refresh_skills: /v1/services fetch failed; skipping reconciliation")
             return {"added": [], "removed": []}
-        # Build the set of currently-live skill tool names
-        live: set[str] = set()
+        # Map each currently-live EXPOSED (fitted) tool name back to its
+        # (agent_id, skill_name) — recovery can't parse the fitted name (the
+        # tail may be truncated + hashed), so carry the source identity here.
+        live: dict[str, tuple[str, str]] = {}
         for svc in services:
             if svc.get("status") != "healthy":
                 continue
             agent_id = svc["id"]
             for skill_name in svc.get("skills", []):
-                live.add(f"{agent_id}.{skill_name}")
+                live[self._fit_tool_name(f"{agent_id}.{skill_name}")] = (agent_id, skill_name)
 
         # Reconcile only SKILL tools. Distinguish them by type — everything in
         # _registered_tools that isn't a tracked flow tool — rather than by name
@@ -831,13 +845,13 @@ class BusMCPAdapter:
         currently_registered = self._registered_tools - self._flow_tools
 
         added: list[str] = []
-        for tool_name in sorted(live - currently_registered):
-            agent_id, _, skill_name = tool_name.partition(".")
+        for tool_name in sorted(set(live) - currently_registered):
+            agent_id, skill_name = live[tool_name]
             self._register_one_skill(agent_id, skill_name)
             added.append(tool_name)
 
         removed: list[str] = []
-        for tool_name in sorted(currently_registered - live):
+        for tool_name in sorted(currently_registered - set(live)):
             try:
                 self.mcp.remove_tool(tool_name)
             except Exception as e:
@@ -878,14 +892,17 @@ class BusMCPAdapter:
         if services is None:
             return {"error": "bus fetch failed", "added": [], "removed": []}
         prefix = f"{agent_id}."
-        live: set[str] = set()
+        # Map each live EXPOSED (fitted) tool name back to its skill_name — the
+        # fitted name's tail may be truncated, so recovery can't parse it.
+        live: dict[str, str] = {}
         for svc in services:
             if svc.get("id") != agent_id or svc.get("status") != "healthy":
                 continue
             for skill_name in svc.get("skills", []):
-                live.add(f"{prefix}{skill_name}")
+                live[self._fit_tool_name(f"{prefix}{skill_name}")] = skill_name
         # This agent's currently-registered skill tools (type-based: skills, not
-        # flows; scoped by the agent_id prefix).
+        # flows; scoped by the agent_id prefix — fitting only truncates the tail,
+        # so the ``agent_id.`` front is preserved and this filter stays valid).
         current = {
             t for t in (self._registered_tools - self._flow_tools)
             if t.startswith(prefix)
@@ -893,13 +910,12 @@ class BusMCPAdapter:
         before_count = len(current)
 
         added: list[str] = []
-        for tool_name in sorted(live - current):
-            _, _, skill_name = tool_name.partition(".")
-            self._register_one_skill(agent_id, skill_name)
+        for tool_name in sorted(set(live) - current):
+            self._register_one_skill(agent_id, live[tool_name])
             added.append(tool_name)
 
         removed: list[str] = []
-        for tool_name in sorted(current - live):
+        for tool_name in sorted(current - set(live)):
             try:
                 self.mcp.remove_tool(tool_name)
             except Exception as e:
@@ -916,14 +932,15 @@ class BusMCPAdapter:
         # success and fire tools/list_changed while the client keeps re-listing
         # the stale description (codex review, fr_khonliang-bus_20f98355).
         updated: list[str] = []
-        unchanged = live & current
+        unchanged = set(live) & current
         if unchanged:
             skills = await self._async_get("/v1/skills", params={"agent_id": agent_id})
             # Mirror _register_one_skill's effective description (empty falls back
             # to the synthetic label) so an unchanged description doesn't churn.
+            # Key by the fitted name to match what's registered.
             want_desc: dict[str, str] = {}
             for s in (skills or []):
-                tn = f"{prefix}{s['name']}"
+                tn = self._fit_tool_name(f"{prefix}{s['name']}")
                 want_desc[tn] = s.get("description", "") or f"{agent_id} skill: {s['name']}"
             for tool_name in sorted(unchanged):
                 want = want_desc.get(tool_name)
@@ -938,8 +955,7 @@ class BusMCPAdapter:
                     logger.warning("force_resync: failed to refresh %s: %s", tool_name, e)
                     continue
                 self._registered_tools.discard(tool_name)
-                _, _, skill_name = tool_name.partition(".")
-                self._register_one_skill(agent_id, skill_name)
+                self._register_one_skill(agent_id, live[tool_name])
                 updated.append(tool_name)
 
         after_count = before_count + len(added) - len(removed)
@@ -969,6 +985,31 @@ class BusMCPAdapter:
             logger.warning("tools/list_changed notification failed: %s", e)
         return False
 
+    @staticmethod
+    def _fit_tool_name(raw_name: str) -> str:
+        """Return an exposed tool name guaranteed to fit the 64-char API limit.
+
+        If ``{MCP_TOOL_NAME_PREFIX}{raw_name}`` is within the limit, ``raw_name``
+        is returned unchanged. Otherwise the name is truncated and a short stable
+        hash of the FULL raw name is appended — deterministic across restarts and
+        collision-resistant, so a given skill always maps to the same exposed
+        name. Only the TAIL is cut, so the ``agent_id.`` front survives and
+        prefix-scoped reconcile filters stay valid.
+
+        Dispatch is unaffected: ``_skill_proxy`` / ``_flow_proxy`` route on the
+        captured agent_id/skill_name/flow_name, not the exposed name. But every
+        reconcile path MUST fit names the same way so add/remove/update diffs
+        still match what was registered.
+        """
+        budget = MCP_TOOL_NAME_LIMIT - len(MCP_TOOL_NAME_PREFIX)
+        if len(raw_name) <= budget:
+            return raw_name
+        # 6 hex chars (24 bits) of a fast non-crypto hash — ample to avoid
+        # collisions among an agent's skills while staying short.
+        digest = hashlib.blake2s(raw_name.encode(), digest_size=3).hexdigest()
+        suffix = f"_{digest}"
+        return raw_name[: budget - len(suffix)] + suffix
+
     def _registered_tool_description(self, tool_name: str) -> str | None:
         """Best-effort read of a registered tool's current description.
 
@@ -983,7 +1024,10 @@ class BusMCPAdapter:
         return getattr(tool, "description", None) if tool is not None else None
 
     def _register_one_skill(self, agent_id: str, skill_name: str) -> None:
-        tool_name = f"{agent_id}.{skill_name}"
+        # Exposed name is capped at the 64-char API limit; dispatch below still
+        # routes on the captured agent_id/skill_name, so a fitted name is
+        # transparent to callers.
+        tool_name = self._fit_tool_name(f"{agent_id}.{skill_name}")
         if tool_name in self._registered_tools:
             return
         self._registered_tools.add(tool_name)
@@ -1043,15 +1087,18 @@ class BusMCPAdapter:
 
     def _register_one_flow(self, flow: dict) -> None:
         flow_name = flow["name"]
-        if flow_name in self._registered_tools:
+        # Exposed name capped at the API limit; the proxy below routes on the
+        # captured raw flow_name (flow_id), so a fitted name is transparent.
+        tool_name = self._fit_tool_name(flow_name)
+        if tool_name in self._registered_tools:
             return
-        self._registered_tools.add(flow_name)
-        self._flow_tools.add(flow_name)
+        self._registered_tools.add(tool_name)
+        self._flow_tools.add(tool_name)
 
         adapter = self
         description = flow.get("description", "") or f"Collaborative flow: {flow_name}"
 
-        @self.mcp.tool(name=flow_name, description=description)
+        @self.mcp.tool(name=tool_name, description=description)
         async def _flow_proxy(args: str = "{}", mcp_timeout: int | None = None) -> str:
             """Execute a collaborative flow. Pass args as JSON string.
 
