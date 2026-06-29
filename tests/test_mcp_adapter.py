@@ -1123,6 +1123,41 @@ def test_refresh_skills_no_churn_for_long_named_skill(bus_client):
     assert diff == {"added": [], "removed": []}
 
 
+def test_resync_handles_long_agent_id_truncated_into_prefix(bus_client):
+    # An agent_id long enough that _fit_tool_name truncates INSIDE the
+    # 'agent_id.' prefix must still be resync-able. Ownership is tracked
+    # explicitly (_skill_routes), not inferred from the truncated tool name —
+    # a prefix match would find nothing and leave stale tools / phantom-add
+    # (codex review).
+    long_id = "really-long-agent-identifier-exceeding-forty-chars-primary"
+    payload = lambda skills: {
+        "id": long_id, "callback": "http://localhost:9009", "pid": 7,
+        "version": "1.0.0", "skills": skills,
+    }
+    bus_client.post("/v1/register", json=payload([
+        {"name": "alpha", "description": "A"},
+        {"name": "beta", "description": "B"},
+    ]))
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    mcp = a.build()
+
+    fit = BusMCPAdapter._fit_tool_name
+    name_alpha = fit(f"{long_id}.alpha")
+    name_beta = fit(f"{long_id}.beta")
+    # The fit truncated past the agent_id boundary, so a prefix match fails:
+    assert not name_beta.startswith(f"{long_id}.")
+    names = {t.name for t in asyncio.run(mcp.list_tools())}
+    assert {name_alpha, name_beta} <= names
+
+    # Drop 'beta'; force_resync must remove its now-stale tool.
+    bus_client.post("/v1/register", json=payload([{"name": "alpha", "description": "A"}]))
+    asyncio.run(mcp.call_tool("bus_force_resync", {"agent_id": long_id}))
+    names_after = {t.name for t in asyncio.run(mcp.list_tools())}
+    assert name_beta not in names_after   # stale tool removed
+    assert name_alpha in names_after      # live tool retained
+
+
 # -- configurable timeout (FR fr_khonliang_a3dc662d) --
 #
 # Root cause: the adapter hardcoded httpx timeouts at 30s, silently

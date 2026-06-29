@@ -130,6 +130,12 @@ class BusMCPAdapter:
         # a flow named with a dot (e.g. ``evaluate_spec.v2``) must not be
         # misread as an ``agent_id.skill`` tool (fr_khonliang-bus_f01ee092).
         self._flow_tools: set[str] = set()
+        # Exposed (possibly fitted) skill-tool name -> (agent_id, skill_name).
+        # Ownership is tracked explicitly rather than parsed back out of the
+        # tool name, because _fit_tool_name may truncate the name (even inside
+        # the ``agent_id.`` prefix for a very long agent id), so a prefix match
+        # can't reliably identify an agent's tools during a scoped resync.
+        self._skill_routes: dict[str, tuple[str, str]] = {}
 
     def build(self) -> FastMCP:
         """Fetch bus state and generate MCP tools. Call once before run."""
@@ -858,6 +864,7 @@ class BusMCPAdapter:
                 logger.warning("Failed to remove tool %s: %s", tool_name, e)
                 continue
             self._registered_tools.discard(tool_name)
+            self._skill_routes.pop(tool_name, None)
             removed.append(tool_name)
 
         if added or removed:
@@ -900,12 +907,13 @@ class BusMCPAdapter:
                 continue
             for skill_name in svc.get("skills", []):
                 live[self._fit_tool_name(f"{prefix}{skill_name}")] = skill_name
-        # This agent's currently-registered skill tools (type-based: skills, not
-        # flows; scoped by the agent_id prefix — fitting only truncates the tail,
-        # so the ``agent_id.`` front is preserved and this filter stays valid).
+        # This agent's currently-registered skill tools, by EXACT ownership from
+        # _skill_routes — not a name prefix match. _fit_tool_name can truncate a
+        # long agent_id past the ``agent_id.`` boundary, so a prefix filter would
+        # miss those tools (codex review: leaves stale tools / phantom adds).
         current = {
-            t for t in (self._registered_tools - self._flow_tools)
-            if t.startswith(prefix)
+            name for name, (aid, _) in self._skill_routes.items()
+            if aid == agent_id
         }
         before_count = len(current)
 
@@ -922,6 +930,7 @@ class BusMCPAdapter:
                 logger.warning("force_resync: failed to remove %s: %s", tool_name, e)
                 continue
             self._registered_tools.discard(tool_name)
+            self._skill_routes.pop(tool_name, None)
             removed.append(tool_name)
 
         # Refresh tools whose NAME is unchanged but whose registry metadata
@@ -1031,6 +1040,9 @@ class BusMCPAdapter:
         if tool_name in self._registered_tools:
             return
         self._registered_tools.add(tool_name)
+        # Record exact ownership so a scoped resync identifies this agent's
+        # tools without parsing the (possibly truncated) exposed name.
+        self._skill_routes[tool_name] = (agent_id, skill_name)
 
         adapter = self
 
