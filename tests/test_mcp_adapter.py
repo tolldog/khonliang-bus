@@ -1091,6 +1091,30 @@ def test_mcp_server_key_configurable_drives_budget(monkeypatch):
     assert default._fit_tool_name(name_45) != name_45
 
 
+def test_mcp_server_key_too_long_rejected():
+    # A key so long it leaves no room to fit even a hashed name must fail fast,
+    # not silently emit names that still exceed the 64-char limit.
+    with pytest.raises(ValueError):
+        BusMCPAdapter("http://testserver", mcp_server_key="k" * 60)
+
+
+def test_skill_flow_alias_collision_is_loud(bus_client, monkeypatch, caplog):
+    # If a skill's fitted name collides with an already-registered flow tool,
+    # drop it loudly (and return False so refresh_skills doesn't churn) rather
+    # than treating it as a harmless duplicate (codex review).
+    a = BusMCPAdapter("http://testserver")
+    _wire_http(a, bus_client)
+    a.build()
+    a._flow_tools.add("aliased_flow")
+    a._registered_tools.add("aliased_flow")
+    monkeypatch.setattr(a, "_fit_tool_name", lambda raw: "aliased_flow")
+    with caplog.at_level("ERROR"):
+        registered = a._register_one_skill("researcher-primary", "find_papers")
+    assert registered is False
+    assert "aliased_flow" not in a._skill_routes        # flow alias not claimed by a skill
+    assert any("collision" in r.message for r in caplog.records)
+
+
 def _register_long_skill(bus_client, agent="researcher-primary"):
     bus_client.post("/v1/register", json={
         "id": agent, "callback": "http://localhost:9001", "pid": 1,

@@ -74,6 +74,15 @@ MCP_TIMEOUT_ARG: str = "_mcp_timeout"
 MCP_TOOL_NAME_LIMIT: int = 64
 DEFAULT_MCP_SERVER_KEY: str = "khonliang-bus"
 
+# Length of the disambiguating suffix a fitted name carries: ``_`` + 12 hex
+# chars (48-bit blake2s digest). A name that must be truncated needs at least
+# this much budget plus a few readable chars; a server key long enough to leave
+# less than _MIN_TOOL_NAME_BUDGET is a misconfiguration we reject at startup
+# (otherwise we couldn't guarantee a <=64-char name at all).
+_FIT_HASH_BYTES: int = 6
+_FIT_SUFFIX_LEN: int = 1 + _FIT_HASH_BYTES * 2  # "_" + hex
+_MIN_TOOL_NAME_BUDGET: int = _FIT_SUFFIX_LEN + 3
+
 
 def _mcp_tool_prefix(server_key: str) -> str:
     """The client-applied tool-name prefix for a given server config key."""
@@ -148,6 +157,16 @@ class BusMCPAdapter:
         # module notes). Resolved once here so _fit_tool_name is cheap.
         self._mcp_server_key = _resolve_mcp_server_key(mcp_server_key)
         self._mcp_tool_prefix = _mcp_tool_prefix(self._mcp_server_key)
+        budget = MCP_TOOL_NAME_LIMIT - len(self._mcp_tool_prefix)
+        if budget < _MIN_TOOL_NAME_BUDGET:
+            # A key this long leaves too few chars to fit even a hashed name
+            # under the API limit — fail fast rather than emit names that still
+            # exceed 64 and break the client.
+            raise ValueError(
+                f"MCP server key {self._mcp_server_key!r} is too long: leaves "
+                f"{budget} chars for tool names (need >= {_MIN_TOOL_NAME_BUDGET}). "
+                "Register the server under a shorter .mcp.json key."
+            )
         # Construct httpx clients with the adapter default timeout as the
         # client-level cap. Call sites that need a longer window (or shorter)
         # pass a per-request ``timeout=`` kwarg which overrides the client
@@ -899,8 +918,8 @@ class BusMCPAdapter:
         added: list[str] = []
         for tool_name in sorted(set(live) - currently_registered):
             agent_id, skill_name = live[tool_name]
-            self._register_one_skill(agent_id, skill_name)
-            added.append(tool_name)
+            if self._register_one_skill(agent_id, skill_name):
+                added.append(tool_name)
 
         removed: list[str] = []
         for tool_name in sorted(currently_registered - set(live)):
@@ -965,8 +984,8 @@ class BusMCPAdapter:
 
         added: list[str] = []
         for tool_name in sorted(set(live) - current):
-            self._register_one_skill(agent_id, live[tool_name])
-            added.append(tool_name)
+            if self._register_one_skill(agent_id, live[tool_name]):
+                added.append(tool_name)
 
         removed: list[str] = []
         for tool_name in sorted(current - set(live)):
@@ -1009,7 +1028,10 @@ class BusMCPAdapter:
                 except Exception as e:
                     logger.warning("force_resync: failed to refresh %s: %s", tool_name, e)
                     continue
+                # Clear BOTH the registration and the route so the re-register
+                # isn't short-circuited by the same-skill no-op guard.
                 self._registered_tools.discard(tool_name)
+                self._skill_routes.pop(tool_name, None)
                 self._register_one_skill(agent_id, live[tool_name])
                 updated.append(tool_name)
 
@@ -1061,14 +1083,17 @@ class BusMCPAdapter:
         budget = MCP_TOOL_NAME_LIMIT - len(self._mcp_tool_prefix)
         if len(raw_name) <= budget:
             return raw_name
-        # 12 hex chars (48 bits) of a fast non-crypto hash of the FULL raw name.
-        # 48 bits keeps collisions negligible even for adversarial same-prefix
-        # names (a 24-bit suffix is small enough to construct collisions that
-        # would silently drop one tool); _register_one_skill also logs loudly if
-        # one ever occurs, so it can't be lost silently.
-        digest = hashlib.blake2s(raw_name.encode(), digest_size=6).hexdigest()
+        # 48-bit blake2s digest of the FULL raw name. 48 bits keeps collisions
+        # negligible even for adversarial same-prefix names (a 24-bit suffix is
+        # small enough to construct collisions that would silently drop a tool);
+        # _register_one_skill also logs loudly if one ever occurs.
+        digest = hashlib.blake2s(raw_name.encode(), digest_size=_FIT_HASH_BYTES).hexdigest()
         suffix = f"_{digest}"
-        return raw_name[: budget - len(suffix)] + suffix
+        # __init__ guarantees budget >= _MIN_TOOL_NAME_BUDGET (> suffix len), so
+        # keep is positive; max(0, …) is belt-and-suspenders against a negative
+        # slice (which would trim the tail and leave an over-limit name).
+        keep = max(0, budget - len(suffix))
+        return (raw_name[:keep] + suffix)[:budget]
 
     def _registered_tool_description(self, tool_name: str) -> str | None:
         """Best-effort read of a registered tool's current description.
@@ -1083,22 +1108,32 @@ class BusMCPAdapter:
             return None
         return getattr(tool, "description", None) if tool is not None else None
 
-    def _register_one_skill(self, agent_id: str, skill_name: str) -> None:
+    def _register_one_skill(self, agent_id: str, skill_name: str) -> bool:
+        """Register one skill tool. Returns True iff it was newly registered.
+
+        False means it was already registered (no-op) OR its fitted name
+        collided with another tool — callers use this to avoid reporting a
+        dropped skill as ``added`` (which would otherwise churn every refresh).
+        """
         # Exposed name is capped at the 64-char API limit; dispatch below still
         # routes on the captured agent_id/skill_name, so a fitted name is
         # transparent to callers.
         tool_name = self._fit_tool_name(f"{agent_id}.{skill_name}")
         existing = self._skill_routes.get(tool_name)
-        if existing is not None and existing != (agent_id, skill_name):
-            # Two distinct skills fitted to the same exposed name (astronomically
-            # unlikely with a 48-bit hash, but never lose a tool silently).
+        if existing == (agent_id, skill_name):
+            return False  # already registered, same skill — no-op
+        if existing is not None or tool_name in self._flow_tools:
+            # The fitted name is already claimed by a DIFFERENT skill or by a
+            # flow tool (astronomically unlikely with a 48-bit hash, but never
+            # drop a tool silently — and don't let refresh_skills churn on it).
+            owner = existing if existing is not None else f"flow {tool_name!r}"
             logger.error(
-                "tool-name collision: %s already routes to %s; dropping (%s, %s)",
-                tool_name, existing, agent_id, skill_name,
+                "tool-name collision: %s already routes to %s; dropping skill (%s, %s)",
+                tool_name, owner, agent_id, skill_name,
             )
-            return
+            return False
         if tool_name in self._registered_tools:
-            return
+            return False
         self._registered_tools.add(tool_name)
         # Record exact ownership so a scoped resync identifies this agent's
         # tools without parsing the (possibly truncated) exposed name.
@@ -1150,6 +1185,8 @@ class BusMCPAdapter:
                 result=result.get("result", ""),
                 budget=budget,
             )
+
+        return True
 
     def _register_flow_tools(self) -> None:
         """Generate an @mcp.tool for each available collaborative flow."""
