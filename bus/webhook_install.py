@@ -1,0 +1,582 @@
+"""GitHub webhook outbound management — install / audit / repair.
+
+Symmetric to :mod:`bus.webhooks` (which receives inbound deliveries):
+this module owns OUTBOUND GitHub API calls that configure repos to
+deliver to the bus's ``/v1/webhooks/github`` endpoint.
+
+Closes ``fr_khonliang-bus_e3b15e88`` (replaces the bash installer
+``scripts/install-github-webhook.sh`` that was abandoned at PR #28
+after 19 passes of bash-specific defects).
+
+Design notes:
+
+- Pure-async functions taking an injected ``httpx.AsyncClient`` plus
+  caller-supplied target URL / secret / event list. No state held in
+  this module; the bus's REST endpoints (in ``bus/server.py``) and
+  the operator CLI compose around these primitives.
+- Hook discovery uses ``GET /repos/{repo}/hooks`` with pagination
+  (RFC-5988 ``Link`` headers). Multi-page repos (>30 hooks) just work
+  — no per-line JSON parsing, no shell-pipeline SIGPIPE class.
+- Active-only duplicate semantics: a repo with one inactive
+  historical hook + one active canonical hook is NOT flagged
+  (only the active hook delivers, no double-fire). Two-or-more
+  ACTIVE hooks on the same URL is the duplicate-error case.
+- Drift covers the fields the script writes: ``events`` set,
+  ``active=True``, ``content_type=json``, ``insecure_ssl="0"``,
+  and the secret-presence bit (GitHub redacts the value in
+  responses, so we check whether SOME secret is set, not which).
+- The orphan-detection (active hook on a NON-canonical host but
+  the canonical ``/v1/webhooks/github`` path — left over from a
+  Funnel hostname migration) is part of audit; install treats them
+  as out-of-scope and surfaces them in the response so an operator
+  can clean them up.
+- Authentication: caller-supplied bearer token (``GITHUB_ADMIN_TOKEN``
+  via env in the typical case). Token requires ``admin:repo_hook``
+  scope. The module does NOT touch ``gh auth`` since the bus is a
+  long-running service, not an interactive CLI session.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any, Iterable
+from urllib.parse import urlparse
+
+import httpx
+
+GITHUB_API = "https://api.github.com"
+WEBHOOK_PATH = "/v1/webhooks/github"
+
+# Canonical event set every khonliang-* repo's webhook fires.
+# Lock here, not at the call site, so all install / audit paths
+# agree on what "drifted events" means.
+DEFAULT_EVENTS: tuple[str, ...] = (
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "issue_comment",
+    "push",
+    "check_run",
+)
+
+
+@dataclass(frozen=True)
+class HookConfig:
+    """The webhook config the installer writes."""
+
+    target_url: str
+    secret: str
+    events: tuple[str, ...] = DEFAULT_EVENTS
+
+    def to_create_body(self) -> dict[str, Any]:
+        return {
+            "name": "web",
+            "active": True,
+            "events": list(self.events),
+            "config": {
+                "url": self.target_url,
+                "content_type": "json",
+                "insecure_ssl": "0",
+                "secret": self.secret,
+            },
+        }
+
+    def to_patch_body(self) -> dict[str, Any]:
+        # PATCH form omits "name" (immutable per GitHub API).
+        body = self.to_create_body()
+        del body["name"]
+        return body
+
+
+@dataclass
+class HookMatch:
+    """Result of comparing existing hooks against a target config.
+
+    Outcomes:
+      - ``kind == "missing"``: no hook at this URL → CREATE path
+      - ``kind == "ok"``: single active hook, config matches → SKIP
+      - ``kind == "drift"``: single active hook, fields drifted → PATCH
+      - ``kind == "duplicate"``: two-or-more ACTIVE hooks on the URL → ERROR
+    """
+
+    kind: str  # "missing" | "ok" | "drift" | "duplicate"
+    hook_id: int | None = None
+    drift_fields: tuple[str, ...] = ()
+    duplicate_ids: tuple[int, ...] = ()
+
+
+@dataclass
+class AuditResult:
+    """Audit shape per repo."""
+
+    repo: str
+    match: HookMatch
+    last_response_code: int | None = None
+    last_response_status: str = ""
+    orphans: tuple[dict[str, Any], ...] = ()  # active hooks on non-canonical hosts
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (no I/O)
+# ---------------------------------------------------------------------------
+
+
+def validate_target_url(url: str) -> None:
+    """Reject URLs that would silently mis-deliver.
+
+    HTTPS scheme, non-empty host, exact ``/v1/webhooks/github`` path.
+    Empty host (``https:///v1/webhooks/github``) and non-canonical path
+    suffixes both trip — operators previously hit fleet-wide misroutes
+    when these shapes slipped through.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError(f"target URL must be HTTPS: {url!r}")
+    if not parsed.hostname:
+        raise ValueError(f"target URL has no host: {url!r}")
+    if parsed.path != WEBHOOK_PATH:
+        raise ValueError(
+            f"target URL must end in {WEBHOOK_PATH!r}, got {parsed.path!r}: {url!r}"
+        )
+
+
+def find_canonical_match(
+    hooks: list[dict[str, Any]],
+    config: HookConfig,
+) -> HookMatch:
+    """Classify the existing-hooks list against the target config.
+
+    Active-only dedup: an inactive historical hook plus an active
+    canonical hook is NOT flagged duplicate (only the active hook
+    delivers). Two-or-more ACTIVE hooks on the same URL is the real
+    double-fire case and is rejected for manual collapse.
+    """
+    matching = [
+        h for h in hooks
+        if (h.get("config") or {}).get("url") == config.target_url
+    ]
+    if not matching:
+        return HookMatch(kind="missing")
+
+    active = [h for h in matching if h.get("active", False)]
+    if len(active) > 1:
+        return HookMatch(
+            kind="duplicate",
+            duplicate_ids=tuple(int(h["id"]) for h in active),
+        )
+
+    # Pick the active match if any; otherwise fall back to the first
+    # inactive so drift detection can still report ``active=False`` as
+    # a fixable field.
+    h = active[0] if active else matching[0]
+    cfg = h.get("config") or {}
+    drift: list[str] = []
+    if not h.get("active", False):
+        drift.append("active")
+    if set(h.get("events") or []) != set(config.events):
+        drift.append("events")
+    if cfg.get("content_type") != "json":
+        drift.append("content_type")
+    if cfg.get("insecure_ssl") != "0":
+        drift.append("insecure_ssl")
+    # GitHub redacts the secret value but exposes a presence bit.
+    if not cfg.get("secret"):
+        drift.append("secret_missing")
+
+    if drift:
+        return HookMatch(
+            kind="drift",
+            hook_id=int(h["id"]),
+            drift_fields=tuple(drift),
+        )
+    return HookMatch(kind="ok", hook_id=int(h["id"]))
+
+
+def find_orphan_hooks(
+    hooks: list[dict[str, Any]],
+    canonical_url: str,
+) -> list[dict[str, Any]]:
+    """Active hooks on the canonical PATH but a different HOST.
+
+    Surfaces hooks left over from a Funnel hostname migration: the path
+    matches what the bus is listening on, but the host is stale, so
+    every event fires twice (once to the canonical host, once into the
+    void). Returned as raw GitHub hook dicts so the caller can delete
+    or PATCH them; this module never deletes on its own.
+    """
+    canonical = urlparse(canonical_url)
+    orphans: list[dict[str, Any]] = []
+    for h in hooks:
+        if not h.get("active", False):
+            continue
+        url = (h.get("config") or {}).get("url", "")
+        if not url:
+            continue
+        parsed = urlparse(url)
+        if parsed.path != canonical.path:
+            continue  # different path → not our concern
+        if parsed.hostname == canonical.hostname:
+            continue  # the canonical hook itself
+        orphans.append(h)
+    return orphans
+
+
+# ---------------------------------------------------------------------------
+# I/O — async GitHub REST calls via httpx
+# ---------------------------------------------------------------------------
+
+
+def make_client(token: str, base_url: str = GITHUB_API) -> httpx.AsyncClient:
+    """Build an authed httpx client for the GitHub REST API.
+
+    Caller is responsible for ``await client.aclose()`` (or use as a
+    context manager). Kept as a top-level helper so tests can swap the
+    transport without monkey-patching this module.
+    """
+    if not token:
+        raise ValueError("GitHub admin token is required (admin:repo_hook scope)")
+    return httpx.AsyncClient(
+        base_url=base_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=30.0,
+    )
+
+
+async def _paginate(
+    client: httpx.AsyncClient,
+    path: str,
+    params: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Walk RFC-5988 ``Link: rel=next`` pagination.
+
+    GitHub's default page size is 30; an explicit ``per_page=100`` keeps
+    the round-trip count down on large fleets without changing the
+    eventual result set.
+    """
+    out: list[dict[str, Any]] = []
+    next_url: str | None = path
+    next_params: dict[str, Any] | None = dict(params or {})
+    next_params.setdefault("per_page", 100)
+    while next_url:
+        resp = await client.get(next_url, params=next_params)
+        resp.raise_for_status()
+        body = resp.json()
+        if not isinstance(body, list):
+            raise ValueError(f"expected list from {path}, got {type(body).__name__}")
+        out.extend(body)
+        # After the first page, the Link header carries an ABSOLUTE URL with the
+        # query (?page=N&per_page=100) already baked in. Pass ``params=None`` —
+        # NOT ``{}`` — to follow it: httpx (0.28) drops the URL's existing query
+        # string when an empty params dict is supplied, which strips ``page=N``
+        # and re-requests page 1 forever (infinite pagination loop).
+        link = resp.headers.get("link", "")
+        next_url = _parse_link_next(link)
+        next_params = None
+    return out
+
+
+def _parse_link_next(link_header: str) -> str | None:
+    """Extract the ``rel=next`` URL from an RFC-5988 Link header."""
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        part = part.strip()
+        if 'rel="next"' not in part:
+            continue
+        # Format: ``<https://api.github.com/...>; rel="next"``
+        lt = part.find("<")
+        gt = part.find(">", lt + 1)
+        if lt == -1 or gt == -1:
+            continue
+        return part[lt + 1:gt]
+    return None
+
+
+async def list_hooks(
+    client: httpx.AsyncClient,
+    repo: str,
+) -> list[dict[str, Any]]:
+    """Return every webhook on ``repo`` (paginated)."""
+    return await _paginate(client, f"/repos/{repo}/hooks")
+
+
+async def list_org_repos(
+    client: httpx.AsyncClient,
+    owner: str,
+    prefix: str = "khonliang-",
+) -> list[str]:
+    """Return ``owner/<name>`` for every repo under ``owner`` whose
+    name starts with ``prefix``.
+
+    Uses ``GET /users/{owner}/repos`` (works for both User and Org
+    accounts; the Org-specific endpoint requires elevated scopes).
+    Filtering happens client-side because the GitHub search API
+    requires different scopes and produces inconsistent shapes.
+    """
+    repos = await _paginate(client, f"/users/{owner}/repos", {"type": "all"})
+    return sorted(
+        f"{owner}/{r['name']}"
+        for r in repos
+        if r.get("name", "").startswith(prefix)
+    )
+
+
+async def install_one(
+    client: httpx.AsyncClient,
+    repo: str,
+    config: HookConfig,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Install / repair the canonical hook on ``repo``.
+
+    Returns a dict with at minimum ``{action, repo}`` plus mode-specific
+    fields (``hook_id``, ``drift_fields``, ``duplicate_ids``). ``action``
+    is one of ``created`` / ``skipped`` / ``repaired`` / ``duplicate``.
+    """
+    hooks = await list_hooks(client, repo)
+    match = find_canonical_match(hooks, config)
+
+    if match.kind == "duplicate":
+        return {
+            "action": "duplicate",
+            "repo": repo,
+            "duplicate_ids": list(match.duplicate_ids),
+        }
+    if match.kind == "ok":
+        return {"action": "skipped", "repo": repo, "hook_id": match.hook_id}
+    if dry_run:
+        return {
+            "action": f"would-{'create' if match.kind == 'missing' else 'repair'}",
+            "repo": repo,
+            "hook_id": match.hook_id,
+            "drift_fields": list(match.drift_fields),
+        }
+    if match.kind == "missing":
+        resp = await client.post(
+            f"/repos/{repo}/hooks", json=config.to_create_body(),
+        )
+        resp.raise_for_status()
+        new = resp.json()
+        return {"action": "created", "repo": repo, "hook_id": int(new["id"])}
+    # match.kind == "drift"
+    resp = await client.patch(
+        f"/repos/{repo}/hooks/{match.hook_id}", json=config.to_patch_body(),
+    )
+    resp.raise_for_status()
+    return {
+        "action": "repaired",
+        "repo": repo,
+        "hook_id": match.hook_id,
+        "drift_fields": list(match.drift_fields),
+    }
+
+
+async def audit_one(
+    client: httpx.AsyncClient,
+    repo: str,
+    config: HookConfig,
+) -> AuditResult:
+    """Read-only audit of ``repo`` against the canonical config.
+
+    No mutations. Returns the match classification, the most-recent
+    delivery's status code (informational; not a pass/fail signal),
+    and any orphan hooks for operator cleanup.
+    """
+    hooks = await list_hooks(client, repo)
+    match = find_canonical_match(hooks, config)
+    orphans = find_orphan_hooks(hooks, config.target_url)
+
+    last_code: int | None = None
+    last_status: str = ""
+    if match.kind in {"ok", "drift"}:
+        target_id = match.hook_id
+        for h in hooks:
+            if int(h.get("id", -1)) == target_id:
+                lr = h.get("last_response") or {}
+                code = lr.get("code")
+                if isinstance(code, int):
+                    last_code = code
+                last_status = str(lr.get("status") or "")
+                break
+
+    return AuditResult(
+        repo=repo,
+        match=match,
+        last_response_code=last_code,
+        last_response_status=last_status,
+        orphans=tuple(orphans),
+    )
+
+
+async def install_fleet(
+    client: httpx.AsyncClient,
+    owner: str,
+    config: HookConfig,
+    *,
+    prefix: str = "khonliang-",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Run :func:`install_one` against every ``owner/<prefix>*`` repo.
+
+    Empty fleet is treated as an actionable failure (auth scoped to
+    the wrong account, prefix migration, etc.) — same shape the bash
+    installer eventually grew into.
+    """
+    repos = await list_org_repos(client, owner, prefix=prefix)
+    if not repos:
+        raise ValueError(
+            f"no repos under {owner!r} matching prefix {prefix!r} — "
+            f"check token scope / org name / prefix"
+        )
+    results: list[dict[str, Any]] = []
+    for repo in repos:
+        try:
+            results.append(await install_one(client, repo, config, dry_run=dry_run))
+        except httpx.HTTPStatusError as e:
+            results.append({
+                "action": "error",
+                "repo": repo,
+                "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}",
+            })
+        except Exception as e:
+            results.append({
+                "action": "error",
+                "repo": repo,
+                "error": f"{type(e).__name__}: {e}",
+            })
+    by_action: dict[str, int] = {}
+    for r in results:
+        by_action[r["action"]] = by_action.get(r["action"], 0) + 1
+    return {"results": results, "summary": by_action}
+
+
+async def audit_fleet(
+    client: httpx.AsyncClient,
+    owner: str,
+    config: HookConfig,
+    *,
+    prefix: str = "khonliang-",
+) -> dict[str, Any]:
+    """Read-only :func:`audit_one` across the fleet."""
+    repos = await list_org_repos(client, owner, prefix=prefix)
+    if not repos:
+        raise ValueError(
+            f"no repos under {owner!r} matching prefix {prefix!r}"
+        )
+    audits: list[AuditResult] = []
+    errors: list[dict[str, Any]] = []
+    for repo in repos:
+        try:
+            audits.append(await audit_one(client, repo, config))
+        except Exception as e:
+            errors.append({"repo": repo, "error": f"{type(e).__name__}: {e}"})
+    by_kind: dict[str, int] = {}
+    for a in audits:
+        by_kind[a.match.kind] = by_kind.get(a.match.kind, 0) + 1
+    return {
+        "audits": [_audit_to_dict(a) for a in audits],
+        "errors": errors,
+        "summary": by_kind,
+    }
+
+
+def _audit_to_dict(a: AuditResult) -> dict[str, Any]:
+    return {
+        "repo": a.repo,
+        "kind": a.match.kind,
+        "hook_id": a.match.hook_id,
+        "drift_fields": list(a.match.drift_fields),
+        "duplicate_ids": list(a.match.duplicate_ids),
+        "last_response_code": a.last_response_code,
+        "last_response_status": a.last_response_status,
+        "orphans": [
+            {"id": o.get("id"), "url": (o.get("config") or {}).get("url")}
+            for o in a.orphans
+        ],
+    }
+
+
+async def repair_one(
+    client: httpx.AsyncClient,
+    repo: str,
+    config: HookConfig,
+) -> dict[str, Any]:
+    """Force-PATCH the canonical hook on ``repo``.
+
+    Equivalent to ``install_one`` BUT always patches when an active
+    hook exists at the target URL — even if the config-shape match is
+    clean — so secret rotation lands. The shape-clean case has no way
+    to detect a stale secret (GitHub redacts the value) so without an
+    explicit force, a re-run after rotation is a no-op.
+    """
+    hooks = await list_hooks(client, repo)
+    match = find_canonical_match(hooks, config)
+    if match.kind == "duplicate":
+        return {
+            "action": "duplicate",
+            "repo": repo,
+            "duplicate_ids": list(match.duplicate_ids),
+        }
+    if match.kind == "missing":
+        # Repair on a missing hook degrades to install. Could also
+        # refuse — current behaviour matches operator intent ("make
+        # this repo correct").
+        return await install_one(client, repo, config)
+    resp = await client.patch(
+        f"/repos/{repo}/hooks/{match.hook_id}", json=config.to_patch_body(),
+    )
+    resp.raise_for_status()
+    return {
+        "action": "repaired",
+        "repo": repo,
+        "hook_id": match.hook_id,
+        "force_patched": True,
+    }
+
+
+async def check_url_reachable(
+    target_url: str,
+    *,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Probe the resolved target URL with an unsigned POST.
+
+    Expected responses from a properly-configured bus:
+      - ``401`` (signature missing — secret loaded, signed POST would 200)
+      - ``200`` (rare — only if signed by accident; sanity-check fallback)
+      - ``503`` (no secret loaded yet — fresh deploy, valid intermediate)
+    Anything else (404, connection refused, DNS failure, 5xx) is
+    diagnostic of a wrong URL, missing tunnel, or downed bus.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                target_url,
+                json={"zen": "reachability-probe"},
+                headers={"X-GitHub-Event": "ping"},
+            )
+        return {
+            "reachable": resp.status_code in {200, 401, 503},
+            "status_code": resp.status_code,
+            "url": target_url,
+        }
+    except httpx.TimeoutException:
+        return {"reachable": False, "error": "timeout", "url": target_url}
+    except httpx.ConnectError as e:
+        return {
+            "reachable": False,
+            "error": f"connect_error: {e}",
+            "url": target_url,
+        }
+    except httpx.RequestError as e:
+        return {
+            "reachable": False,
+            "error": f"{type(e).__name__}: {e}",
+            "url": target_url,
+        }
