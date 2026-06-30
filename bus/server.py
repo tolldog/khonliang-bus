@@ -2788,10 +2788,18 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         precondition failure: 403 if admin is disabled, 400 if no token /
         public URL / the URL fails shape validation.
 
-        ``require_deliverable`` (set by mutating callers) additionally refuses
-        when the bus's own receiver would reject every delivery — see below.
-        Read-only audits leave it False so they still work as a diagnostic on
-        a misconfigured receiver.
+        A valid canonical ``github_webhook_public_url`` is a HARD prerequisite
+        for EVERY route, audits included: ``find_canonical_match`` /
+        ``find_orphan_hooks`` classify a repo's hooks by the canonical URL's
+        host+path, and ``HookConfig`` can't be built without it — so there is
+        no meaningful audit to run when it's unset. (Raw, unclassified hook
+        enumeration would be a separate feature, not a lenient audit.)
+
+        ``require_deliverable`` (set by mutating callers) is the ONLY leniency
+        axis: it additionally refuses when the bus's own RECEIVER would reject
+        every delivery (no secret + unsigned disallowed). Read-only audits and
+        dry-runs leave it False so they still work on a receiver that is
+        secret-misconfigured — but they still require the public URL above.
         """
         if not _webhook_admin_enabled():
             raise HTTPException(
@@ -2823,7 +2831,8 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         # false (the default), /v1/webhooks/github answers 503 to everything,
         # so an install would "succeed" while wiring up a permanently-broken
         # webhook. Require a secret, or explicit unsigned dev mode. Only the
-        # mutating callers gate on this; audits stay usable for diagnosis.
+        # mutating callers gate on THIS (the secret/unsigned state); audits and
+        # dry-runs skip it. (They still require the public URL above.)
         allow_unsigned = bool(bus.config.get("github_webhook_allow_unsigned", False))
         if require_deliverable and not secret and not allow_unsigned:
             raise HTTPException(
@@ -2842,10 +2851,13 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"github_webhook_public_url invalid or unset: {e}"
+                    f"github_webhook_public_url invalid ({e}) — these routes "
+                    "classify/configure repo hooks against the canonical URL, "
+                    "so it must be a valid HTTPS /v1/webhooks/github URL"
                     if public_url
                     else "github_webhook_public_url is unset — set the HTTPS "
-                    "/v1/webhooks/github URL in bus config"
+                    "/v1/webhooks/github URL in bus config; every management "
+                    "route (audit included) compares against it"
                 ),
             )
         return token, hook_config

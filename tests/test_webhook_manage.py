@@ -302,6 +302,32 @@ def test_unset_public_url_returns_400(monkeypatch, tmp_path):
     assert "public_url" in r.json()["detail"]
 
 
+def test_audit_requires_public_url(monkeypatch, tmp_path):
+    # A valid canonical URL is a hard prerequisite even for read-only audit:
+    # audit classifies hooks AGAINST that URL, so there's nothing to compare
+    # when it's unset. The leniency for a misconfigured receiver is the
+    # secret/unsigned guard only — not the URL.
+    monkeypatch.delenv("GITHUB_WEBHOOK_PUBLIC_URL", raising=False)
+    client = _make_client(
+        monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[_hook(42)]),
+        github_webhook_public_url="",
+    )
+    r = client.post("/v1/webhooks/manage/audit", json={"repo": "owner/repo"})
+    assert r.status_code == 400
+    assert "public_url" in r.json()["detail"]
+
+
+def test_audit_fleet_requires_public_url(monkeypatch, tmp_path):
+    monkeypatch.delenv("GITHUB_WEBHOOK_PUBLIC_URL", raising=False)
+    handler = _fleet_handler(["owner/khonliang-bus"])
+    client = _make_client(
+        monkeypatch, tmp_path, handler, github_webhook_public_url=""
+    )
+    r = client.post("/v1/webhooks/manage/audit_fleet", json={"prefix": "khonliang-"})
+    assert r.status_code == 400
+    assert "public_url" in r.json()["detail"]
+
+
 def test_non_https_public_url_returns_400(monkeypatch, tmp_path):
     client = _make_client(
         monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[]),
