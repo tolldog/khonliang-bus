@@ -2779,12 +2779,19 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             or os.environ.get("GITHUB_WEBHOOK_PUBLIC_URL", "")
         )
 
-    def _resolve_webhook_context() -> tuple[str, "webhook_install.HookConfig"]:
+    def _resolve_webhook_context(
+        *, require_deliverable: bool = False
+    ) -> tuple[str, "webhook_install.HookConfig"]:
         """Resolve (token, HookConfig) for a token-backed management route.
 
         Raises ``HTTPException`` (FastAPI renders ``{"detail": ...}``) on any
         precondition failure: 403 if admin is disabled, 400 if no token /
         public URL / the URL fails shape validation.
+
+        ``require_deliverable`` (set by mutating callers) additionally refuses
+        when the bus's own receiver would reject every delivery — see below.
+        Read-only audits leave it False so they still work as a diagnostic on
+        a misconfigured receiver.
         """
         if not _webhook_admin_enabled():
             raise HTTPException(
@@ -2811,6 +2818,24 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         secret = bus.config.get("github_webhook_secret", "") or os.environ.get(
             "GITHUB_WEBHOOK_SECRET", ""
         )
+        # Refuse to configure a hook the bus's own receiver would reject on
+        # every delivery: with no secret AND github_webhook_allow_unsigned
+        # false (the default), /v1/webhooks/github answers 503 to everything,
+        # so an install would "succeed" while wiring up a permanently-broken
+        # webhook. Require a secret, or explicit unsigned dev mode. Only the
+        # mutating callers gate on this; audits stay usable for diagnosis.
+        allow_unsigned = bool(bus.config.get("github_webhook_allow_unsigned", False))
+        if require_deliverable and not secret and not allow_unsigned:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "refusing to install: the bus receiver has no "
+                    "github_webhook_secret and github_webhook_allow_unsigned is "
+                    "false, so every delivery would be rejected (503). Set "
+                    "github_webhook_secret (recommended) or enable "
+                    "github_webhook_allow_unsigned for localhost dev."
+                ),
+            )
         try:
             hook_config = webhook_install.HookConfig(target_url=public_url, secret=secret)
         except ValueError as e:
@@ -2854,14 +2879,32 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"github request error: {e}")
 
+    async def _require_object_body(request: Request) -> dict:
+        """Parse the request body as a JSON object or raise 400.
+
+        Without this, malformed JSON (``request.json()`` raises) or a valid
+        non-object payload (``[]`` / ``"x"`` — ``.get`` then ``AttributeError``)
+        would surface as a 500 instead of a client-error 400.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"request body must be a JSON object, got {type(body).__name__}",
+            )
+        return body
+
     @app.post("/v1/webhooks/manage/install")
     async def webhook_manage_install(request: Request):
-        body = await request.json()
+        body = await _require_object_body(request)
         repo = body.get("repo")
         if not repo:
             raise HTTPException(status_code=400, detail="'repo' is required")
         dry_run = bool(body.get("dry_run", False))
-        token, hook_config = _resolve_webhook_context()
+        token, hook_config = _resolve_webhook_context(require_deliverable=not dry_run)
         async with webhook_install.make_client(token) as client:
             return await _run_webhook_op(
                 webhook_install.install_one(client, repo, hook_config, dry_run=dry_run)
@@ -2869,10 +2912,10 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.post("/v1/webhooks/manage/install_fleet")
     async def webhook_manage_install_fleet(request: Request):
-        body = await request.json()
+        body = await _require_object_body(request)
         dry_run = bool(body.get("dry_run", False))
         prefix = body.get("prefix", "khonliang-")
-        token, hook_config = _resolve_webhook_context()
+        token, hook_config = _resolve_webhook_context(require_deliverable=not dry_run)
         owner = _resolve_webhook_owner(body.get("owner"))
         async with webhook_install.make_client(token) as client:
             return await _run_webhook_op(
@@ -2883,7 +2926,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.post("/v1/webhooks/manage/audit")
     async def webhook_manage_audit(request: Request):
-        body = await request.json()
+        body = await _require_object_body(request)
         repo = body.get("repo")
         if not repo:
             raise HTTPException(status_code=400, detail="'repo' is required")
@@ -2896,7 +2939,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.post("/v1/webhooks/manage/audit_fleet")
     async def webhook_manage_audit_fleet(request: Request):
-        body = await request.json()
+        body = await _require_object_body(request)
         prefix = body.get("prefix", "khonliang-")
         token, hook_config = _resolve_webhook_context()
         owner = _resolve_webhook_owner(body.get("owner"))
@@ -2907,11 +2950,11 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.post("/v1/webhooks/manage/repair")
     async def webhook_manage_repair(request: Request):
-        body = await request.json()
+        body = await _require_object_body(request)
         repo = body.get("repo")
         if not repo:
             raise HTTPException(status_code=400, detail="'repo' is required")
-        token, hook_config = _resolve_webhook_context()
+        token, hook_config = _resolve_webhook_context(require_deliverable=True)
         async with webhook_install.make_client(token) as client:
             return await _run_webhook_op(
                 webhook_install.repair_one(client, repo, hook_config)

@@ -294,6 +294,83 @@ def test_non_https_public_url_returns_400(monkeypatch, tmp_path):
     assert "public_url" in r.json()["detail"]
 
 
+def test_install_refuses_when_receiver_rejects_all(monkeypatch, tmp_path):
+    # No secret + allow_unsigned false (default) → the bus receiver 503s every
+    # delivery, so installing a hook configures a permanently-broken webhook.
+    monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
+    client = _make_client(
+        monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[]),
+        github_webhook_secret="",
+    )
+    r = client.post("/v1/webhooks/manage/install", json={"repo": "owner/repo"})
+    assert r.status_code == 400
+    assert "refusing" in r.json()["detail"]
+
+
+def test_install_allows_unsigned_dev_mode(monkeypatch, tmp_path):
+    # No secret BUT allow_unsigned true → localhost dev receiver accepts
+    # unsigned deliveries, so the install is legitimate.
+    monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        return httpx.Response(201, json={"id": 1})
+
+    client = _make_client(
+        monkeypatch, tmp_path, handler,
+        github_webhook_secret="", github_webhook_allow_unsigned=True,
+    )
+    r = client.post("/v1/webhooks/manage/install", json={"repo": "owner/repo"})
+    assert r.status_code == 200
+    assert r.json()["action"] == "created"
+
+
+def test_audit_works_without_secret(monkeypatch, tmp_path):
+    # Audit is diagnostic — it must stay usable even when the receiver has no
+    # secret configured (the require_deliverable guard is mutating-only).
+    monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
+    client = _make_client(
+        monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[_hook(42)]),
+        github_webhook_secret="",
+    )
+    r = client.post("/v1/webhooks/manage/audit", json={"repo": "owner/repo"})
+    assert r.status_code == 200
+    assert r.json()["kind"] == "ok"
+
+
+def test_dry_run_install_works_without_secret(monkeypatch, tmp_path):
+    # dry_run doesn't mutate, so it isn't blocked by the deliverable guard.
+    monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
+    client = _make_client(
+        monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[]),
+        github_webhook_secret="",
+    )
+    r = client.post(
+        "/v1/webhooks/manage/install", json={"repo": "owner/repo", "dry_run": True}
+    )
+    assert r.status_code == 200
+    assert r.json()["action"] == "would-create"
+
+
+def test_malformed_json_body_returns_400(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[]))
+    r = client.post(
+        "/v1/webhooks/manage/install",
+        content="not json",
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 400
+    assert "JSON" in r.json()["detail"]
+
+
+def test_non_object_body_returns_400(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[]))
+    r = client.post("/v1/webhooks/manage/install", json=["not", "an", "object"])
+    assert r.status_code == 400
+    assert "object" in r.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # check_funnel (ungated, token-free)
 # ---------------------------------------------------------------------------

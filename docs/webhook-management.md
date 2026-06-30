@@ -65,6 +65,12 @@ thin formatters over the routes above.
   stale host — e.g. after a Funnel hostname change) are surfaced on every
   result, even a clean repo, since they still double-deliver.
 - **Empty fleet** is an explicit error (likely a token-scope or prefix mismatch).
+- **Dead-on-arrival guard**: a *mutating* call (install/repair, non-dry-run)
+  refuses with `400` when the bus receiver has no `github_webhook_secret` and
+  `github_webhook_allow_unsigned` is false — otherwise it would install a hook
+  the receiver `503`s on every delivery. Read-only audits and dry-runs are
+  exempt so they still work for diagnosis.
+- **Malformed / non-object** request bodies get a `400`, not a `500`.
 
 ## Not yet shipped (follow-up)
 
