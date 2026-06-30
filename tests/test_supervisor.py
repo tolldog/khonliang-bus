@@ -625,7 +625,35 @@ async def test_registration_clears_give_up_state(tmp_path, monkeypatch):
     await bus.register_agent(RegisterRequest(id="a1", callback="http://x", pid=123))
 
     assert "a1" not in bus._autostart_failures
+    # (give-up already popped backoff; this just confirms it's gone)
     assert "a1" not in bus._supervisor_backoff
+
+
+async def test_registration_preserves_active_backoff_counter(tmp_path, monkeypatch):
+    """A supervisor-restarted agent re-registers immediately; registration must
+    NOT zero its consecutive-restart counter, or backoff + the give-up ceiling
+    would never engage for a crash-loop that keeps registering."""
+    from bus.server import RegisterRequest
+
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(bus, "_publish_event", _noop)
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()  # supervisor restart → restarts=1
+    assert bus._supervisor_backoff["a1"]["restarts"] == 1
+
+    # The restarted agent registers (the normal post-restart handshake).
+    await bus.register_agent(RegisterRequest(id="a1", callback="ws", pid=99))
+
+    assert bus._supervisor_backoff["a1"]["restarts"] == 1  # preserved
 
 
 def test_stop_clears_backoff_state(tmp_path, monkeypatch):

@@ -443,15 +443,26 @@ class BusServer:
             "failed": dict(self._autostart_failures),
         }
 
-    def _clear_supervisor_failure_state(self, agent_id: str) -> None:
-        """Drop stale supervisor give-up / backoff records on a fresh start.
+    def _drop_autostart_failure(self, agent_id: str) -> None:
+        """Drop a stale ``autostart_failed`` REASON when the agent comes alive.
 
-        A successful registration (or manual start) proves the agent is alive
-        NOW, so any prior ``autostart_failed`` reason + backoff history is stale.
-        Called from BOTH registration paths (HTTP + WS) so an agent that
-        recovered out-of-band — not via ``start_agent`` — also clears the
-        record; otherwise the old reason re-surfaces on /v1/services the moment
-        that replacement later deregisters.
+        Called from both registration paths (HTTP + WS): registration proves the
+        agent is up, so a prior give-up/boot-failure reason is stale and must not
+        re-surface on /v1/services when a later replacement deregisters.
+
+        Deliberately does NOT touch ``_supervisor_backoff`` — a
+        supervisor-restarted agent re-registers immediately, so zeroing its
+        consecutive-restart counter on every registration would defeat backoff +
+        the give-up ceiling. The counter is reset only by sustained liveness
+        (the recovery window) or explicit operator action (start/stop), which go
+        through :meth:`_reset_supervisor_state`.
+        """
+        self._autostart_failures.pop(agent_id, None)
+
+    def _reset_supervisor_state(self, agent_id: str) -> None:
+        """Operator-intent reset: drop BOTH the give-up reason and the backoff
+        counter so a manually (re)started agent is supervised with a fresh
+        budget. Used by ``start_agent`` (and, for the counter, ``_stop_process``).
         """
         self._supervisor_backoff.pop(agent_id, None)
         self._autostart_failures.pop(agent_id, None)
@@ -973,7 +984,7 @@ class BusServer:
         # fails. The supervisor restarts via _start_process directly (never
         # through start_agent), so this never clears state mid-backoff.
         if result.get("status") == "started":
-            self._clear_supervisor_failure_state(agent_id)
+            self._reset_supervisor_state(agent_id)
         return result
 
     def stop_agent(self, agent_id: str) -> dict:
@@ -1038,7 +1049,7 @@ class BusServer:
             launch_spec=req.launch_spec,
             launch_info=req.launch_info,
         )
-        self._clear_supervisor_failure_state(req.id)
+        self._drop_autostart_failure(req.id)
         # Persist welcome (survives-deregister) so the bus_welcome super-skill
         # and GET /v1/agents/<id>/welcome work after the agent process exits.
         # fr_khonliang-bus_f96722dd. An oversized welcome must not break the
@@ -2361,7 +2372,7 @@ class BusServer:
                         launch_spec=data.get("launch_spec"),
                         launch_info=data.get("launch_info"),
                     )
-                    self._clear_supervisor_failure_state(agent_id)
+                    self._drop_autostart_failure(agent_id)
                     # Persist welcome to the survives-deregister catalog so
                     # cold-start LLMs + bus_welcome super-skill see it even
                     # after the agent process exits.
