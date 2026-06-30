@@ -2897,13 +2897,42 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             )
         return body
 
+    def _str_field(
+        body: dict, name: str, *, default: str | None = None, required: bool = False
+    ) -> str | None:
+        """Extract a string field or raise 400. An absent key falls back to
+        ``default``; a present-but-wrong-type value (``123``, explicit
+        ``null``) is a client error, not a 500."""
+        if name not in body:
+            if required:
+                raise HTTPException(status_code=400, detail=f"'{name}' is required")
+            return default
+        val = body[name]
+        if not isinstance(val, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{name}' must be a string, got {type(val).__name__}",
+            )
+        if required and not val:
+            raise HTTPException(status_code=400, detail=f"'{name}' is required")
+        return val
+
+    def _bool_field(body: dict, name: str, *, default: bool = False) -> bool:
+        """Extract a JSON boolean or raise 400. Avoids Python truthiness
+        silently turning ``{"dry_run": "false"}`` into a (true) dry run."""
+        val = body.get(name, default)
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{name}' must be a boolean, got {type(val).__name__}",
+            )
+        return val
+
     @app.post("/v1/webhooks/manage/install")
     async def webhook_manage_install(request: Request):
         body = await _require_object_body(request)
-        repo = body.get("repo")
-        if not repo:
-            raise HTTPException(status_code=400, detail="'repo' is required")
-        dry_run = bool(body.get("dry_run", False))
+        repo = _str_field(body, "repo", required=True)
+        dry_run = _bool_field(body, "dry_run")
         token, hook_config = _resolve_webhook_context(require_deliverable=not dry_run)
         async with webhook_install.make_client(token) as client:
             return await _run_webhook_op(
@@ -2913,10 +2942,10 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.post("/v1/webhooks/manage/install_fleet")
     async def webhook_manage_install_fleet(request: Request):
         body = await _require_object_body(request)
-        dry_run = bool(body.get("dry_run", False))
-        prefix = body.get("prefix", "khonliang-")
+        dry_run = _bool_field(body, "dry_run")
+        prefix = _str_field(body, "prefix", default="khonliang-")
         token, hook_config = _resolve_webhook_context(require_deliverable=not dry_run)
-        owner = _resolve_webhook_owner(body.get("owner"))
+        owner = _resolve_webhook_owner(_str_field(body, "owner"))
         async with webhook_install.make_client(token) as client:
             return await _run_webhook_op(
                 webhook_install.install_fleet(
@@ -2927,9 +2956,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.post("/v1/webhooks/manage/audit")
     async def webhook_manage_audit(request: Request):
         body = await _require_object_body(request)
-        repo = body.get("repo")
-        if not repo:
-            raise HTTPException(status_code=400, detail="'repo' is required")
+        repo = _str_field(body, "repo", required=True)
         token, hook_config = _resolve_webhook_context()
         async with webhook_install.make_client(token) as client:
             result = await _run_webhook_op(
@@ -2940,9 +2967,9 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.post("/v1/webhooks/manage/audit_fleet")
     async def webhook_manage_audit_fleet(request: Request):
         body = await _require_object_body(request)
-        prefix = body.get("prefix", "khonliang-")
+        prefix = _str_field(body, "prefix", default="khonliang-")
         token, hook_config = _resolve_webhook_context()
-        owner = _resolve_webhook_owner(body.get("owner"))
+        owner = _resolve_webhook_owner(_str_field(body, "owner"))
         async with webhook_install.make_client(token) as client:
             return await _run_webhook_op(
                 webhook_install.audit_fleet(client, owner, hook_config, prefix=prefix)
@@ -2951,9 +2978,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.post("/v1/webhooks/manage/repair")
     async def webhook_manage_repair(request: Request):
         body = await _require_object_body(request)
-        repo = body.get("repo")
-        if not repo:
-            raise HTTPException(status_code=400, detail="'repo' is required")
+        repo = _str_field(body, "repo", required=True)
         token, hook_config = _resolve_webhook_context(require_deliverable=True)
         async with webhook_install.make_client(token) as client:
             return await _run_webhook_op(

@@ -371,6 +371,40 @@ def test_non_object_body_returns_400(monkeypatch, tmp_path):
     assert "object" in r.json()["detail"]
 
 
+def test_non_boolean_dry_run_returns_400(monkeypatch, tmp_path):
+    # {"dry_run": "false"} must NOT silently become a (truthy) dry run that
+    # also skips the deliverable guard — reject it as a 400.
+    client = _make_client(monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[]))
+    r = client.post(
+        "/v1/webhooks/manage/install", json={"repo": "owner/repo", "dry_run": "false"}
+    )
+    assert r.status_code == 400
+    assert "boolean" in r.json()["detail"]
+
+
+def test_non_string_owner_returns_400(monkeypatch, tmp_path):
+    handler = _fleet_handler(["owner/khonliang-bus"])
+    client = _make_client(monkeypatch, tmp_path, handler)
+    r = client.post("/v1/webhooks/manage/install_fleet", json={"owner": 123})
+    assert r.status_code == 400
+    assert "string" in r.json()["detail"]
+
+
+def test_null_prefix_returns_400(monkeypatch, tmp_path):
+    handler = _fleet_handler(["owner/khonliang-bus"])
+    client = _make_client(monkeypatch, tmp_path, handler)
+    r = client.post("/v1/webhooks/manage/audit_fleet", json={"prefix": None})
+    assert r.status_code == 400
+    assert "string" in r.json()["detail"]
+
+
+def test_non_string_repo_returns_400(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path, lambda req: httpx.Response(200, json=[]))
+    r = client.post("/v1/webhooks/manage/install", json={"repo": 123})
+    assert r.status_code == 400
+    assert "string" in r.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # check_funnel (ungated, token-free)
 # ---------------------------------------------------------------------------
