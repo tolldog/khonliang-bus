@@ -228,6 +228,27 @@ def test_bus_flag_before_subcommand_not_clobbered():
     assert seen["host"] == "before.test"
 
 
+def test_timeout_exception_distinct_message(capsys):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out")
+
+    # A timeout must not be misreported as "bus unreachable".
+    code = _run(["audit-fleet"], handler)
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "timed out" in err
+    assert "--timeout" in err
+    assert "unreachable" not in err
+
+
+def test_timeout_flag_sets_client_timeout(capsys):
+    # --timeout 0 disables the limit (no value error / accepted).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"reachable": True, "status_code": 400, "url": "https://h/v1/webhooks/github"})
+
+    assert cli.run(["check-funnel", "--timeout", "0"], client=_client(handler)) == 0
+
+
 def test_no_subcommand_is_error():
     with pytest.raises(SystemExit):
         cli.run(["--bus", BUS], client=_client(lambda r: httpx.Response(200, json={})))

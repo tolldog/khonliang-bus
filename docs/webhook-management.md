@@ -94,6 +94,8 @@ python -m bus.cli.webhook check-funnel
 ```
 
 Bus URL defaults to `$KHONLIANG_BUS_URL` or `http://localhost:8787`; override
-with `--bus`. `--json` prints the raw response body. Exit codes: `0` success,
-`1` on a bus-side error (4xx/5xx, or an unreachable funnel), `2` if the bus
-itself is unreachable.
+with `--bus`. `--json` prints the raw response body. `--timeout SECONDS`
+(default 120; `0` = no limit) — fleet ops walk every repo serially bus-side,
+so raise it for large owners. Global flags work before or after the
+subcommand. Exit codes: `0` success, `1` on a bus-side error (4xx/5xx, or an
+unreachable funnel), `2` if the bus is unreachable or the request times out.

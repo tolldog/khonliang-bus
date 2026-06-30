@@ -33,6 +33,10 @@ from typing import Any
 import httpx
 
 DEFAULT_BUS = os.environ.get("KHONLIANG_BUS_URL", "http://localhost:8787")
+# Generous default: fleet ops walk every matching repo serially on the bus
+# side before responding, so a tight client timeout would false-fail a healthy
+# bus on large owners. Override per-call with --timeout (0 = no limit).
+DEFAULT_TIMEOUT = 120.0
 _MANAGE = "/v1/webhooks/manage"
 
 
@@ -48,6 +52,14 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--json", action="store_true", default=argparse.SUPPRESS,
         help="print the raw JSON response",
+    )
+    common.add_argument(
+        "--timeout", type=float, default=argparse.SUPPRESS,
+        help=(
+            f"HTTP timeout seconds (default {DEFAULT_TIMEOUT}; 0 = no limit). "
+            "Fleet ops walk every repo serially bus-side, so raise this for "
+            "large owners."
+        ),
     )
 
     p = argparse.ArgumentParser(
@@ -168,11 +180,21 @@ def run(argv: list[str] | None = None, *, client: httpx.Client | None = None) ->
     # in either position — apply the real fallbacks here.
     bus = getattr(args, "bus", DEFAULT_BUS)
     want_json = getattr(args, "json", False)
+    timeout = getattr(args, "timeout", DEFAULT_TIMEOUT)
     owns_client = client is None
-    client = client or httpx.Client(timeout=30.0)
+    client = client or httpx.Client(timeout=(None if timeout == 0 else timeout))
     try:
         try:
             resp = _request(client, bus, args)
+        except httpx.TimeoutException:
+            # Distinct from a connect failure: the bus is likely healthy but
+            # the op outran the timeout (common for fleet walks).
+            print(
+                f"error: request to {bus} timed out after {timeout}s — raise "
+                "--timeout (or use 0) for large fleets",
+                file=sys.stderr,
+            )
+            return 2
         except httpx.RequestError as e:
             print(f"error: bus unreachable at {bus}: {e}", file=sys.stderr)
             return 2
