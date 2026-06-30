@@ -37,30 +37,42 @@ _MANAGE = "/v1/webhooks/manage"
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    # ``--bus`` / ``--json`` are global but should work in EITHER position
+    # (``... --json install repo`` and ``... install repo --json``). Share them
+    # via a parent parser added to both the top level and every subparser. The
+    # parent uses default=SUPPRESS so a subparser parse doesn't clobber a value
+    # set at the top level back to its default; run() reads them via getattr
+    # with the real fallbacks.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--bus", default=argparse.SUPPRESS, help=f"bus URL (default {DEFAULT_BUS})")
+    common.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS,
+        help="print the raw JSON response",
+    )
+
     p = argparse.ArgumentParser(
         prog="python -m bus.cli.webhook",
         description="Manage GitHub webhooks via the bus management routes.",
+        parents=[common],
     )
-    p.add_argument("--bus", default=DEFAULT_BUS, help=f"bus URL (default {DEFAULT_BUS})")
-    p.add_argument("--json", action="store_true", help="print the raw JSON response")
     sub = p.add_subparsers(dest="command", required=True)
 
     for name in ("install", "audit", "repair"):
-        sp = sub.add_parser(name, help=f"{name} the canonical hook on a repo")
+        sp = sub.add_parser(name, parents=[common], help=f"{name} the canonical hook on a repo")
         sp.add_argument("repo", help="owner/name")
         if name == "install":
             sp.add_argument("--dry-run", action="store_true", help="report without mutating")
 
-    inf = sub.add_parser("install-fleet", help="install across owner/<prefix>* repos")
+    inf = sub.add_parser("install-fleet", parents=[common], help="install across owner/<prefix>* repos")
     inf.add_argument("--prefix", default="khonliang-", help="repo-name prefix (default khonliang-)")
     inf.add_argument("--owner", default="", help="owner (defaults to bus github_owner)")
     inf.add_argument("--dry-run", action="store_true", help="report without mutating")
 
-    auf = sub.add_parser("audit-fleet", help="audit across owner/<prefix>* repos")
+    auf = sub.add_parser("audit-fleet", parents=[common], help="audit across owner/<prefix>* repos")
     auf.add_argument("--prefix", default="khonliang-", help="repo-name prefix (default khonliang-)")
     auf.add_argument("--owner", default="", help="owner (defaults to bus github_owner)")
 
-    sub.add_parser("check-funnel", help="probe the configured public webhook URL")
+    sub.add_parser("check-funnel", parents=[common], help="probe the configured public webhook URL")
     return p
 
 
@@ -152,27 +164,31 @@ def _format(cmd: str, b: dict) -> str:
 
 def run(argv: list[str] | None = None, *, client: httpx.Client | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    # default=SUPPRESS means these attrs are absent unless the flag was given
+    # in either position — apply the real fallbacks here.
+    bus = getattr(args, "bus", DEFAULT_BUS)
+    want_json = getattr(args, "json", False)
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0)
     try:
         try:
-            resp = _request(client, args.bus, args)
+            resp = _request(client, bus, args)
         except httpx.RequestError as e:
-            print(f"error: bus unreachable at {args.bus}: {e}", file=sys.stderr)
+            print(f"error: bus unreachable at {bus}: {e}", file=sys.stderr)
             return 2
         try:
             body = resp.json()
         except Exception:
             print(f"error: HTTP {resp.status_code} (non-JSON response)", file=sys.stderr)
             return 1
-        if args.json:
+        if want_json:
             print(json.dumps(body, indent=2))
         if resp.status_code >= 400:
             msg = (body.get("detail") or body.get("error") or f"HTTP {resp.status_code}") \
                 if isinstance(body, dict) else f"HTTP {resp.status_code}"
             print(f"error: {msg}", file=sys.stderr)
             return 1
-        if not args.json:
+        if not want_json:
             print(_format(args.command, body))
         # A reachable=false funnel is a successful probe but a failed state —
         # give it a non-zero exit so operator scripts can branch on it.

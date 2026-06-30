@@ -192,6 +192,42 @@ def test_json_flag_with_error_still_exit_1(capsys):
     assert "required" in captured.err
 
 
+def test_json_flag_after_subcommand(capsys):
+    # Global flags must work AFTER the subcommand too (common scripted form).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"action": "skipped", "repo": "owner/x", "hook_id": 1, "orphans": []})
+
+    code = cli.run(
+        ["install", "owner/x", "--json"], client=_client(handler)
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "skipped"
+
+
+def test_bus_flag_after_subcommand():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["host"] = request.url.host
+        return httpx.Response(200, json={"repo": "owner/x", "kind": "ok", "hook_id": 1, "orphans": []})
+
+    # --bus given AFTER the subcommand must still take effect (not reset to
+    # the default by subparser parsing).
+    cli.run(["audit", "owner/x", "--bus", "http://after.test"], client=_client(handler))
+    assert seen["host"] == "after.test"
+
+
+def test_bus_flag_before_subcommand_not_clobbered():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["host"] = request.url.host
+        return httpx.Response(200, json={"repo": "owner/x", "kind": "ok", "hook_id": 1, "orphans": []})
+
+    cli.run(["--bus", "http://before.test", "audit", "owner/x"], client=_client(handler))
+    assert seen["host"] == "before.test"
+
+
 def test_no_subcommand_is_error():
     with pytest.raises(SystemExit):
         cli.run(["--bus", BUS], client=_client(lambda r: httpx.Response(200, json={})))
