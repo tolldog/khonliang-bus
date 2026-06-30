@@ -481,13 +481,35 @@ def test_check_funnel_unset_url_returns_400(monkeypatch, tmp_path):
 
 def test_check_funnel_invalid_url_shape_returns_400(monkeypatch, tmp_path):
     # A bad URL shape is a config error → 400, not a 200 reachability result.
+    # The (ungated) error must NOT echo the raw URL back.
+    bad = "http://user:tok@example.test/v1/webhooks/github"
     client = _make_client(
-        monkeypatch, tmp_path, handler=None,
-        github_webhook_public_url="http://example.test/v1/webhooks/github",
+        monkeypatch, tmp_path, handler=None, github_webhook_public_url=bad,
     )
     r = client.get("/v1/webhooks/manage/check_funnel")
     assert r.status_code == 400
-    assert "invalid" in r.json()["detail"]
+    assert "not a valid" in r.json()["detail"]
+    assert "tok" not in r.json()["detail"]
+
+
+def test_check_funnel_redacts_credentials(monkeypatch, tmp_path):
+    # Ungated endpoint must not echo userinfo / query token back.
+    secret_url = "https://user:s3cr3t@example.test/v1/webhooks/github?token=abc"
+
+    async def fake_probe(url, **kw):
+        # The probe still receives the FULL url (it must actually reach it).
+        assert "s3cr3t" in url and "token=abc" in url
+        return {"reachable": True, "status_code": 400, "url": url}
+
+    monkeypatch.setattr(wi, "check_url_reachable", fake_probe)
+    client = _make_client(
+        monkeypatch, tmp_path, handler=None, github_webhook_public_url=secret_url,
+    )
+    r = client.get("/v1/webhooks/manage/check_funnel")
+    assert r.status_code == 200
+    echoed = r.json()["url"]
+    assert echoed == "https://example.test/v1/webhooks/github"
+    assert "s3cr3t" not in echoed and "token" not in echoed
 
 
 # ---------------------------------------------------------------------------

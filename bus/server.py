@@ -22,6 +22,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -3017,13 +3018,33 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
                 webhook_install.repair_one(client, repo, hook_config)
             )
 
+    def _redact_url(url: str) -> str:
+        """Strip credentials / query / fragment, keeping scheme://host[:port]/path.
+
+        ``check_funnel`` is ungated, and github_webhook_public_url can validly
+        carry userinfo (``https://user:tok@host/...``) or a ``?token=`` query
+        — both pass validate_target_url (it only checks scheme/host/path). The
+        ungated response must not echo those secrets back, so the host+path
+        (all an operator needs to confirm the funnel target) is all we return.
+        """
+        try:
+            p = urlparse(url)
+        except Exception:
+            return ""
+        if not p.scheme or not p.hostname:
+            return ""
+        host = p.hostname + (f":{p.port}" if p.port else "")
+        return f"{p.scheme}://{host}{p.path}"
+
     @app.get("/v1/webhooks/manage/check_funnel")
     async def webhook_manage_check_funnel():
         """Probe the configured public webhook URL for bus reachability.
 
         Ungated and token-free: it only POSTs a deliberately-invalid body to
         the bus's own ``/v1/webhooks/github`` (rejected pre-publish), so it
-        leaks no repo state and needs no admin credential.
+        leaks no repo state and needs no admin credential. The echoed URL is
+        redacted to host+path so an ungated caller can't read back any
+        userinfo / query-string token embedded in the configured URL.
         """
         public_url = _resolve_webhook_public_url()
         if not public_url:
@@ -3034,13 +3055,21 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         # A bad URL *shape* is a local config error, not a reachability result:
         # reject it with 400 (like the other routes) so a client's
         # raise_for_status() doesn't misread a misconfig as "bus unreachable".
+        # Don't echo the raw URL in the error (ungated endpoint).
         try:
             webhook_install.validate_target_url(public_url)
-        except ValueError as e:
+        except ValueError:
             raise HTTPException(
-                status_code=400, detail=f"github_webhook_public_url invalid: {e}"
+                status_code=400,
+                detail=(
+                    "github_webhook_public_url is set but not a valid HTTPS "
+                    "/v1/webhooks/github URL"
+                ),
             )
-        return await webhook_install.check_url_reachable(public_url)
+        result = await webhook_install.check_url_reachable(public_url)
+        if isinstance(result, dict) and isinstance(result.get("url"), str):
+            result["url"] = _redact_url(result["url"])
+        return result
 
     @app.post("/v1/ack")
     def ack(req: AckRequest):
