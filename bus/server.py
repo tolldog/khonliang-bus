@@ -22,6 +22,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -35,6 +36,7 @@ from bus.orchestrator import Orchestrator
 from bus.scheduler import SchedulerIntegration
 from bus.versions import validate_collaboration_requirements
 from bus.webhooks import build_topic, summarize, verify_signature
+from bus import webhook_install
 
 logger = logging.getLogger(__name__)
 
@@ -2753,6 +2755,324 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         ))
         logger.info("GitHub webhook %s (delivery=%s) → %s msg=%s", event_type, delivery_id, topic, result.get("id"))
         return {"status": "published", "topic": topic, "message_id": result.get("id"), "delivery_id": delivery_id}
+
+    # -- outbound webhook management (install / audit / repair) --
+    #
+    # These routes call the GitHub API with an admin:repo_hook token to
+    # CREATE/PATCH/DELETE repo webhooks pointing back at this bus. The token
+    # is a real write credential, and the bus binds 0.0.0.0 with no auth, so
+    # the whole token-backed surface is gated behind an explicit opt-in
+    # (``github_webhook_admin`` config or ``KHONLIANG_BUS_WEBHOOK_ADMIN`` env)
+    # — same posture as the provenance disclose flag. ``check_funnel`` is the
+    # one exception: it needs no token (it only probes the bus's own public
+    # URL), so it stays ungated as a plain reachability check.
+
+    def _webhook_admin_enabled() -> bool:
+        if bool(bus.config.get("github_webhook_admin", False)):
+            return True
+        return os.environ.get("KHONLIANG_BUS_WEBHOOK_ADMIN", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
+    def _resolve_webhook_public_url() -> str:
+        return (
+            bus.config.get("github_webhook_public_url", "")
+            or os.environ.get("GITHUB_WEBHOOK_PUBLIC_URL", "")
+        )
+
+    def _resolve_webhook_context(
+        *, require_deliverable: bool = False
+    ) -> tuple[str, "webhook_install.HookConfig"]:
+        """Resolve (token, HookConfig) for a token-backed management route.
+
+        Raises ``HTTPException`` (FastAPI renders ``{"detail": ...}``) on any
+        precondition failure: 403 if admin is disabled, 400 if no token /
+        public URL / the URL fails shape validation.
+
+        A valid canonical ``github_webhook_public_url`` is a HARD prerequisite
+        for EVERY route, audits included: ``find_canonical_match`` /
+        ``find_orphan_hooks`` classify a repo's hooks by the canonical URL's
+        host+path, and ``HookConfig`` can't be built without it — so there is
+        no meaningful audit to run when it's unset. (Raw, unclassified hook
+        enumeration would be a separate feature, not a lenient audit.)
+
+        ``require_deliverable`` (set by mutating callers) is the ONLY leniency
+        axis: it additionally refuses when the bus's own RECEIVER would reject
+        every delivery (no secret + unsigned disallowed). Read-only audits and
+        dry-runs leave it False so they still work on a receiver that is
+        secret-misconfigured — but they still require the public URL above.
+        """
+        if not _webhook_admin_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "webhook admin disabled — set github_webhook_admin: true "
+                    "in bus config or KHONLIANG_BUS_WEBHOOK_ADMIN=1"
+                ),
+            )
+        token = (
+            bus.config.get("github_token", "")
+            or os.environ.get("GITHUB_TOKEN", "")
+            or os.environ.get("GH_TOKEN", "")
+        )
+        if not token:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "no GitHub token — set github_token (config) or "
+                    "GITHUB_TOKEN / GH_TOKEN env (needs admin:repo_hook scope)"
+                ),
+            )
+        public_url = _resolve_webhook_public_url()
+        secret = bus.config.get("github_webhook_secret", "") or os.environ.get(
+            "GITHUB_WEBHOOK_SECRET", ""
+        )
+        # Refuse to configure a hook the bus's own receiver would reject on
+        # every delivery: with no secret AND github_webhook_allow_unsigned
+        # false (the default), /v1/webhooks/github answers 503 to everything,
+        # so an install would "succeed" while wiring up a permanently-broken
+        # webhook. Require a secret, or explicit unsigned dev mode. Only the
+        # mutating callers gate on THIS (the secret/unsigned state); audits and
+        # dry-runs skip it. (They still require the public URL above.)
+        allow_unsigned = bool(bus.config.get("github_webhook_allow_unsigned", False))
+        if require_deliverable and not secret and not allow_unsigned:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "refusing to install: the bus receiver has no "
+                    "github_webhook_secret and github_webhook_allow_unsigned is "
+                    "false, so every delivery would be rejected (503). Set "
+                    "github_webhook_secret (recommended) or enable "
+                    "github_webhook_allow_unsigned for localhost dev."
+                ),
+            )
+        try:
+            hook_config = webhook_install.HookConfig(target_url=public_url, secret=secret)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"github_webhook_public_url invalid ({e}) — these routes "
+                    "classify/configure repo hooks against the canonical URL, "
+                    "so it must be a valid HTTPS /v1/webhooks/github URL"
+                    if public_url
+                    else "github_webhook_public_url is unset — set the HTTPS "
+                    "/v1/webhooks/github URL in bus config; every management "
+                    "route (audit included) compares against it"
+                ),
+            )
+        return token, hook_config
+
+    def _resolve_webhook_owner(owner: str | None) -> str:
+        resolved = (owner or bus.config.get("github_owner", "") or "").strip()
+        if not resolved:
+            raise HTTPException(
+                status_code=400,
+                detail="no owner — pass 'owner' or set github_owner in bus config",
+            )
+        return resolved
+
+    def _require_fleet_prefix(body: dict) -> str:
+        """Resolve a fleet ``prefix``, refusing the empty string.
+
+        ``list_org_repos`` matches by ``name.startswith(prefix)``, so ``""``
+        would match EVERY repo under the owner — turning an intended
+        ``khonliang-*`` rollout into an account-wide hook create/repair. Force
+        an explicit non-empty prefix.
+        """
+        prefix = _str_field(body, "prefix", default="khonliang-")
+        if not prefix:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "'prefix' must be non-empty — it matches repos by "
+                    "startswith, so an empty prefix would match every repo "
+                    "under the owner"
+                ),
+            )
+        return prefix
+
+    async def _run_webhook_op(coro):
+        """Await a primitive coroutine, mapping its failure modes to HTTP.
+
+        ``ValueError`` (e.g. empty fleet) → 400; ``httpx.HTTPStatusError``
+        (GitHub rejected the call — bad scope, missing repo) → 502 carrying
+        the upstream status. Each raises ``HTTPException`` (FastAPI renders
+        ``{"detail": ...}``).
+        """
+        try:
+            return await coro
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"github HTTP {e.response.status_code}: {e.response.text[:200]}",
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"github request error: {e}")
+
+    async def _require_object_body(request: Request) -> dict:
+        """Parse the request body as a JSON object or raise 400.
+
+        Without this, malformed JSON (``request.json()`` raises) or a valid
+        non-object payload (``[]`` / ``"x"`` — ``.get`` then ``AttributeError``)
+        would surface as a 500 instead of a client-error 400.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"request body must be a JSON object, got {type(body).__name__}",
+            )
+        return body
+
+    def _str_field(
+        body: dict, name: str, *, default: str | None = None, required: bool = False
+    ) -> str | None:
+        """Extract a string field or raise 400. An absent key falls back to
+        ``default``; a present-but-wrong-type value (``123``, explicit
+        ``null``) is a client error, not a 500."""
+        if name not in body:
+            if required:
+                raise HTTPException(status_code=400, detail=f"'{name}' is required")
+            return default
+        val = body[name]
+        if not isinstance(val, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{name}' must be a string, got {type(val).__name__}",
+            )
+        if required and not val:
+            raise HTTPException(status_code=400, detail=f"'{name}' is required")
+        return val
+
+    def _bool_field(body: dict, name: str, *, default: bool = False) -> bool:
+        """Extract a JSON boolean or raise 400. Avoids Python truthiness
+        silently turning ``{"dry_run": "false"}`` into a (true) dry run."""
+        val = body.get(name, default)
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{name}' must be a boolean, got {type(val).__name__}",
+            )
+        return val
+
+    @app.post("/v1/webhooks/manage/install")
+    async def webhook_manage_install(request: Request):
+        body = await _require_object_body(request)
+        repo = _str_field(body, "repo", required=True)
+        dry_run = _bool_field(body, "dry_run")
+        token, hook_config = _resolve_webhook_context(require_deliverable=not dry_run)
+        async with webhook_install.make_client(token) as client:
+            return await _run_webhook_op(
+                webhook_install.install_one(client, repo, hook_config, dry_run=dry_run)
+            )
+
+    @app.post("/v1/webhooks/manage/install_fleet")
+    async def webhook_manage_install_fleet(request: Request):
+        body = await _require_object_body(request)
+        dry_run = _bool_field(body, "dry_run")
+        prefix = _require_fleet_prefix(body)
+        token, hook_config = _resolve_webhook_context(require_deliverable=not dry_run)
+        owner = _resolve_webhook_owner(_str_field(body, "owner"))
+        async with webhook_install.make_client(token) as client:
+            return await _run_webhook_op(
+                webhook_install.install_fleet(
+                    client, owner, hook_config, prefix=prefix, dry_run=dry_run
+                )
+            )
+
+    @app.post("/v1/webhooks/manage/audit")
+    async def webhook_manage_audit(request: Request):
+        body = await _require_object_body(request)
+        repo = _str_field(body, "repo", required=True)
+        token, hook_config = _resolve_webhook_context()
+        async with webhook_install.make_client(token) as client:
+            result = await _run_webhook_op(
+                webhook_install.audit_one(client, repo, hook_config)
+            )
+        return webhook_install._audit_to_dict(result)
+
+    @app.post("/v1/webhooks/manage/audit_fleet")
+    async def webhook_manage_audit_fleet(request: Request):
+        body = await _require_object_body(request)
+        prefix = _require_fleet_prefix(body)
+        token, hook_config = _resolve_webhook_context()
+        owner = _resolve_webhook_owner(_str_field(body, "owner"))
+        async with webhook_install.make_client(token) as client:
+            return await _run_webhook_op(
+                webhook_install.audit_fleet(client, owner, hook_config, prefix=prefix)
+            )
+
+    @app.post("/v1/webhooks/manage/repair")
+    async def webhook_manage_repair(request: Request):
+        body = await _require_object_body(request)
+        repo = _str_field(body, "repo", required=True)
+        token, hook_config = _resolve_webhook_context(require_deliverable=True)
+        async with webhook_install.make_client(token) as client:
+            return await _run_webhook_op(
+                webhook_install.repair_one(client, repo, hook_config)
+            )
+
+    def _redact_url(url: str) -> str:
+        """Strip credentials / query / fragment, keeping scheme://host[:port]/path.
+
+        ``check_funnel`` is ungated, and github_webhook_public_url can validly
+        carry userinfo (``https://user:tok@host/...``) or a ``?token=`` query
+        — both pass validate_target_url (it only checks scheme/host/path). The
+        ungated response must not echo those secrets back, so the host+path
+        (all an operator needs to confirm the funnel target) is all we return.
+        """
+        try:
+            p = urlparse(url)
+            if not p.scheme or not p.hostname:
+                return ""
+            # ``p.port`` validates the port lazily and raises ValueError on a
+            # non-numeric one — kept inside the try so redaction never crashes
+            # the caller (validate_target_url already rejects this upstream).
+            host = p.hostname + (f":{p.port}" if p.port else "")
+            return f"{p.scheme}://{host}{p.path}"
+        except Exception:
+            return ""
+
+    @app.get("/v1/webhooks/manage/check_funnel")
+    async def webhook_manage_check_funnel():
+        """Probe the configured public webhook URL for bus reachability.
+
+        Ungated and token-free: it only POSTs a deliberately-invalid body to
+        the bus's own ``/v1/webhooks/github`` (rejected pre-publish), so it
+        leaks no repo state and needs no admin credential. The echoed URL is
+        redacted to host+path so an ungated caller can't read back any
+        userinfo / query-string token embedded in the configured URL.
+        """
+        public_url = _resolve_webhook_public_url()
+        if not public_url:
+            raise HTTPException(
+                status_code=400,
+                detail="github_webhook_public_url is unset",
+            )
+        # A bad URL *shape* is a local config error, not a reachability result:
+        # reject it with 400 (like the other routes) so a client's
+        # raise_for_status() doesn't misread a misconfig as "bus unreachable".
+        # Don't echo the raw URL in the error (ungated endpoint).
+        try:
+            webhook_install.validate_target_url(public_url)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "github_webhook_public_url is set but not a valid HTTPS "
+                    "/v1/webhooks/github URL"
+                ),
+            )
+        result = await webhook_install.check_url_reachable(public_url)
+        if isinstance(result, dict) and isinstance(result.get("url"), str):
+            result["url"] = _redact_url(result["url"])
+        return result
 
     @app.post("/v1/ack")
     def ack(req: AckRequest):

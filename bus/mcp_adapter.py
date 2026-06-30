@@ -781,6 +781,180 @@ class BusMCPAdapter:
                     lines.append("  no tool changes; tools/list_changed NOT sent (no client session)")
             return "\n".join(lines)
 
+        # -- outbound webhook management (fronts /v1/webhooks/manage/*) --
+
+        def _webhook_problem(resp: Any) -> str | None:
+            """Return an error string if ``resp`` is a route failure, else None.
+
+            The management routes raise ``HTTPException`` → FastAPI renders
+            ``{"detail": ...}``; ``_async_post`` surfaces transport failures as
+            ``{"error": ...}``. Success envelopes from the primitives never
+            carry either key, so the presence of one marks a problem.
+            """
+            if not isinstance(resp, dict):
+                return f"unexpected response: {resp!r}"
+            msg = resp.get("detail") or resp.get("error")
+            return str(msg) if msg else None
+
+        def _fmt_orphans(orphans: list | None) -> str:
+            n = len(orphans or [])
+            return f" ⚠ {n} orphan hook(s)" if n else ""
+
+        def _fmt_install_result(r: dict) -> str:
+            action = r.get("action", "?")
+            line = f"{r.get('repo', '?')}: {action}"
+            if r.get("hook_id") is not None:
+                line += f" hook_id={r['hook_id']}"
+            if r.get("drift_fields"):
+                line += f" drift={','.join(r['drift_fields'])}"
+            if r.get("duplicate_ids"):
+                line += f" duplicate_ids={','.join(map(str, r['duplicate_ids']))}"
+            if r.get("force_patched"):
+                line += " force_patched"
+            if r.get("error"):
+                line += f" error={r['error']}"
+            line += _fmt_orphans(r.get("orphans"))
+            return line
+
+        @mcp.tool()
+        async def bus_webhook_install(repo: str, dry_run: bool = False) -> str:
+            """Install / repair the canonical GitHub webhook on ``repo``.
+
+            Drift-detects the existing hook and SKIP/PATCH/CREATEs as needed,
+            resolving the public bus URL + secret + admin token from bus config
+            (fr_khonliang-bus_e3b15e88). Two-or-more active hooks on the URL is
+            reported as ``duplicate`` (manual collapse). Any leftover orphan
+            hooks (canonical path, stale host) are surfaced for cleanup even on
+            a clean repo. ``dry_run`` reports the would-be action without
+            mutating. Requires the bus's webhook-admin opt-in.
+            """
+            resp = await adapter._async_post(
+                "/v1/webhooks/manage/install", {"repo": repo, "dry_run": dry_run}
+            )
+            problem = _webhook_problem(resp)
+            return f"install {repo}: {problem}" if problem else f"install {_fmt_install_result(resp)}"
+
+        @mcp.tool()
+        async def bus_webhook_audit(repo: str) -> str:
+            """Read-only audit of ``repo``'s canonical webhook.
+
+            Reports the match kind (ok/missing/drift/duplicate), the most
+            recent delivery's status code (informational), and any orphan
+            hooks. No mutations. Requires the bus's webhook-admin opt-in.
+            """
+            resp = await adapter._async_post("/v1/webhooks/manage/audit", {"repo": repo})
+            problem = _webhook_problem(resp)
+            if problem:
+                return f"audit {repo}: {problem}"
+            line = f"audit {resp.get('repo', repo)}: {resp.get('kind', '?')}"
+            if resp.get("hook_id") is not None:
+                line += f" hook_id={resp['hook_id']}"
+            if resp.get("drift_fields"):
+                line += f" drift={','.join(resp['drift_fields'])}"
+            if resp.get("last_response_code") is not None:
+                line += f" last={resp['last_response_code']}"
+            line += _fmt_orphans(resp.get("orphans"))
+            return line
+
+        @mcp.tool()
+        async def bus_webhook_repair(repo: str) -> str:
+            """Force-PATCH ``repo``'s canonical webhook (incl. secret rotation).
+
+            Unlike ``bus_webhook_install``, repairs even a shape-clean hook so a
+            rotated secret lands (GitHub redacts the stored secret, so drift
+            detection can't see a stale one). Requires the webhook-admin opt-in.
+            """
+            resp = await adapter._async_post("/v1/webhooks/manage/repair", {"repo": repo})
+            problem = _webhook_problem(resp)
+            return f"repair {repo}: {problem}" if problem else f"repair {_fmt_install_result(resp)}"
+
+        @mcp.tool()
+        async def bus_webhook_install_fleet(
+            prefix: str = "khonliang-", owner: str = "", dry_run: bool = False
+        ) -> str:
+            """Install the canonical webhook across every ``owner/<prefix>*`` repo.
+
+            ``owner`` defaults to the bus config's ``github_owner``. An empty
+            fleet (no repos match) is an explicit error (likely a token-scope /
+            prefix mismatch). ``dry_run`` previews. Requires the webhook-admin
+            opt-in.
+            """
+            body: dict = {"prefix": prefix, "dry_run": dry_run}
+            if owner:
+                body["owner"] = owner
+            resp = await adapter._async_post("/v1/webhooks/manage/install_fleet", body)
+            problem = _webhook_problem(resp)
+            if problem:
+                return f"install_fleet: {problem}"
+            summary = resp.get("summary", {})
+            head = "install_fleet " + ", ".join(f"{k}={v}" for k, v in summary.items())
+            lines = [head] + [f"  {_fmt_install_result(r)}" for r in resp.get("results", [])]
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def bus_webhook_audit_fleet(prefix: str = "khonliang-", owner: str = "") -> str:
+            """Read-only audit across every ``owner/<prefix>*`` repo.
+
+            ``owner`` defaults to ``github_owner`` in bus config. Requires the
+            webhook-admin opt-in.
+            """
+            body: dict = {"prefix": prefix}
+            if owner:
+                body["owner"] = owner
+            resp = await adapter._async_post("/v1/webhooks/manage/audit_fleet", body)
+            problem = _webhook_problem(resp)
+            if problem:
+                return f"audit_fleet: {problem}"
+            summary = resp.get("summary", {})
+            head = "audit_fleet " + ", ".join(f"{k}={v}" for k, v in summary.items())
+            lines = [head]
+            for a in resp.get("audits", []):
+                line = f"  {a.get('repo', '?')}: {a.get('kind', '?')}"
+                if a.get("last_response_code") is not None:
+                    line += f" last={a['last_response_code']}"
+                line += _fmt_orphans(a.get("orphans"))
+                lines.append(line)
+            for e in resp.get("errors", []):
+                lines.append(f"  {e.get('repo', '?')}: error={e.get('error', '')}")
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def bus_webhook_check_funnel() -> str:
+            """Probe the configured public webhook URL for bus reachability.
+
+            Token-free, side-effect-free: POSTs a deliberately-invalid body to
+            the bus's own ``/v1/webhooks/github`` (rejected pre-publish). A bus
+            rejection (400/401/503 + JSON error) reads as reachable; 404 /
+            connect-refused / timeout means a mispointed URL, down tunnel, or
+            down bus. Closes the URL-reachability gap (bug_khonliang-bus_20dda1cd
+            / _1064a609).
+            """
+            # Read the body regardless of status: the route returns an
+            # intentional 400 {"detail": ...} for a config error (unset /
+            # invalid github_webhook_public_url). adapter._async_get raises on
+            # 4xx → None, which would mislabel that as "bus unreachable", so go
+            # through the raw client here to preserve the diagnostic.
+            try:
+                r = await adapter._async_http.get(
+                    f"{adapter.bus_url}/v1/webhooks/manage/check_funnel"
+                )
+            except Exception as e:
+                return f"check_funnel: failed — bus unreachable ({e})"
+            try:
+                resp = r.json()
+            except Exception:
+                return f"check_funnel: failed — HTTP {r.status_code} (non-JSON body)"
+            if not isinstance(resp, dict):
+                return f"check_funnel: unexpected response {resp!r}"
+            if resp.get("detail"):
+                return f"check_funnel: {resp['detail']}"
+            line = f"check_funnel {resp.get('url', '?')}: reachable={resp.get('reachable')}"
+            if resp.get("status_code") is not None:
+                line += f" status={resp['status_code']}"
+            if resp.get("error"):
+                line += f" error={resp['error']}"
+            return line
+
         @mcp.tool()
         async def bus_skills(agent_id: str = "") -> str:
             """List skills. Optionally filter by agent_id."""
