@@ -311,14 +311,29 @@ async def list_org_repos(
     prefix: str = "khonliang-",
 ) -> list[str]:
     """Return ``owner/<name>`` for every repo under ``owner`` whose
-    name starts with ``prefix``.
+    name starts with ``prefix`` — INCLUDING private repos.
 
-    Uses ``GET /users/{owner}/repos`` (works for both User and Org
-    accounts; the Org-specific endpoint requires elevated scopes).
-    Filtering happens client-side because the GitHub search API
-    requires different scopes and produces inconsistent shapes.
+    ``GET /users/{owner}/repos`` returns only PUBLIC repos, so for a
+    private fleet it silently lists nothing (or raises empty-fleet). Detect
+    the owner type first and pick an endpoint that surfaces private repos:
+
+    - Organization → ``GET /orgs/{owner}/repos`` (private repos visible with
+      ``admin:repo_hook`` + ``read:org``).
+    - User → ``GET /user/repos`` (the authenticated user's own repos, private
+      included), filtered to ``owner`` so a token with broader access doesn't
+      pull in other accounts.
+
+    Filtering by prefix happens client-side (the search API needs different
+    scopes and returns inconsistent shapes).
     """
-    repos = await _paginate(client, f"/users/{owner}/repos", {"type": "all"})
+    acct = await client.get(f"/users/{owner}")
+    acct.raise_for_status()
+    acct_type = (acct.json() or {}).get("type", "User")
+    if acct_type == "Organization":
+        repos = await _paginate(client, f"/orgs/{owner}/repos", {"type": "all"})
+    else:
+        repos = await _paginate(client, "/user/repos", {"affiliation": "owner"})
+        repos = [r for r in repos if (r.get("owner") or {}).get("login") == owner]
     return sorted(
         f"{owner}/{r['name']}"
         for r in repos
@@ -338,24 +353,34 @@ async def install_one(
     Returns a dict with at minimum ``{action, repo}`` plus mode-specific
     fields (``hook_id``, ``drift_fields``, ``duplicate_ids``). ``action``
     is one of ``created`` / ``skipped`` / ``repaired`` / ``duplicate``.
+
+    Every result also carries ``orphans`` (active hooks on the canonical PATH
+    but a stale HOST). The canonical hook can be perfectly in shape while a
+    leftover orphan still double-delivers, so install must surface them for
+    cleanup — not just audit (a ``skipped``/``repaired`` repo can still be
+    mis-firing).
     """
     hooks = await list_hooks(client, repo)
     match = find_canonical_match(hooks, config)
+    orphans = _orphan_summary(find_orphan_hooks(hooks, config.target_url))
 
     if match.kind == "duplicate":
         return {
             "action": "duplicate",
             "repo": repo,
             "duplicate_ids": list(match.duplicate_ids),
+            "orphans": orphans,
         }
     if match.kind == "ok":
-        return {"action": "skipped", "repo": repo, "hook_id": match.hook_id}
+        return {"action": "skipped", "repo": repo, "hook_id": match.hook_id,
+                "orphans": orphans}
     if dry_run:
         return {
             "action": f"would-{'create' if match.kind == 'missing' else 'repair'}",
             "repo": repo,
             "hook_id": match.hook_id,
             "drift_fields": list(match.drift_fields),
+            "orphans": orphans,
         }
     if match.kind == "missing":
         resp = await client.post(
@@ -363,7 +388,8 @@ async def install_one(
         )
         resp.raise_for_status()
         new = resp.json()
-        return {"action": "created", "repo": repo, "hook_id": int(new["id"])}
+        return {"action": "created", "repo": repo, "hook_id": int(new["id"]),
+                "orphans": orphans}
     # match.kind == "drift"
     resp = await client.patch(
         f"/repos/{repo}/hooks/{match.hook_id}", json=config.to_patch_body(),
@@ -374,6 +400,7 @@ async def install_one(
         "repo": repo,
         "hook_id": match.hook_id,
         "drift_fields": list(match.drift_fields),
+        "orphans": orphans,
     }
 
 
@@ -486,6 +513,14 @@ async def audit_fleet(
     }
 
 
+def _orphan_summary(orphans: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compact {id, url} view of orphan hooks for operator-facing results."""
+    return [
+        {"id": o.get("id"), "url": (o.get("config") or {}).get("url")}
+        for o in orphans
+    ]
+
+
 def _audit_to_dict(a: AuditResult) -> dict[str, Any]:
     return {
         "repo": a.repo,
@@ -495,10 +530,7 @@ def _audit_to_dict(a: AuditResult) -> dict[str, Any]:
         "duplicate_ids": list(a.match.duplicate_ids),
         "last_response_code": a.last_response_code,
         "last_response_status": a.last_response_status,
-        "orphans": [
-            {"id": o.get("id"), "url": (o.get("config") or {}).get("url")}
-            for o in a.orphans
-        ],
+        "orphans": _orphan_summary(a.orphans),
     }
 
 
@@ -517,11 +549,13 @@ async def repair_one(
     """
     hooks = await list_hooks(client, repo)
     match = find_canonical_match(hooks, config)
+    orphans = _orphan_summary(find_orphan_hooks(hooks, config.target_url))
     if match.kind == "duplicate":
         return {
             "action": "duplicate",
             "repo": repo,
             "duplicate_ids": list(match.duplicate_ids),
+            "orphans": orphans,
         }
     if match.kind == "missing":
         # Repair on a missing hook degrades to install. Could also
@@ -537,6 +571,7 @@ async def repair_one(
         "repo": repo,
         "hook_id": match.hook_id,
         "force_patched": True,
+        "orphans": orphans,
     }
 
 

@@ -309,7 +309,7 @@ async def test_install_one_skip_when_clean(canonical_config):
     async with _build_client(handler) as client:
         result = await wi.install_one(client, "o/r", canonical_config)
 
-    assert result == {"action": "skipped", "repo": "o/r", "hook_id": 42}
+    assert result == {"action": "skipped", "repo": "o/r", "hook_id": 42, "orphans": []}
     assert mutations == []
 
 
@@ -416,7 +416,64 @@ async def test_install_one_inactive_plus_active_proceeds_against_active(canonica
     async with _build_client(handler) as client:
         result = await wi.install_one(client, "o/r", canonical_config)
 
-    assert result == {"action": "skipped", "repo": "o/r", "hook_id": 2}
+    assert result == {"action": "skipped", "repo": "o/r", "hook_id": 2, "orphans": []}
+
+
+@pytest.mark.asyncio
+async def test_install_one_surfaces_orphans(canonical_config):
+    """A clean canonical hook PLUS an active stale-host orphan: install must
+    SKIP but still report the orphan (it's double-delivering)."""
+    orphan = _hook(99, url="https://stale.test/v1/webhooks/github")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[_hook(1), orphan])
+        raise AssertionError(f"unexpected {request.method}")
+
+    async with _build_client(handler) as client:
+        result = await wi.install_one(client, "o/r", canonical_config)
+
+    assert result["action"] == "skipped"
+    assert result["orphans"] == [{"id": 99, "url": "https://stale.test/v1/webhooks/github"}]
+
+
+@pytest.mark.asyncio
+async def test_list_org_repos_user_uses_authenticated_endpoint(canonical_config):
+    """A User owner must enumerate via /user/repos (private repos included),
+    NOT /users/{owner}/repos (public-only)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/users/owner":
+            return httpx.Response(200, json={"login": "owner", "type": "User"})
+        if path == "/user/repos":
+            return httpx.Response(200, json=[
+                {"name": "khonliang-bus", "owner": {"login": "owner"}, "private": True},
+                {"name": "khonliang-x", "owner": {"login": "someone-else"}},  # filtered
+                {"name": "unrelated", "owner": {"login": "owner"}},           # prefix-filtered
+            ])
+        raise AssertionError(f"unexpected {path}")
+
+    async with _build_client(handler) as client:
+        repos = await wi.list_org_repos(client, "owner")
+    assert repos == ["owner/khonliang-bus"]
+
+
+@pytest.mark.asyncio
+async def test_list_org_repos_org_uses_orgs_endpoint(canonical_config):
+    """An Organization owner must enumerate via /orgs/{owner}/repos."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/users/acme":
+            return httpx.Response(200, json={"login": "acme", "type": "Organization"})
+        if path == "/orgs/acme/repos":
+            return httpx.Response(200, json=[
+                {"name": "khonliang-bus"}, {"name": "other"},
+            ])
+        raise AssertionError(f"unexpected {path}")
+
+    async with _build_client(handler) as client:
+        repos = await wi.list_org_repos(client, "acme")
+    assert repos == ["acme/khonliang-bus"]
 
 
 # ---------------------------------------------------------------------------
@@ -493,14 +550,16 @@ async def test_audit_one_missing_no_last_response(canonical_config):
 @pytest.mark.asyncio
 async def test_install_fleet_skips_existing_creates_new(canonical_config):
     repos_payload = [
-        {"name": "khonliang-bus"},
-        {"name": "khonliang-developer"},
-        {"name": "unrelated-project"},  # filtered by prefix
+        {"name": "khonliang-bus", "owner": {"login": "owner"}},
+        {"name": "khonliang-developer", "owner": {"login": "owner"}},
+        {"name": "unrelated-project", "owner": {"login": "owner"}},  # filtered by prefix
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if path == "/users/owner/repos":
+        if path == "/users/owner":
+            return httpx.Response(200, json={"login": "owner", "type": "User"})
+        if path == "/user/repos":
             return httpx.Response(200, json=repos_payload)
         if path == "/repos/owner/khonliang-bus/hooks" and request.method == "GET":
             return httpx.Response(200, json=[_hook(1)])  # OK, skip
@@ -525,7 +584,9 @@ async def test_install_fleet_skips_existing_creates_new(canonical_config):
 @pytest.mark.asyncio
 async def test_install_fleet_empty_raises(canonical_config):
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/users/owner/repos":
+        if request.url.path == "/users/owner":
+            return httpx.Response(200, json={"login": "owner", "type": "User"})
+        if request.url.path == "/user/repos":
             return httpx.Response(200, json=[])
         raise AssertionError("should not query repos when fleet is empty")
 
@@ -540,9 +601,11 @@ async def test_install_fleet_per_repo_failure_does_not_abort(canonical_config):
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if path == "/users/owner/repos":
+        if path == "/users/owner":
+            return httpx.Response(200, json={"login": "owner", "type": "User"})
+        if path == "/user/repos":
             return httpx.Response(200, json=[
-                {"name": "khonliang-a"}, {"name": "khonliang-b"},
+                {"name": "khonliang-a", "owner": {"login": "owner"}}, {"name": "khonliang-b", "owner": {"login": "owner"}},
             ])
         if path == "/repos/owner/khonliang-a/hooks" and request.method == "GET":
             return httpx.Response(403, json={"message": "forbidden"})
@@ -563,11 +626,13 @@ async def test_install_fleet_per_repo_failure_does_not_abort(canonical_config):
 async def test_audit_fleet_summarises_kinds(canonical_config):
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if path == "/users/owner/repos":
+        if path == "/users/owner":
+            return httpx.Response(200, json={"login": "owner", "type": "User"})
+        if path == "/user/repos":
             return httpx.Response(200, json=[
-                {"name": "khonliang-a"},
-                {"name": "khonliang-b"},
-                {"name": "khonliang-c"},
+                {"name": "khonliang-a", "owner": {"login": "owner"}},
+                {"name": "khonliang-b", "owner": {"login": "owner"}},
+                {"name": "khonliang-c", "owner": {"login": "owner"}},
             ])
         if path == "/repos/owner/khonliang-a/hooks":
             return httpx.Response(200, json=[_hook(1)])  # ok
