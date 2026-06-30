@@ -30,6 +30,17 @@ class _FakePopen:
         self._alive = False
         self.returncode = code
 
+    # subprocess.Popen-shaped lifecycle no-ops so _stop_process can terminate a
+    # (fake) live process without spawning a real one.
+    def terminate(self) -> None:
+        self.die(-15)
+
+    def kill(self) -> None:
+        self.die(-9)
+
+    def wait(self, timeout=None):
+        return self.returncode
+
 
 def _bus(db: BusDB) -> BusServer:
     return BusServer(db, config={"bus_url": "http://localhost:9999"})
@@ -127,16 +138,21 @@ def test_supervise_once_records_restart_failure(tmp_path):
 
 
 def test_supervise_once_counts_repeated_restarts(tmp_path, monkeypatch):
-    """Restart counter accumulates across calls so operators can spot a flapping agent."""
+    """Restart counter accumulates across calls so operators can spot a flapping
+    agent — but only once each crash is past the backoff window (advance the
+    injectable clock between crashes)."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "flapper")
     bus = _bus(db)
     _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 1000.0}
+    bus._now = lambda: clock["t"]
 
-    # First crash + restart.
+    # First crash + restart (immediate).
     bus._processes["flapper"] = _FakePopen(alive=False, returncode=1)
     bus.supervise_once()
-    # Second crash + restart.
+    # Second crash, past the first backoff (backoff_s[0] = 1s) → restart again.
+    clock["t"] += 2.0
     bus._processes["flapper"] = _FakePopen(alive=False, returncode=1)
     bus.supervise_once()
 
@@ -286,6 +302,205 @@ async def test_start_supervisor_returns_running_task_and_is_idempotent(tmp_path)
         await task
     except asyncio.CancelledError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff + give-up (fr_khonliang-bus_dc4ef3e9 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def _bus_cfg(db: BusDB, **cfg) -> BusServer:
+    return BusServer(db, config={"bus_url": "http://localhost:9999", **cfg})
+
+
+def _crash(bus: BusServer, agent_id: str, code: int = 1) -> None:
+    """Mark the agent's current tracked process dead in place."""
+    bus._processes[agent_id].die(code)
+
+
+def test_backoff_window_skips_immediate_recrash(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0, 30.0])
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 100.0}
+    bus._now = lambda: clock["t"]
+
+    # First crash → immediate restart.
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    r1 = bus.supervise_once()
+    assert r1["restarted"] == ["a1"]
+
+    # Re-crash within the 5s window → backing_off, NOT restarted.
+    _crash(bus, "a1")
+    r2 = bus.supervise_once()
+    assert r2["restarted"] == []
+    assert r2["backing_off"] == ["a1"]
+    assert bus._supervisor_restart_counts["a1"] == 1  # unchanged
+
+    # Past the window → restart again.
+    clock["t"] += 6.0
+    r3 = bus.supervise_once()
+    assert r3["restarted"] == ["a1"]
+    assert bus._supervisor_restart_counts["a1"] == 2
+
+
+def test_backoff_escalates_per_schedule(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[1.0, 5.0, 30.0], supervisor_max_restarts=10)
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 0.0}
+    bus._now = lambda: clock["t"]
+
+    # Restart #1 → next window = backoff_s[0] = 1s.
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()
+    assert bus._supervisor_backoff["a1"]["next_attempt_at"] == 1.0
+
+    # +1s, restart #2 → next window = backoff_s[1] = 5s.
+    clock["t"] = 1.0
+    _crash(bus, "a1")
+    bus.supervise_once()
+    assert bus._supervisor_backoff["a1"]["next_attempt_at"] == 6.0
+
+    # +5s, restart #3 → next window = backoff_s[2] = 30s (capped at last).
+    clock["t"] = 6.0
+    _crash(bus, "a1")
+    bus.supervise_once()
+    assert bus._supervisor_backoff["a1"]["next_attempt_at"] == 36.0
+    assert bus._supervisor_restart_counts["a1"] == 3
+
+
+def test_gives_up_after_max_restarts(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=2)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 100.0  # frozen; backoff_s=[0] keeps every sweep eligible
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()           # restart #1
+    _crash(bus, "a1")
+    bus.supervise_once()           # restart #2
+    _crash(bus, "a1")
+    result = bus.supervise_once()  # restarts == 2 == max → give up
+
+    assert "a1" in result["gave_up"]
+    assert result["restarted"] == []
+    assert "a1" in bus._autostart_failures
+    assert "gave up" in bus._autostart_failures["a1"]
+    assert "a1" not in bus._processes          # stopped supervising
+    assert "a1" not in bus._supervisor_backoff
+
+
+def test_gave_up_agent_surfaced_as_autostart_failed(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()   # restart #1
+    _crash(bus, "a1")
+    bus.supervise_once()   # give up
+
+    services = bus.get_services()
+    row = next(s for s in services if s["id"] == "a1")
+    assert row["status"] == "autostart_failed"
+    assert "gave up" in row["autostart_error"]
+
+
+def test_recovery_window_resets_counter(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[1.0], supervisor_recovery_window_s=100.0)
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 0.0}
+    bus._now = lambda: clock["t"]
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()  # restart #1; the fake start leaves it alive
+    assert bus._supervisor_backoff["a1"]["restarts"] == 1
+
+    # Survives past the recovery window → next sweep (alive) resets the counter.
+    clock["t"] = 150.0
+    result = bus.supervise_once()
+    assert result["alive"] == ["a1"]
+    assert "a1" not in bus._supervisor_backoff
+
+
+def test_restart_failure_keeps_supervising_then_gives_up(tmp_path):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=2)
+    bus._now = lambda: 0.0  # backoff_s=[0] → always eligible
+
+    bus._processes["broken"] = _FakePopen(alive=False, returncode=1)
+    r1 = bus.supervise_once()  # restart attempt #1 fails
+    assert "broken" in r1["lost"]
+    # The dead Popen is LEFT in _processes so the next sweep retries it.
+    assert "broken" in bus._processes
+    assert bus._supervisor_backoff["broken"]["restarts"] == 1
+
+    r2 = bus.supervise_once()  # attempt #2 fails
+    assert "broken" in r2["lost"]
+    assert bus._supervisor_backoff["broken"]["restarts"] == 2
+
+    r3 = bus.supervise_once()  # restarts == max → give up
+    assert "broken" in r3["gave_up"]
+    assert "broken" not in bus._processes
+
+
+def test_restart_on_crash_false_disables_restart(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_restart_on_crash=False)
+    _patch_fake_start_process(monkeypatch, bus)
+
+    dead = _FakePopen(alive=False, returncode=1)
+    bus._processes["a1"] = dead
+    result = bus.supervise_once()
+
+    assert result["would_restart"] == ["a1"]
+    assert result["restarted"] == []
+    assert bus._processes["a1"] is dead  # left in place, untouched
+    assert bus._supervisor_restart_counts == {}
+
+
+def test_manual_start_clears_give_up_state(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()  # restart #1
+    _crash(bus, "a1")
+    bus.supervise_once()  # give up
+    assert "a1" in bus._autostart_failures
+
+    # Operator manually starts it → clears the failed surface + backoff state.
+    bus.start_agent("a1")
+    assert "a1" not in bus._autostart_failures
+    assert "a1" not in bus._supervisor_backoff
+
+
+def test_stop_clears_backoff_state(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0])
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()  # restart → backoff state set
+    assert "a1" in bus._supervisor_backoff
+
+    bus.stop_agent("a1")
+    assert "a1" not in bus._supervisor_backoff
 
 
 def test_start_supervisor_rejects_non_positive_interval(tmp_path):
