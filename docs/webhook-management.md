@@ -78,7 +78,24 @@ thin formatters over the routes above.
   `github_webhook_public_url` (a config error), reserving its `200` body for a
   genuine reachability result.
 
-## Not yet shipped (follow-up)
+## Operator CLI
 
-A thin operator CLI (`python -m bus.cli.webhook ...`) dispatching to these
-routes via the bus client is planned as a follow-up to this layer.
+`python -m bus.cli.webhook` is a thin dispatcher over the routes above — it
+holds no secrets (the bus resolves token/URL/secret server-side), just
+forwards `repo`/`prefix`/`owner`/`dry_run`:
+
+```sh
+python -m bus.cli.webhook install owner/repo [--dry-run]
+python -m bus.cli.webhook audit  owner/repo
+python -m bus.cli.webhook repair owner/repo
+python -m bus.cli.webhook install-fleet [--prefix khonliang-] [--owner X] [--dry-run]
+python -m bus.cli.webhook audit-fleet  [--prefix khonliang-] [--owner X]
+python -m bus.cli.webhook check-funnel
+```
+
+Bus URL defaults to `$KHONLIANG_BUS_URL` or `http://localhost:8787`; override
+with `--bus`. `--json` prints the raw response body. `--timeout SECONDS`
+(default 120; `0` = no limit) — fleet ops walk every repo serially bus-side,
+so raise it for large owners. Global flags work before or after the
+subcommand. Exit codes: `0` success, `1` on a bus-side error (4xx/5xx, or an
+unreachable funnel), `2` if the bus is unreachable or the request times out.
