@@ -443,6 +443,19 @@ class BusServer:
             "failed": dict(self._autostart_failures),
         }
 
+    def _clear_supervisor_failure_state(self, agent_id: str) -> None:
+        """Drop stale supervisor give-up / backoff records on a fresh start.
+
+        A successful registration (or manual start) proves the agent is alive
+        NOW, so any prior ``autostart_failed`` reason + backoff history is stale.
+        Called from BOTH registration paths (HTTP + WS) so an agent that
+        recovered out-of-band — not via ``start_agent`` — also clears the
+        record; otherwise the old reason re-surfaces on /v1/services the moment
+        that replacement later deregisters.
+        """
+        self._supervisor_backoff.pop(agent_id, None)
+        self._autostart_failures.pop(agent_id, None)
+
     def supervise_once(self) -> dict:
         """Single-pass supervision sweep: walk ``self._processes`` and re-launch
         any whose underlying subprocess has exited, with exponential backoff and
@@ -960,8 +973,7 @@ class BusServer:
         # fails. The supervisor restarts via _start_process directly (never
         # through start_agent), so this never clears state mid-backoff.
         if result.get("status") == "started":
-            self._supervisor_backoff.pop(agent_id, None)
-            self._autostart_failures.pop(agent_id, None)
+            self._clear_supervisor_failure_state(agent_id)
         return result
 
     def stop_agent(self, agent_id: str) -> dict:
@@ -1026,6 +1038,7 @@ class BusServer:
             launch_spec=req.launch_spec,
             launch_info=req.launch_info,
         )
+        self._clear_supervisor_failure_state(req.id)
         # Persist welcome (survives-deregister) so the bus_welcome super-skill
         # and GET /v1/agents/<id>/welcome work after the agent process exits.
         # fr_khonliang-bus_f96722dd. An oversized welcome must not break the
@@ -2348,6 +2361,7 @@ class BusServer:
                         launch_spec=data.get("launch_spec"),
                         launch_info=data.get("launch_info"),
                     )
+                    self._clear_supervisor_failure_state(agent_id)
                     # Persist welcome to the survives-deregister catalog so
                     # cold-start LLMs + bus_welcome super-skill see it even
                     # after the agent process exits.

@@ -598,6 +598,36 @@ def test_get_services_skips_uninstalled_failure_entry(tmp_path):
     assert not any(s["id"] == "ghost" for s in bus.get_services())
 
 
+async def test_registration_clears_give_up_state(tmp_path, monkeypatch):
+    """An agent that gave up and then recovers OUT OF BAND (registers directly,
+    not via start_agent) must clear its stale autostart_failed record — else the
+    old reason re-surfaces on /v1/services once the replacement later
+    deregisters."""
+    from bus.server import RegisterRequest
+
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(bus, "_publish_event", _noop)
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()
+    _crash(bus, "a1")
+    bus.supervise_once()  # give up
+    assert "a1" in bus._autostart_failures
+
+    await bus.register_agent(RegisterRequest(id="a1", callback="http://x", pid=123))
+
+    assert "a1" not in bus._autostart_failures
+    assert "a1" not in bus._supervisor_backoff
+
+
 def test_stop_clears_backoff_state(tmp_path, monkeypatch):
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
