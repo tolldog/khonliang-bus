@@ -368,7 +368,13 @@ async def list_org_repos(
         # private repos still enumerates them — then scope by owner login.
         # ``affiliation=owner`` would drop everything when owner != auth user.
         repos = await _paginate(client, "/user/repos")
-        repos = [r for r in repos if (r.get("owner") or {}).get("login") == owner]
+        # GitHub logins are case-insensitive, so normalize both sides — a caller
+        # passing "TToll" must still match repos GitHub returns under "ttoll".
+        owner_lc = owner.lower()
+        repos = [
+            r for r in repos
+            if ((r.get("owner") or {}).get("login") or "").lower() == owner_lc
+        ]
     return sorted(
         f"{owner}/{r['name']}"
         for r in repos

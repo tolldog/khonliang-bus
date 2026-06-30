@@ -483,6 +483,25 @@ async def test_list_org_repos_user_includes_collaborator_repos(canonical_config)
 
 
 @pytest.mark.asyncio
+async def test_list_org_repos_user_owner_match_is_case_insensitive(canonical_config):
+    """GitHub logins are case-insensitive: caller 'TToll' must match repos
+    GitHub returns under 'ttoll'."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/users/TToll":
+            return httpx.Response(200, json={"login": "ttoll", "type": "User"})
+        if path == "/user/repos":
+            return httpx.Response(200, json=[
+                {"name": "khonliang-bus", "owner": {"login": "ttoll"}},
+            ])
+        raise AssertionError(f"unexpected {path}")
+
+    async with _build_client(handler) as client:
+        repos = await wi.list_org_repos(client, "TToll")
+    assert repos == ["TToll/khonliang-bus"]
+
+
+@pytest.mark.asyncio
 async def test_check_url_reachable_rejects_bad_url_without_posting(monkeypatch):
     """A non-canonical target must fail shape validation BEFORE any POST."""
     posted = []
