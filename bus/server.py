@@ -484,24 +484,24 @@ class BusServer:
         with self._processes_lock:
             tracked = list(self._processes.items())
         for agent_id, proc in tracked:
-            # Recovery reset (applies whether the agent is currently alive OR has
-            # just crashed): once it has survived the recovery window since its
-            # last supervisor restart, clear the consecutive-restart counter so
-            # the give-up ceiling counts a crash-LOOP, not lifetime crashes. Doing
-            # this before the alive/dead split also resets a long-lived agent that
-            # crashes between the window elapsing and the next alive sweep — its
-            # crash then starts a fresh restart budget instead of inheriting the
-            # old loop's count.
             st = self._supervisor_backoff.get(agent_id)
-            if st and now - st["last_restart_at"] >= self._supervisor_recovery_window_s:
-                self._supervisor_backoff.pop(agent_id, None)
-                st = None
-                logger.info(
-                    "Supervisor: %s stable %.0fs since last restart; reset backoff counter",
-                    agent_id, self._supervisor_recovery_window_s,
-                )
-
             if proc.poll() is None:
+                # Alive. Recovery is detected ONLY by OBSERVING the agent up past
+                # the window: clear the consecutive-restart counter so the give-up
+                # ceiling counts a crash-LOOP, not lifetime crashes. We never reset
+                # on a dead sweep — a dead process can't be distinguished from one
+                # that crashed immediately and sat dead, and resetting there would
+                # let a permanently-broken agent dodge the give-up ceiling once
+                # backoff_s reaches the window (each post-window sweep would zero
+                # the counter). This requires supervisor_interval_s <
+                # supervisor_recovery_window_s so an alive sweep lands during
+                # recovery — true by default (5s << 300s).
+                if st and now - st["last_restart_at"] >= self._supervisor_recovery_window_s:
+                    self._supervisor_backoff.pop(agent_id, None)
+                    logger.info(
+                        "Supervisor: %s stable %.0fs since last restart; reset backoff counter",
+                        agent_id, self._supervisor_recovery_window_s,
+                    )
                 alive.append(agent_id)
                 continue
 
