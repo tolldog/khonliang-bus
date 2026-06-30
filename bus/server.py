@@ -3029,12 +3029,15 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         """
         try:
             p = urlparse(url)
+            if not p.scheme or not p.hostname:
+                return ""
+            # ``p.port`` validates the port lazily and raises ValueError on a
+            # non-numeric one — kept inside the try so redaction never crashes
+            # the caller (validate_target_url already rejects this upstream).
+            host = p.hostname + (f":{p.port}" if p.port else "")
+            return f"{p.scheme}://{host}{p.path}"
         except Exception:
             return ""
-        if not p.scheme or not p.hostname:
-            return ""
-        host = p.hostname + (f":{p.port}" if p.port else "")
-        return f"{p.scheme}://{host}{p.path}"
 
     @app.get("/v1/webhooks/manage/check_funnel")
     async def webhook_manage_check_funnel():

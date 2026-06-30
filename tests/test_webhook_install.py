@@ -104,6 +104,12 @@ def test_validate_target_url_rejects_wrong_path():
         wi.validate_target_url("https://example.test/wrong-path")
 
 
+def test_validate_target_url_rejects_bad_port():
+    # urlparse accepts a non-numeric port lazily; ``.port`` raises on access.
+    with pytest.raises(ValueError, match="invalid port"):
+        wi.validate_target_url("https://example.test:abc/v1/webhooks/github")
+
+
 # ---------------------------------------------------------------------------
 # find_canonical_match (pure logic, no httpx)
 # ---------------------------------------------------------------------------

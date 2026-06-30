@@ -136,16 +136,23 @@ class AuditResult:
 def validate_target_url(url: str) -> None:
     """Reject URLs that would silently mis-deliver.
 
-    HTTPS scheme, non-empty host, exact ``/v1/webhooks/github`` path.
-    Empty host (``https:///v1/webhooks/github``) and non-canonical path
-    suffixes both trip — operators previously hit fleet-wide misroutes
-    when these shapes slipped through.
+    HTTPS scheme, non-empty host, exact ``/v1/webhooks/github`` path, and a
+    parseable port. Empty host (``https:///v1/webhooks/github``) and
+    non-canonical path suffixes both trip — operators previously hit
+    fleet-wide misroutes when these shapes slipped through. A non-numeric
+    port (``https://host:abc/...``) is rejected here too: ``urlparse`` accepts
+    it lazily but ``parsed.port`` raises ``ValueError`` on access, which would
+    otherwise surface downstream (e.g. URL redaction) as a crash.
     """
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise ValueError(f"target URL must be HTTPS: {url!r}")
     if not parsed.hostname:
         raise ValueError(f"target URL has no host: {url!r}")
+    try:
+        parsed.port  # noqa: B018 — access triggers lazy port validation
+    except ValueError:
+        raise ValueError(f"target URL has an invalid port: {url!r}")
     if parsed.path != WEBHOOK_PATH:
         raise ValueError(
             f"target URL must end in {WEBHOOK_PATH!r}, got {parsed.path!r}: {url!r}"

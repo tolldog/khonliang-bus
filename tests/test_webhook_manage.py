@@ -492,6 +492,18 @@ def test_check_funnel_invalid_url_shape_returns_400(monkeypatch, tmp_path):
     assert "tok" not in r.json()["detail"]
 
 
+def test_check_funnel_bad_port_returns_400(monkeypatch, tmp_path):
+    # A non-numeric port must surface as a 400 config error, not a 500 from
+    # _redact_url accessing .port.
+    client = _make_client(
+        monkeypatch, tmp_path, handler=None,
+        github_webhook_public_url="https://example.test:abc/v1/webhooks/github",
+    )
+    r = client.get("/v1/webhooks/manage/check_funnel")
+    assert r.status_code == 400
+    assert "not a valid" in r.json()["detail"]
+
+
 def test_check_funnel_redacts_credentials(monkeypatch, tmp_path):
     # Ungated endpoint must not echo userinfo / query token back.
     secret_url = "https://user:s3cr3t@example.test/v1/webhooks/github?token=abc"
