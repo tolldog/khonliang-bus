@@ -462,6 +462,43 @@ async def test_list_org_repos_user_uses_authenticated_endpoint(canonical_config)
 
 
 @pytest.mark.asyncio
+async def test_list_org_repos_user_includes_collaborator_repos(canonical_config):
+    """A User owner enumerated by a DIFFERENT auth token (collaborator access)
+    must still surface that owner's repos — not be dropped by an owner-only
+    affiliation filter."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/users/owner":
+            return httpx.Response(200, json={"login": "owner", "type": "User"})
+        if path == "/user/repos":
+            # Token is some admin user; the repo is owned by "owner".
+            return httpx.Response(200, json=[
+                {"name": "khonliang-bus", "owner": {"login": "owner"}},
+            ])
+        raise AssertionError(f"unexpected {path}")
+
+    async with _build_client(handler) as client:
+        repos = await wi.list_org_repos(client, "owner")
+    assert repos == ["owner/khonliang-bus"]
+
+
+@pytest.mark.asyncio
+async def test_check_url_reachable_rejects_bad_url_without_posting(monkeypatch):
+    """A non-canonical target must fail shape validation BEFORE any POST."""
+    posted = []
+
+    async def fake_post(self, url, **kwargs):
+        posted.append(url)
+        return httpx.Response(400, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    out = await wi.check_url_reachable("https://host.test/not-the-webhook-path")
+    assert out["reachable"] is False
+    assert "invalid_url" in out["error"]
+    assert posted == []  # never POSTed to the wrong handler
+
+
+@pytest.mark.asyncio
 async def test_list_org_repos_org_uses_orgs_endpoint(canonical_config):
     """An Organization owner must enumerate via /orgs/{owner}/repos."""
     def handler(request: httpx.Request) -> httpx.Response:

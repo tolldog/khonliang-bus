@@ -363,7 +363,11 @@ async def list_org_repos(
     if acct_type == "Organization":
         repos = await _paginate(client, f"/orgs/{owner}/repos", {"type": "all"})
     else:
-        repos = await _paginate(client, "/user/repos", {"affiliation": "owner"})
+        # Default affiliation (owner + collaborator + organization_member) so an
+        # admin/service token that only has COLLABORATOR access to ``owner``'s
+        # private repos still enumerates them — then scope by owner login.
+        # ``affiliation=owner`` would drop everything when owner != auth user.
+        repos = await _paginate(client, "/user/repos")
         repos = [r for r in repos if (r.get("owner") or {}).get("login") == owner]
     return sorted(
         f"{owner}/{r['name']}"
@@ -645,7 +649,15 @@ async def check_url_reachable(
     validation isn't enough, so a mispointed ``target_url`` won't false-positive.
     ``404`` / connection refused / DNS failure / timeout means a wrong URL,
     missing tunnel, or downed bus.
+
+    The target is shape-validated (HTTPS + exact ``/v1/webhooks/github`` path)
+    BEFORE any POST, so a mistyped URL can't fire a request at an unrelated
+    handler — the probe only ever POSTs to a canonical webhook path.
     """
+    try:
+        validate_target_url(target_url)
+    except ValueError as e:
+        return {"reachable": False, "error": f"invalid_url: {e}", "url": target_url}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
