@@ -766,6 +766,71 @@ async def test_check_url_reachable_timeout(monkeypatch):
     assert out["error"] == "timeout"
 
 
+@pytest.mark.asyncio
+async def test_check_url_reachable_400_reachable_and_body_is_not_json(monkeypatch):
+    """The probe must send a NON-JSON body (so the receiver 400s pre-publish in
+    unsigned mode, never publishing a real github.ping), and treat 400 as
+    reachable."""
+    captured: dict[str, Any] = {}
+
+    async def fake_post(self, url, **kwargs):
+        captured.update(kwargs)
+        return httpx.Response(400, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    out = await wi.check_url_reachable(CANONICAL_URL)
+    assert out["reachable"] is True and out["status_code"] == 400
+    # Side-effect-free: no JSON payload, and the raw content isn't valid JSON.
+    assert "json" not in captured
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(captured["content"])
+
+
+# ---------------------------------------------------------------------------
+# HookConfig target-URL validation + same-endpoint URL drift
+# ---------------------------------------------------------------------------
+
+
+def test_hookconfig_validates_target_url_at_construction():
+    # Every mutating path takes a HookConfig, so an invalid URL must fail at
+    # construction, before any GitHub hook is written.
+    with pytest.raises(ValueError, match="/v1/webhooks/github"):
+        wi.HookConfig(target_url="https://host.test/wrong-path", secret="s")
+    with pytest.raises(ValueError, match="HTTPS"):
+        wi.HookConfig(target_url="http://host.test/v1/webhooks/github", secret="s")
+
+
+def test_find_canonical_match_url_drift_same_endpoint(canonical_config):
+    # Same host+path but a drifted query string → DRIFT (PATCH to exact URL),
+    # not MISSING (which would create a duplicate active hook).
+    drifted = _hook(5, url=CANONICAL_URL + "?stale=1")
+    match = wi.find_canonical_match([drifted], canonical_config)
+    assert match.kind == "drift"
+    assert "url" in match.drift_fields
+
+
+@pytest.mark.asyncio
+async def test_install_one_url_drift_patches_not_duplicates(canonical_config):
+    """A same-endpoint hook with a drifted URL must be PATCHed, never create a
+    second active hook (double-delivery)."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json=[_hook(8, url=CANONICAL_URL + "?v=old")])
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"id": 8})
+        raise AssertionError(f"unexpected {request.method}")
+
+    async with _build_client(handler) as client:
+        result = await wi.install_one(client, "o/r", canonical_config)
+
+    assert result["action"] == "repaired"
+    assert "url" in result["drift_fields"]
+    assert "POST" not in calls  # never created a duplicate
+
+
 # ---------------------------------------------------------------------------
 # make_client guard
 # ---------------------------------------------------------------------------

@@ -63,11 +63,21 @@ DEFAULT_EVENTS: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class HookConfig:
-    """The webhook config the installer writes."""
+    """The webhook config the installer writes.
+
+    ``target_url`` is validated at construction (HTTPS, non-empty host, exact
+    ``/v1/webhooks/github`` path) — HookConfig is the sole input to the public
+    install/audit/repair APIs, so validating here means no mutating path can
+    write a hook pointing at an endpoint the bus never serves, without every
+    caller having to remember to call :func:`validate_target_url`.
+    """
 
     target_url: str
     secret: str
     events: tuple[str, ...] = DEFAULT_EVENTS
+
+    def __post_init__(self) -> None:
+        validate_target_url(self.target_url)
 
     def to_create_body(self) -> dict[str, Any]:
         return {
@@ -152,9 +162,22 @@ def find_canonical_match(
     delivers). Two-or-more ACTIVE hooks on the same URL is the real
     double-fire case and is rejected for manual collapse.
     """
+    # Match by (host, path) identity — the SAME basis ``find_orphan_hooks``
+    # uses (it flags same-path / different-host). Matching on the full URL
+    # string instead would classify a same-endpoint hook that differs only by
+    # query string or port as ``missing`` → install_one creates a SECOND active
+    # hook while the original keeps firing (double-delivery). Same host+path is
+    # the canonical hook (PATCH any URL drift to the exact target); different
+    # host is an orphan; different path is unrelated.
+    target = urlparse(config.target_url)
+
+    def _same_endpoint(url: str) -> bool:
+        p = urlparse(url or "")
+        return p.hostname == target.hostname and p.path == target.path
+
     matching = [
         h for h in hooks
-        if (h.get("config") or {}).get("url") == config.target_url
+        if _same_endpoint((h.get("config") or {}).get("url", ""))
     ]
     if not matching:
         return HookMatch(kind="missing")
@@ -174,6 +197,10 @@ def find_canonical_match(
     drift: list[str] = []
     if not h.get("active", False):
         drift.append("active")
+    # Same endpoint but the stored URL isn't byte-identical (query/port drift) —
+    # PATCH rewrites it to the exact canonical URL rather than duplicating.
+    if (cfg.get("url") or "") != config.target_url:
+        drift.append("url")
     if set(h.get("events") or []) != set(config.events):
         drift.append("events")
     if cfg.get("content_type") != "json":
@@ -580,24 +607,30 @@ async def check_url_reachable(
     *,
     timeout: float = 5.0,
 ) -> dict[str, Any]:
-    """Probe the resolved target URL with an unsigned POST.
+    """Probe the resolved target URL — strictly read-only.
 
-    Expected responses from a properly-configured bus:
-      - ``401`` (signature missing — secret loaded, signed POST would 200)
-      - ``200`` (rare — only if signed by accident; sanity-check fallback)
-      - ``503`` (no secret loaded yet — fresh deploy, valid intermediate)
-    Anything else (404, connection refused, DNS failure, 5xx) is
-    diagnostic of a wrong URL, missing tunnel, or downed bus.
+    Sends an INTENTIONALLY INVALID (non-JSON) body so the bus's webhook
+    receiver rejects it BEFORE publishing any event. A valid ping payload
+    would, in ``github_webhook_allow_unsigned`` dev mode, be accepted and
+    published as a real ``github.ping`` bus message (waking subscribers /
+    polluting event history) — so the probe must not look like a real event.
+
+    A bus webhook endpoint rejects the bad body pre-publish in every mode:
+      - ``400`` — unsigned/dev mode: signature accepted, JSON parse fails.
+      - ``401`` — signed mode: signature check fails first.
+      - ``503`` — no secret + unsigned not allowed: rejected outright.
+    Any of those proves the receiver is there. ``404`` / connection refused /
+    DNS failure / timeout means a wrong URL, missing tunnel, or downed bus.
     """
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 target_url,
-                json={"zen": "reachability-probe"},
+                content=b"khonliang-webhook-reachability-probe",  # not JSON
                 headers={"X-GitHub-Event": "ping"},
             )
         return {
-            "reachable": resp.status_code in {200, 401, 503},
+            "reachable": resp.status_code in {200, 400, 401, 503},
             "status_code": resp.status_code,
             "url": target_url,
         }
