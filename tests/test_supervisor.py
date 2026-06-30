@@ -431,6 +431,42 @@ def test_recovery_window_resets_counter(tmp_path, monkeypatch):
     assert "a1" not in bus._supervisor_backoff
 
 
+def test_crash_after_recovery_window_resets_counter(tmp_path, monkeypatch):
+    """An agent that recovers (survives past the recovery window) and only then
+    crashes must start a FRESH restart budget — the reset can't depend on an
+    alive sweep landing in the window."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[1.0], supervisor_max_restarts=3,
+                   supervisor_recovery_window_s=100.0)
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 0.0}
+    bus._now = lambda: clock["t"]
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()                 # restart #1
+    clock["t"] = 2.0
+    _crash(bus, "a1")
+    bus.supervise_once()                 # restart #2
+    assert bus._supervisor_backoff["a1"]["restarts"] == 2
+
+    # Long-lived, then crashes 198s later (> recovery window) BEFORE any alive
+    # sweep observes it. The crash sweep itself must reset the counter.
+    clock["t"] = 200.0
+    _crash(bus, "a1")
+    result = bus.supervise_once()
+    assert "a1" in result["restarted"]
+    assert bus._supervisor_backoff["a1"]["restarts"] == 1  # fresh, not 3
+
+
+def test_scalar_backoff_config_accepted(tmp_path):
+    """A constant backoff (scalar) config must not abort bus startup — the
+    other supervisor_*_s knobs are scalars too."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    bus = BusServer(db, config={"supervisor_backoff_s": 5})
+    assert bus._supervisor_backoff_s == [5.0]
+
+
 def test_restart_failure_keeps_supervising_then_gives_up(tmp_path):
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "broken", command="/no/such/binary/for/supervise")

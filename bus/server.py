@@ -312,6 +312,11 @@ class BusServer:
             self.config.get("supervisor_restart_on_crash", True)
         )
         raw_backoff = self.config.get("supervisor_backoff_s", [1.0, 5.0, 30.0, 300.0])
+        # Accept a scalar (constant backoff) as well as a schedule list — the
+        # other supervisor_*_s knobs are scalars, so a single number is a
+        # plausible config and shouldn't abort bus startup.
+        if isinstance(raw_backoff, (int, float)):
+            raw_backoff = [raw_backoff]
         self._supervisor_backoff_s = [float(x) for x in raw_backoff] or [1.0]
         self._supervisor_max_restarts = max(
             1, int(self.config.get("supervisor_max_restarts", 5))
@@ -479,23 +484,29 @@ class BusServer:
         with self._processes_lock:
             tracked = list(self._processes.items())
         for agent_id, proc in tracked:
+            # Recovery reset (applies whether the agent is currently alive OR has
+            # just crashed): once it has survived the recovery window since its
+            # last supervisor restart, clear the consecutive-restart counter so
+            # the give-up ceiling counts a crash-LOOP, not lifetime crashes. Doing
+            # this before the alive/dead split also resets a long-lived agent that
+            # crashes between the window elapsing and the next alive sweep — its
+            # crash then starts a fresh restart budget instead of inheriting the
+            # old loop's count.
+            st = self._supervisor_backoff.get(agent_id)
+            if st and now - st["last_restart_at"] >= self._supervisor_recovery_window_s:
+                self._supervisor_backoff.pop(agent_id, None)
+                st = None
+                logger.info(
+                    "Supervisor: %s stable %.0fs since last restart; reset backoff counter",
+                    agent_id, self._supervisor_recovery_window_s,
+                )
+
             if proc.poll() is None:
-                # Alive. Once it has survived the recovery window since its last
-                # supervisor restart, clear the consecutive-restart counter so
-                # the give-up ceiling counts a crash-loop, not lifetime crashes.
-                st = self._supervisor_backoff.get(agent_id)
-                if st and now - st["last_restart_at"] >= self._supervisor_recovery_window_s:
-                    self._supervisor_backoff.pop(agent_id, None)
-                    logger.info(
-                        "Supervisor: %s stable %.0fs since last restart; reset backoff counter",
-                        agent_id, self._supervisor_recovery_window_s,
-                    )
                 alive.append(agent_id)
                 continue
 
             exit_code = proc.returncode
             crashed_pid = proc.pid
-            st = self._supervisor_backoff.get(agent_id)
 
             # Still inside the backoff window: leave the dead Popen in place so a
             # later sweep re-sees it. Don't pop, don't restart yet.
