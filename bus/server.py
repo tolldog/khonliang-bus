@@ -308,14 +308,20 @@ class BusServer:
         #       the bus gives up and marks the agent autostart_failed.
         #   supervisor_recovery_window_s — sustained liveness that resets the
         #       consecutive-restart counter.
-        self._supervisor_restart_on_crash = bool(
-            self.config.get("supervisor_restart_on_crash", True)
-        )
+        # Parse explicitly: config may arrive string-valued (quoted YAML /
+        # env-backed), where bool("false") is truthy — so an operator's
+        # "false"/"0" must actually disable restarts, not silently enable them.
+        _rc = self.config.get("supervisor_restart_on_crash", True)
+        if isinstance(_rc, str):
+            self._supervisor_restart_on_crash = _rc.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            self._supervisor_restart_on_crash = bool(_rc)
         raw_backoff = self.config.get("supervisor_backoff_s", [1.0, 5.0, 30.0, 300.0])
         # Accept a scalar (constant backoff) as well as a schedule list — the
         # other supervisor_*_s knobs are scalars, so a single number is a
-        # plausible config and shouldn't abort bus startup.
-        if isinstance(raw_backoff, (int, float)):
+        # plausible config and shouldn't abort startup. A string scalar ("30")
+        # must be one value, not iterated char-by-char into [3.0, 0.0].
+        if isinstance(raw_backoff, (int, float, str)):
             raw_backoff = [raw_backoff]
         self._supervisor_backoff_s = [float(x) for x in raw_backoff] or [1.0]
         self._supervisor_max_restarts = max(

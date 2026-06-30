@@ -462,6 +462,24 @@ def test_scalar_backoff_config_accepted(tmp_path):
     assert bus._supervisor_backoff_s == [5.0]
 
 
+def test_string_scalar_backoff_config(tmp_path):
+    """A string scalar ("30" / "0.5") from quoted-YAML / env config is one
+    value, not iterated char-by-char."""
+    db = BusDB(str(tmp_path / "b.db"))
+    assert BusServer(db, config={"supervisor_backoff_s": "30"})._supervisor_backoff_s == [30.0]
+    db2 = BusDB(str(tmp_path / "b2.db"))
+    assert BusServer(db2, config={"supervisor_backoff_s": "0.5"})._supervisor_backoff_s == [0.5]
+
+
+def test_string_restart_on_crash_false_disables(tmp_path):
+    """supervisor_restart_on_crash="false" must disable restarts — bool("false")
+    would otherwise be truthy."""
+    db = BusDB(str(tmp_path / "b.db"))
+    assert BusServer(db, config={"supervisor_restart_on_crash": "false"})._supervisor_restart_on_crash is False
+    db2 = BusDB(str(tmp_path / "b2.db"))
+    assert BusServer(db2, config={"supervisor_restart_on_crash": "true"})._supervisor_restart_on_crash is True
+
+
 def test_restart_failure_keeps_supervising_then_gives_up(tmp_path):
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "broken", command="/no/such/binary/for/supervise")
