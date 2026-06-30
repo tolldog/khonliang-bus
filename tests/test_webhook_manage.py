@@ -540,14 +540,42 @@ async def test_tool_install_surfaces_403_detail(monkeypatch):
     assert "admin disabled" in out
 
 
+class _FakeResp:
+    def __init__(self, status_code: int, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+class _FakeHTTP:
+    def __init__(self, resp: _FakeResp):
+        self._resp = resp
+
+    async def get(self, url, **kw):
+        return self._resp
+
+
 @pytest.mark.asyncio
 async def test_tool_check_funnel_formats(monkeypatch):
     a = _adapter()
-
-    async def fake_get(path, params=None):
-        return {"reachable": True, "status_code": 400, "url": CANONICAL_URL}
-
-    a._async_get = fake_get
+    a._async_http = _FakeHTTP(
+        _FakeResp(200, {"reachable": True, "status_code": 400, "url": CANONICAL_URL})
+    )
     out = await _call(a, "bus_webhook_check_funnel", {})
     assert "reachable=True" in out
     assert "status=400" in out
+
+
+@pytest.mark.asyncio
+async def test_tool_check_funnel_surfaces_config_error(monkeypatch):
+    # A 400 config error from the route must reach the user as the actual
+    # detail, not a generic "bus unreachable".
+    a = _adapter()
+    a._async_http = _FakeHTTP(
+        _FakeResp(400, {"detail": "github_webhook_public_url is unset"})
+    )
+    out = await _call(a, "bus_webhook_check_funnel", {})
+    assert "public_url is unset" in out
+    assert "unreachable" not in out

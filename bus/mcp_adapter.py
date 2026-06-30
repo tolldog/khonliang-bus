@@ -929,10 +929,25 @@ class BusMCPAdapter:
             down bus. Closes the URL-reachability gap (bug_khonliang-bus_20dda1cd
             / _1064a609).
             """
-            resp = await adapter._async_get("/v1/webhooks/manage/check_funnel")
-            # _async_get raises_for_status → None on the 400 "url unset" path.
-            if resp is None:
-                return "check_funnel: failed (github_webhook_public_url unset or bus unreachable)"
+            # Read the body regardless of status: the route returns an
+            # intentional 400 {"detail": ...} for a config error (unset /
+            # invalid github_webhook_public_url). adapter._async_get raises on
+            # 4xx → None, which would mislabel that as "bus unreachable", so go
+            # through the raw client here to preserve the diagnostic.
+            try:
+                r = await adapter._async_http.get(
+                    f"{adapter.bus_url}/v1/webhooks/manage/check_funnel"
+                )
+            except Exception as e:
+                return f"check_funnel: failed — bus unreachable ({e})"
+            try:
+                resp = r.json()
+            except Exception:
+                return f"check_funnel: failed — HTTP {r.status_code} (non-JSON body)"
+            if not isinstance(resp, dict):
+                return f"check_funnel: unexpected response {resp!r}"
+            if resp.get("detail"):
+                return f"check_funnel: {resp['detail']}"
             line = f"check_funnel {resp.get('url', '?')}: reachable={resp.get('reachable')}"
             if resp.get("status_code") is not None:
                 line += f" status={resp['status_code']}"
