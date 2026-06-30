@@ -21,10 +21,11 @@ Design notes:
   historical hook + one active canonical hook is NOT flagged
   (only the active hook delivers, no double-fire). Two-or-more
   ACTIVE hooks on the same URL is the duplicate-error case.
-- Drift covers the fields the script writes: ``events`` set,
-  ``active=True``, ``content_type=json``, ``insecure_ssl="0"``,
-  and the secret-presence bit (GitHub redacts the value in
-  responses, so we check whether SOME secret is set, not which).
+- Drift covers the readable fields the script writes: ``events`` set,
+  ``active=True``, ``content_type=json``, ``insecure_ssl="0"``, and the
+  URL string. The secret is NOT a drift signal — GitHub's GET response
+  doesn't return a usable ``config.secret`` (write-only/redacted), so it
+  can't be read back; ``repair_one`` force-PATCHes for secret rotation.
 - The orphan-detection (active hook on a NON-canonical host but
   the canonical ``/v1/webhooks/github`` path — left over from a
   Funnel hostname migration) is part of audit; install treats them
@@ -207,9 +208,12 @@ def find_canonical_match(
         drift.append("content_type")
     if cfg.get("insecure_ssl") != "0":
         drift.append("insecure_ssl")
-    # GitHub redacts the secret value but exposes a presence bit.
-    if not cfg.get("secret"):
-        drift.append("secret_missing")
+    # NOTE: secret presence is intentionally NOT a drift signal. GitHub's
+    # GET /hooks response does not return a usable ``config.secret`` (it's
+    # write-only / redacted), so treating a missing/redacted value as drift
+    # would flag EVERY real hook forever and PATCH it on every run. Secret
+    # rotation can't be detected from a read — that's exactly what
+    # ``repair_one`` (force-PATCH) exists for.
 
     if drift:
         return HookMatch(
@@ -602,6 +606,22 @@ async def repair_one(
     }
 
 
+def _looks_like_bus_rejection(resp: httpx.Response) -> bool:
+    """True iff ``resp`` is a bus webhook-receiver rejection.
+
+    Requires one of the pre-publish rejection statuses AND the bus's JSON
+    ``{"error": <str>}`` body, so an unrelated endpoint that merely returns
+    400/401/503 for an arbitrary POST doesn't read as reachable.
+    """
+    if resp.status_code not in {400, 401, 503}:
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and isinstance(body.get("error"), str)
+
+
 async def check_url_reachable(
     target_url: str,
     *,
@@ -615,12 +635,16 @@ async def check_url_reachable(
     published as a real ``github.ping`` bus message (waking subscribers /
     polluting event history) — so the probe must not look like a real event.
 
-    A bus webhook endpoint rejects the bad body pre-publish in every mode:
+    A bus webhook endpoint rejects the bad body pre-publish in every mode,
+    each with a JSON ``{"error": ...}`` body:
       - ``400`` — unsigned/dev mode: signature accepted, JSON parse fails.
       - ``401`` — signed mode: signature check fails first.
       - ``503`` — no secret + unsigned not allowed: rejected outright.
-    Any of those proves the receiver is there. ``404`` / connection refused /
-    DNS failure / timeout means a wrong URL, missing tunnel, or downed bus.
+    ``reachable`` requires BOTH a rejection status AND the bus's JSON error
+    shape — a bare 400/401/503 from some unrelated app behind auth or input
+    validation isn't enough, so a mispointed ``target_url`` won't false-positive.
+    ``404`` / connection refused / DNS failure / timeout means a wrong URL,
+    missing tunnel, or downed bus.
     """
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -630,7 +654,7 @@ async def check_url_reachable(
                 headers={"X-GitHub-Event": "ping"},
             )
         return {
-            "reachable": resp.status_code in {200, 400, 401, 503},
+            "reachable": _looks_like_bus_rejection(resp),
             "status_code": resp.status_code,
             "url": target_url,
         }

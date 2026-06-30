@@ -136,11 +136,14 @@ def test_find_canonical_match_drift_inactive(canonical_config):
     assert "active" in match.drift_fields
 
 
-def test_find_canonical_match_drift_secret_missing(canonical_config):
+def test_find_canonical_match_redacted_secret_is_not_drift(canonical_config):
+    # GitHub's GET /hooks doesn't return a usable config.secret, so an
+    # otherwise-canonical hook with no readable secret must be 'ok' — NOT
+    # perpetual drift that re-PATCHes every run.
     hooks = [_hook(1, secret_present=False)]
     match = wi.find_canonical_match(hooks, canonical_config)
-    assert match.kind == "drift"
-    assert "secret_missing" in match.drift_fields
+    assert match.kind == "ok"
+    assert "secret_missing" not in match.drift_fields
 
 
 def test_find_canonical_match_drift_content_type(canonical_config):
@@ -707,7 +710,7 @@ async def test_check_url_reachable_401_is_reachable(monkeypatch):
     response. ``reachable`` must be True."""
 
     async def fake_post(self, url, **kwargs):
-        return httpx.Response(401, request=httpx.Request("POST", url))
+        return httpx.Response(401, json={"error": "invalid signature"}, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
     out = await wi.check_url_reachable(CANONICAL_URL)
@@ -721,7 +724,7 @@ async def test_check_url_reachable_503_is_reachable(monkeypatch):
     Still reachable for the purposes of "is the URL right"."""
 
     async def fake_post(self, url, **kwargs):
-        return httpx.Response(503, request=httpx.Request("POST", url))
+        return httpx.Response(503, json={"error": "webhook receiver not configured"}, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
     out = await wi.check_url_reachable(CANONICAL_URL)
@@ -775,7 +778,7 @@ async def test_check_url_reachable_400_reachable_and_body_is_not_json(monkeypatc
 
     async def fake_post(self, url, **kwargs):
         captured.update(kwargs)
-        return httpx.Response(400, request=httpx.Request("POST", url))
+        return httpx.Response(400, json={"error": "invalid JSON: x"}, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
     out = await wi.check_url_reachable(CANONICAL_URL)
