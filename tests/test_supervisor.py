@@ -488,6 +488,67 @@ def test_manual_start_clears_give_up_state(tmp_path, monkeypatch):
     assert "a1" not in bus._supervisor_backoff
 
 
+def test_manual_start_failure_keeps_failed_state(tmp_path):
+    """A failed manual retry must NOT clear the failure surface — that would
+    hide a still-down agent from /v1/services and reset its restart budget."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus(db)
+    # Simulate a prior supervisor give-up.
+    bus._autostart_failures["broken"] = "supervisor gave up after 5 consecutive restarts"
+
+    result = bus.start_agent("broken")  # _start_process fails (bad binary)
+
+    assert "error" in result
+    assert "broken" in bus._autostart_failures  # outage still visible
+
+
+def test_manual_start_success_clears_failed_state(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus(db)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._autostart_failures["a1"] = "supervisor gave up after 5 consecutive restarts"
+    bus._supervisor_backoff["a1"] = {"restarts": 5, "next_attempt_at": 0.0, "last_restart_at": 0.0}
+
+    result = bus.start_agent("a1")
+
+    assert result["status"] == "started"
+    assert "a1" not in bus._autostart_failures
+    assert "a1" not in bus._supervisor_backoff
+
+
+def test_uninstall_clears_phantom_autostart_failed(tmp_path, monkeypatch):
+    """A supervisor give-up writes _autostart_failures; uninstalling the agent
+    must drop it from /v1/services (no phantom service)."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()
+    _crash(bus, "a1")
+    bus.supervise_once()  # give up
+    assert any(s["id"] == "a1" for s in bus.get_services())
+
+    bus.uninstall_agent("a1")
+
+    assert "a1" not in bus._autostart_failures
+    assert not any(s["id"] == "a1" for s in bus.get_services())
+
+
+def test_get_services_skips_uninstalled_failure_entry(tmp_path):
+    """Read-time guard: even a leftover _autostart_failures entry for an agent
+    that's no longer installed is not surfaced."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    bus = _bus(db)
+    bus._autostart_failures["ghost"] = "supervisor gave up"  # never installed
+
+    assert not any(s["id"] == "ghost" for s in bus.get_services())
+
+
 def test_stop_clears_backoff_state(tmp_path, monkeypatch):
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")

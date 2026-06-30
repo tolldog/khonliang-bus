@@ -910,6 +910,9 @@ class BusServer:
 
     def uninstall_agent(self, agent_id: str) -> dict:
         self._stop_process(agent_id)
+        # Drop any recorded autostart/supervisor-give-up failure so an
+        # uninstalled agent doesn't linger on the autostart_failed surface.
+        self._autostart_failures.pop(agent_id, None)
         if self.db.uninstall_agent(agent_id):
             self.db.deregister_agent(agent_id)
             logger.info("Uninstalled agent %s", agent_id)
@@ -933,13 +936,16 @@ class BusServer:
         # restart_agent (stop + start).
         if reg and self._derive_live_status(reg) != "dead":
             return {"id": agent_id, "status": "already_running"}
-        # Manual (re)start clears any supervisor give-up / backoff state so a
-        # recovered agent is supervised fresh and drops off the autostart_failed
-        # surface. The supervisor restarts via _start_process directly (never
+        result = self._start_process(installed)
+        # Only clear supervisor give-up / backoff state once the manual start
+        # ACTUALLY succeeded — clearing before would hide a still-down agent
+        # from /v1/services and reset its restart budget if the retry also
+        # fails. The supervisor restarts via _start_process directly (never
         # through start_agent), so this never clears state mid-backoff.
-        self._supervisor_backoff.pop(agent_id, None)
-        self._autostart_failures.pop(agent_id, None)
-        return self._start_process(installed)
+        if result.get("status") == "started":
+            self._supervisor_backoff.pop(agent_id, None)
+            self._autostart_failures.pop(agent_id, None)
+        return result
 
     def stop_agent(self, agent_id: str) -> dict:
         self._stop_process(agent_id)
@@ -1673,6 +1679,11 @@ class BusServer:
             if agent_id in registered_ids:
                 continue
             installed = self.db.get_installed_agent(agent_id)
+            if installed is None:
+                # Agent was uninstalled after the failure was recorded (e.g. a
+                # supervisor give-up followed by uninstall). Don't surface a
+                # phantom service for something no longer installed.
+                continue
             result.append({
                 "id": agent_id,
                 "agent_type": (installed or {}).get("agent_type", "unknown"),
