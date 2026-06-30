@@ -2859,6 +2859,26 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             )
         return resolved
 
+    def _require_fleet_prefix(body: dict) -> str:
+        """Resolve a fleet ``prefix``, refusing the empty string.
+
+        ``list_org_repos`` matches by ``name.startswith(prefix)``, so ``""``
+        would match EVERY repo under the owner — turning an intended
+        ``khonliang-*`` rollout into an account-wide hook create/repair. Force
+        an explicit non-empty prefix.
+        """
+        prefix = _str_field(body, "prefix", default="khonliang-")
+        if not prefix:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "'prefix' must be non-empty — it matches repos by "
+                    "startswith, so an empty prefix would match every repo "
+                    "under the owner"
+                ),
+            )
+        return prefix
+
     async def _run_webhook_op(coro):
         """Await a primitive coroutine, mapping its failure modes to HTTP.
 
@@ -2943,7 +2963,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     async def webhook_manage_install_fleet(request: Request):
         body = await _require_object_body(request)
         dry_run = _bool_field(body, "dry_run")
-        prefix = _str_field(body, "prefix", default="khonliang-")
+        prefix = _require_fleet_prefix(body)
         token, hook_config = _resolve_webhook_context(require_deliverable=not dry_run)
         owner = _resolve_webhook_owner(_str_field(body, "owner"))
         async with webhook_install.make_client(token) as client:
@@ -2967,7 +2987,7 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
     @app.post("/v1/webhooks/manage/audit_fleet")
     async def webhook_manage_audit_fleet(request: Request):
         body = await _require_object_body(request)
-        prefix = _str_field(body, "prefix", default="khonliang-")
+        prefix = _require_fleet_prefix(body)
         token, hook_config = _resolve_webhook_context()
         owner = _resolve_webhook_owner(_str_field(body, "owner"))
         async with webhook_install.make_client(token) as client:
@@ -2998,6 +3018,15 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             raise HTTPException(
                 status_code=400,
                 detail="github_webhook_public_url is unset",
+            )
+        # A bad URL *shape* is a local config error, not a reachability result:
+        # reject it with 400 (like the other routes) so a client's
+        # raise_for_status() doesn't misread a misconfig as "bus unreachable".
+        try:
+            webhook_install.validate_target_url(public_url)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"github_webhook_public_url invalid: {e}"
             )
         return await webhook_install.check_url_reachable(public_url)
 

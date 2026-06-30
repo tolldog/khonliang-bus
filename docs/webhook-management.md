@@ -70,7 +70,13 @@ thin formatters over the routes above.
   `github_webhook_allow_unsigned` is false — otherwise it would install a hook
   the receiver `503`s on every delivery. Read-only audits and dry-runs are
   exempt so they still work for diagnosis.
-- **Malformed / non-object** request bodies get a `400`, not a `500`.
+- **Malformed / non-object** request bodies, wrong-typed fields (non-boolean
+  `dry_run`, non-string `owner`/`prefix`/`repo`), and an **empty fleet
+  `prefix`** (which would match every repo under the owner) all get a `400`,
+  not a `500` or a silent account-wide rollout.
+- **`check_funnel`** returns `400` for an unset/invalid-shape
+  `github_webhook_public_url` (a config error), reserving its `200` body for a
+  genuine reachability result.
 
 ## Not yet shipped (follow-up)
 

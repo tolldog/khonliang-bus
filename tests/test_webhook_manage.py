@@ -226,6 +226,24 @@ def test_install_fleet_empty_is_400(monkeypatch, tmp_path):
     assert "no repos" in r.json()["detail"]
 
 
+def test_install_fleet_empty_prefix_returns_400(monkeypatch, tmp_path):
+    # Empty prefix would match EVERY repo (startswith "") → account-wide
+    # mutation. Must be refused.
+    handler = _fleet_handler(["owner/khonliang-bus"])
+    client = _make_client(monkeypatch, tmp_path, handler)
+    r = client.post("/v1/webhooks/manage/install_fleet", json={"prefix": ""})
+    assert r.status_code == 400
+    assert "non-empty" in r.json()["detail"]
+
+
+def test_audit_fleet_empty_prefix_returns_400(monkeypatch, tmp_path):
+    handler = _fleet_handler(["owner/khonliang-bus"])
+    client = _make_client(monkeypatch, tmp_path, handler)
+    r = client.post("/v1/webhooks/manage/audit_fleet", json={"prefix": ""})
+    assert r.status_code == 400
+    assert "non-empty" in r.json()["detail"]
+
+
 def test_fleet_requires_owner(monkeypatch, tmp_path):
     handler = _fleet_handler(["owner/khonliang-bus"])
     client = _make_client(monkeypatch, tmp_path, handler, github_owner="")
@@ -433,6 +451,17 @@ def test_check_funnel_unset_url_returns_400(monkeypatch, tmp_path):
     )
     r = client.get("/v1/webhooks/manage/check_funnel")
     assert r.status_code == 400
+
+
+def test_check_funnel_invalid_url_shape_returns_400(monkeypatch, tmp_path):
+    # A bad URL shape is a config error → 400, not a 200 reachability result.
+    client = _make_client(
+        monkeypatch, tmp_path, handler=None,
+        github_webhook_public_url="http://example.test/v1/webhooks/github",
+    )
+    r = client.get("/v1/webhooks/manage/check_funnel")
+    assert r.status_code == 400
+    assert "invalid" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
