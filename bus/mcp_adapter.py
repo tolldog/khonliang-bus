@@ -1805,6 +1805,7 @@ class BusMCPAdapter:
             budget=budget,
             artifact=artifact,
             content_type=content_type,
+            value=result,  # keep structured results structured (no line-fragmenting)
         )
         return dumps_envelope(envelope)
 
