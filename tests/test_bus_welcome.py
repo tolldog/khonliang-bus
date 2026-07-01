@@ -25,9 +25,10 @@ from bus.server import BusServer
 def test_bus_welcome_shape_includes_platform(bus):
     w = bus.get_bus_welcome()
     assert w["platform"]["name"] == "khonliang"
-    # The top-level ``bus`` self-entry (fr_khonliang-bus_6638f4dc) is additive,
-    # so the schema version stays at 1 (clients ignore unknown keys).
-    assert w["platform"]["schema_version"] == 1
+    # v2: agents[].state gained the 'lazy_eligible' enum value
+    # (fr_khonliang-bus_c81f7ab5) — a new enum value bumps the schema (a new
+    # additive field like ``bus`` did not).
+    assert w["platform"]["schema_version"] == 2
     # uptime is non-negative int.
     assert isinstance(w["platform"]["bus_uptime_s"], int)
     assert w["platform"]["bus_uptime_s"] >= 0

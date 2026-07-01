@@ -380,6 +380,7 @@ class BusMCPAdapter:
                     "cataloged_dead": "○",
                     "autostart_failed": "✗",
                     "deregistered": "·",
+                    "lazy_eligible": "z",  # dormant; launches on first skill call
                 }.get(a.get("state"), "?")
                 line = (
                     f"  {state_mark} {a['agent_id']} "
