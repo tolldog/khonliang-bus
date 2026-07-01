@@ -1207,6 +1207,31 @@ class BusServer:
             return matches[0] if len(matches) == 1 else None
         return None
 
+    def _is_lazy_agent_down(self, agent_id: str, reg: dict | None) -> bool:
+        """True if a lazy-eligible agent should be (re)launched on this call.
+
+        pid-derived liveness is NOT sufficient here: a lazy agent registers over
+        WebSocket with pid=0 (``handle_agent_ws`` default), which
+        _derive_live_status can never mark 'dead', so after it exits the stale
+        row would suppress relaunch (codex). For a bus-MANAGED agent the ground
+        truth for "up right now" is an active WS connection OR a live spawned
+        process — check those directly for the pid-less case.
+        """
+        if reg is None:
+            return True
+        if self._derive_live_status(reg) == "dead":
+            return True
+        pid = reg.get("pid")
+        if pid and int(pid) > 0:
+            return False  # real local pid, not derived-dead → up
+        # pid-less (WS / remote-shape) registration: only up if a live peer or a
+        # live bus-spawned process backs it.
+        if self.is_agent_ws_connected(agent_id):
+            return False
+        with self._processes_lock:
+            proc = self._processes.get(agent_id)
+        return not (proc is not None and proc.poll() is None)
+
     async def _lazy_launch(self, agent_id: str) -> dict:
         """Launch a dead lazy-eligible agent and wait for it to register.
 
@@ -1379,7 +1404,7 @@ class BusServer:
         # where os.kill(pid,0) is reliable — so it can also re-launch an agent
         # whose row lingered after a crash. Non-lazy routing is unchanged.
         lazy_id = self._resolve_lazy_target(req)
-        if lazy_id and (reg is None or self._derive_live_status(reg) == "dead"):
+        if lazy_id and self._is_lazy_agent_down(lazy_id, reg):
             launched = await self._lazy_launch(lazy_id)
             if launched.get("error"):
                 return {**launched, "trace_id": trace_id}

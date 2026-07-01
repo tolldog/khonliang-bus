@@ -113,6 +113,26 @@ def test_resolve_lazy_target_by_type_ambiguous_is_none(tmp_path):
     assert bus._resolve_lazy_target(RequestMessage(agent_type="reviewer", operation="x")) is None
 
 
+def test_is_lazy_agent_down_matrix(tmp_path, monkeypatch):
+    import bus.server as srv
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+
+    assert bus._is_lazy_agent_down("a", None) is True  # no reg
+
+    monkeypatch.setattr(srv, "_pid_alive", lambda pid: False)
+    assert bus._is_lazy_agent_down("a", {"pid": 4242, "status": "healthy"}) is True  # dead pid
+    monkeypatch.setattr(srv, "_pid_alive", lambda pid: True)
+    assert bus._is_lazy_agent_down("a", {"pid": 4242, "status": "healthy"}) is False  # live pid
+
+    # pid=0 (WS shape): liveness = WS-connected OR live spawned process.
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: True)
+    assert bus._is_lazy_agent_down("a", {"pid": 0, "status": "healthy"}) is False  # WS live
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
+    assert bus._is_lazy_agent_down("a", {"pid": 0, "status": "healthy"}) is True   # WS gone, no proc → relaunch
+    bus._processes["a"] = _FakePopen(alive=True)
+    assert bus._is_lazy_agent_down("a", {"pid": 0, "status": "healthy"}) is False  # live spawned process
+
+
 # ---------------------------------------------------------------------------
 # AC#2/#3 — launch + wait + timeout
 # ---------------------------------------------------------------------------
