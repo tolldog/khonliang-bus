@@ -486,6 +486,42 @@ async def test_agent_type_relaunches_stale_self_registration(tmp_path, monkeypat
     assert launched == ["a"]  # stale self-reg → relaunch, not dispatch-to-dead
 
 
+async def test_explicit_stop_suppresses_lazy_relaunch(tmp_path, monkeypatch):
+    """stop_agent on a lazy agent honors 'stay down' — the next skill call does
+    NOT cold-start it; a manual start (or re-register) clears the suppression."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+
+    launched: list[str] = []
+
+    async def _fake_lazy(agent_id):
+        launched.append(agent_id)
+        return {}
+    monkeypatch.setattr(bus, "_lazy_launch", _fake_lazy)
+
+    bus.stop_agent("a")  # explicit operator stop
+    assert "a" in bus._lazy_suppressed
+
+    result = await bus.handle_request(RequestMessage(agent_id="a", operation="x"))
+    assert launched == []                        # not re-woken
+    assert "no healthy agent" in result["error"]
+
+    # A fresh registration clears suppression → future cold calls relaunch again.
+    bus._drop_autostart_failure("a")
+    assert "a" not in bus._lazy_suppressed
+
+
+def test_bus_welcome_suppressed_lazy_not_shown_eligible(tmp_path):
+    """A stopped lazy agent shows cataloged_dead, not lazy_eligible (it won't
+    auto-wake)."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    bus._lazy_suppressed.add("a")
+
+    entry = next(e for e in bus.get_bus_welcome()["agents"] if e["agent_id"] == "a")
+    assert entry["state"] == "cataloged_dead"
+
+
 async def test_handle_request_no_lazy_for_non_lazy_agent(tmp_path, monkeypatch):
     bus = _bus(tmp_path)  # nothing lazy
     launched: list[str] = []

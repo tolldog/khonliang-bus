@@ -387,6 +387,11 @@ class BusServer:
         # In-flight lazy launches: agent_id -> asyncio.Task, so concurrent callers
         # for the same dead agent share ONE launch instead of racing to spawn.
         self._lazy_launches: dict[str, asyncio.Task] = {}
+        # Lazy agents an operator explicitly stopped: suppressed from cold-start
+        # relaunch until a manual start or a fresh registration, so stop_agent's
+        # "intentionally down" contract holds for lazy agents too (else the next
+        # skill call would immediately re-wake a maintenance-stopped worker).
+        self._lazy_suppressed: set[str] = set()
         self.flow_engine = FlowEngine(db, self._http)
         self.artifacts = ArtifactStore(db)
         self.orchestrator = Orchestrator(
@@ -563,6 +568,9 @@ class BusServer:
         action (``start_agent`` on spawn success / ``_stop_process`` on stop).
         """
         self._autostart_failures.pop(agent_id, None)
+        # A fresh registration means the agent is up — clear any lazy-stop
+        # suppression so future cold calls can relaunch it again.
+        self._lazy_suppressed.discard(agent_id)
 
 
     def supervise_once(self) -> dict:
@@ -1149,6 +1157,7 @@ class BusServer:
         # (``_drop_autostart_failure`` on the register path clears it then).
         if result.get("status") == "started":
             self._supervisor_backoff.pop(agent_id, None)
+            self._lazy_suppressed.discard(agent_id)  # explicit start un-suppresses lazy
         elif result.get("error"):
             # The manual (re)start failed to SPAWN. restart_agent's _stop_process
             # already removed the dead Popen + backoff state, so without this the
@@ -1167,6 +1176,10 @@ class BusServer:
         # failed restart has to keep the outage visible; the failure is cleared
         # only when the replacement actually registers).
         self._autostart_failures.pop(agent_id, None)
+        # Explicit stop of a lazy agent = keep it down: suppress cold-start
+        # relaunch until a manual start / re-register (fr_khonliang-bus_c81f7ab5).
+        if agent_id in self._lazy_config:
+            self._lazy_suppressed.add(agent_id)
         self.db.deregister_agent(agent_id)
         return {"id": agent_id, "status": "stopped"}
 
@@ -1423,6 +1436,8 @@ class BusServer:
         # where os.kill(pid,0) is reliable — so it can also re-launch an agent
         # whose row lingered after a crash. Non-lazy routing is unchanged.
         lazy_id = self._resolve_lazy_target(req)
+        if lazy_id and lazy_id in self._lazy_suppressed:
+            lazy_id = None  # explicitly stopped — honor "stay down", don't re-wake
         if lazy_id:
             # Decide on the LAZY AGENT'S OWN registration (its source of truth),
             # not the type-resolved ``reg``. Launch (or JOIN an in-flight launch)
@@ -2389,9 +2404,12 @@ class BusServer:
             # next skill call. Surface it as ``lazy_eligible`` so callers know the
             # skills are available on demand (fr_khonliang-bus_c81f7ab5 AC#5). A
             # LIVE lazy agent keeps its runtime status.
-            if inst and agent_id in self._lazy_config and state in {
-                "cataloged_dead", "dead", "deregistered"
-            }:
+            if (
+                inst
+                and agent_id in self._lazy_config
+                and agent_id not in self._lazy_suppressed  # explicitly stopped → stays down
+                and state in {"cataloged_dead", "dead", "deregistered"}
+            ):
                 state = "lazy_eligible"
 
             entry: dict = {
