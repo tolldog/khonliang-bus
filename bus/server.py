@@ -647,14 +647,30 @@ class BusServer:
                 logger.error("Supervisor: %s — %s; marking autostart_failed", agent_id, reason)
                 continue
 
-            # At the actual restart instant (window elapsed), clear our crashed
-            # instance's stale row so the freshly-spawned process re-registers
-            # cleanly. During the preceding backoff window the row is left in
-            # place for observability (get_services/diagnose show the outage);
-            # this only removes it for the brief gap until re-registration —
-            # matching v1's crash→restart behaviour. ``reg`` was re-checked by the
-            # replacement guard above, so this only ever drops our own dead row.
-            if reg is not None:
+            # At the actual restart instant (window elapsed), re-validate for a
+            # replacement (same TOCTOU the give-up path guards): one could have
+            # registered between the ws/pid guard above and here on another
+            # threadpool thread. If so, abort — don't deregister it or spawn a
+            # duplicate; stop tracking our dead Popen and treat as alive.
+            reg_now = self.db.get_registration(agent_id)
+            if self.is_agent_ws_connected(agent_id) or (
+                reg_now is not None
+                and reg_now.get("pid")
+                and int(reg_now["pid"]) != crashed_pid
+            ):
+                with self._processes_lock:
+                    if self._processes.get(agent_id) is proc:
+                        self._processes.pop(agent_id, None)
+                self._supervisor_backoff.pop(agent_id, None)
+                alive.append(agent_id)
+                continue
+            # No replacement: clear our crashed instance's stale row so the
+            # freshly-spawned process re-registers cleanly. During the preceding
+            # backoff window the row is left in place for observability
+            # (get_services/diagnose show the outage); this only removes it for
+            # the brief gap until re-registration — matching v1's crash→restart
+            # behaviour.
+            if reg_now is not None:
                 self.db.deregister_agent(agent_id)
             result = self._start_process(installed)  # overwrites _processes[id] on success
             backoff_s = self._supervisor_backoff_s[

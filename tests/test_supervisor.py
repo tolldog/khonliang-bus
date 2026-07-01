@@ -549,6 +549,42 @@ def test_replacement_during_backoff_stops_tracking_dead_popen(tmp_path):
     assert db.get_registration("a1") is not None  # replacement not wiped
 
 
+def test_restart_revalidates_before_wiping_replacement(tmp_path, monkeypatch):
+    """Same TOCTOU guard as give-up, on the restart path: a replacement that goes
+    live between the ws/pid guard and the restart's deregister must abort the
+    restart — not wipe the replacement or spawn a duplicate."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    started: list[str] = []
+
+    def _fake_start(installed):
+        started.append(installed["id"])
+        return {"id": installed["id"], "pid": 1, "status": "started"}
+
+    monkeypatch.setattr(bus, "_start_process", _fake_start)
+    bus._now = lambda: 10.0
+
+    bus._processes["a1"] = _FakePopen(pid=4242, alive=False, returncode=1)
+    # Backoff window already elapsed → eligible to restart this sweep.
+    bus._supervisor_backoff["a1"] = {"restarts": 1, "next_attempt_at": 0.0, "last_restart_at": 0.0}
+
+    ws_calls = {"n": 0}
+
+    def _staged_ws(agent_id):
+        ws_calls["n"] += 1
+        return ws_calls["n"] >= 2  # False at the guard, True at the restart revalidation
+
+    monkeypatch.setattr(bus, "is_agent_ws_connected", _staged_ws)
+
+    result = bus.supervise_once()
+
+    assert started == []                 # restart aborted (no duplicate spawned)
+    assert result["restarted"] == []
+    assert "a1" in result["alive"]
+    assert "a1" not in bus._processes     # dead Popen dropped
+
+
 def test_restart_on_crash_false_disables_restart(tmp_path, monkeypatch):
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
