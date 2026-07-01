@@ -8,6 +8,7 @@ handling, the once-guarded dual-bind lifespan, and a real UDS bind→connect E2E
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 
 import httpx
@@ -260,6 +261,10 @@ async def test_run_dual_bind_both_up_serves_until_exit():
         b.should_exit = True
 
     await asyncio.gather(busmain._run_dual_bind([a, b], None, None), _stop_soon())
+    # Per-server signal capture disabled (one combined handler stops both, so a
+    # signal can't shut down only one listener and hang gather()).
+    assert a.capture_signals is contextlib.nullcontext
+    assert b.capture_signals is contextlib.nullcontext
 
 
 # ---------------------------------------------------------------------------

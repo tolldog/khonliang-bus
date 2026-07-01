@@ -7,8 +7,10 @@ TCP listener (remote / transition), serving the same bus. See
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 import socket
 import stat
 import sys
@@ -119,6 +121,26 @@ async def _run_dual_bind(servers, uds_server, uds_path: Path | None) -> None:
     a silent degradation that breaks the discovery contract. Instead: wait for
     every listener to come up, and if one exits before all are started, tear the
     rest down and fail startup."""
+    # Each uvicorn server captures process-wide SIGINT/SIGTERM (flipping only its
+    # OWN should_exit); with two servers the last-registered handler wins, so a
+    # signal would stop just one listener and gather() would hang. Disable
+    # per-server capture and install ONE handler that stops them all.
+    for s in servers:
+        s.capture_signals = contextlib.nullcontext
+    loop = asyncio.get_running_loop()
+
+    def _stop_all() -> None:
+        for s in servers:
+            s.should_exit = True
+
+    installed_sigs = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop_all)
+            installed_sigs.append(sig)
+        except (NotImplementedError, ValueError, RuntimeError):  # pragma: no cover
+            pass  # non-Unix loop / not main thread — best effort
+
     tasks = [asyncio.create_task(s.serve()) for s in servers]
     try:
         while not all(s.started for s in servers):
@@ -127,6 +149,9 @@ async def _run_dual_bind(servers, uds_server, uds_path: Path | None) -> None:
             await asyncio.sleep(0.05)
         await asyncio.gather(*tasks)  # all up — run until they stop
     finally:
+        for sig in installed_sigs:
+            with contextlib.suppress(ValueError, NotImplementedError):
+                loop.remove_signal_handler(sig)
         for s in servers:
             s.should_exit = True
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -195,8 +220,11 @@ def main():
     )
 
     tcp = _resolve_tcp(args)
+    # Absolutize a custom --uds: bus_url (unix://<path>) is forwarded to spawned
+    # agents launched under their OWN cwd, so a relative path would resolve to a
+    # different socket than the bus bound.
     uds_path: Path | None = None if args.no_uds else (
-        Path(args.uds).expanduser() if args.uds else DEFAULT_SOCK_PATH
+        Path(args.uds).expanduser().resolve() if args.uds else DEFAULT_SOCK_PATH
     )
 
     if uds_path is not None:
