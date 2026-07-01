@@ -1149,17 +1149,14 @@ class BusServer:
         if not reg:
             return {"error": f"no healthy agent found for {req.agent_id or req.agent_type}", "trace_id": trace_id}
 
-        # Don't route to an agent whose process is confirmed gone. A crashed
-        # bus-spawned agent's registration row lingers during supervisor backoff
-        # (kept for observability), and the direct agent_id path above bypasses
-        # the healthy-only filter that type resolution uses — so gate on derived
-        # liveness. Only a registered LOCAL pid that os.kill(pid, 0) can't find
-        # (or a negative pid) reads 'dead'; WS/remote agents register pid=0 and
-        # fall through to the heartbeat signal, so this never blocks a live
-        # remote agent (a stale-heartbeat one reads 'stale', not 'dead').
-        if self._derive_live_status(reg) == "dead":
-            return {"error": f"no healthy agent found for {req.agent_id or req.agent_type} (agent process is down)", "trace_id": trace_id}
-
+        # NB: direct agent_id resolution intentionally does NOT gate on
+        # _derive_live_status. That check is os.kill(pid, 0) on the LOCAL pid
+        # namespace, which is only meaningful for bus-spawned agents — a remote
+        # agent that registers a positive pid from another host/container would
+        # be false-flagged 'dead' and become unreachable. So a crashed
+        # bus-spawned agent that is still registered during supervisor backoff
+        # gets a failed dispatch against its (dead) callback rather than a clean
+        # no-healthy; type-based routing still excludes it via reconcile_liveness.
         agent_id = reg["id"]
 
         # Record trace (include args for push-back replay)
