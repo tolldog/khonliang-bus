@@ -323,7 +323,17 @@ class BusServer:
         # must be one value, not iterated char-by-char into [3.0, 0.0].
         if isinstance(raw_backoff, (int, float, str)):
             raw_backoff = [raw_backoff]
-        self._supervisor_backoff_s = [float(x) for x in raw_backoff] or [1.0]
+
+        def _san_backoff(x) -> float:
+            # A non-finite (NaN/Inf) or negative backoff would corrupt the
+            # ``now < next_attempt_at`` gate (NaN comparisons are always False;
+            # Inf never elapses; negative fires instantly in the past). Coerce
+            # any such value to 0.0 (immediate retry) rather than letting bad
+            # config wedge the supervisor.
+            v = float(x)
+            return v if (math.isfinite(v) and v >= 0) else 0.0
+
+        self._supervisor_backoff_s = [_san_backoff(x) for x in raw_backoff] or [1.0]
         self._supervisor_max_restarts = max(
             1, int(self.config.get("supervisor_max_restarts", 5))
         )
@@ -454,8 +464,8 @@ class BusServer:
         supervisor-restarted agent re-registers immediately, so zeroing its
         consecutive-restart counter on every registration would defeat backoff +
         the give-up ceiling. The counter is reset only by sustained liveness
-        (the recovery window) or explicit operator action (start/stop), which go
-        through :meth:`_reset_supervisor_state`.
+        (the recovery window, in :meth:`supervise_once`) or explicit operator
+        action (``start_agent`` on spawn success / ``_stop_process`` on stop).
         """
         self._autostart_failures.pop(agent_id, None)
 
@@ -584,17 +594,22 @@ class BusServer:
                 alive.append(agent_id)
                 continue
 
-            # Still inside the backoff window: skip the restart this sweep, leaving
-            # the dead Popen so a later sweep re-sees it. We deliberately DON'T
-            # deregister the crashed row here — it stays visible on
-            # get_services/diagnose (as a derived-'dead' agent) instead of
-            # vanishing for the whole cooldown. Routing is protected separately:
-            # type-based routing filters on healthy (reconcile_liveness marks it
-            # dead), and handle_request gates direct agent_id dispatch on live
-            # status. A replacement that comes up during the window is caught by
-            # the guard above on the NEXT sweep (which pops the dead Popen), so
-            # lifecycle ops won't act on the stale entry.
-            if st and now < st["next_attempt_at"]:
+            # Still inside the backoff window AND below the give-up ceiling: skip
+            # the restart this sweep, leaving the dead Popen so a later sweep
+            # re-sees it. The ``restarts < max`` guard matters: once the ceiling
+            # is reached, a further crash must fall through to the give-up path
+            # promptly rather than waiting out one more (up to 300s) cooldown
+            # first. We deliberately DON'T deregister the crashed row here — it
+            # stays visible on get_services/diagnose (as a derived-'dead' agent)
+            # instead of vanishing for the whole cooldown; type-based routing
+            # still excludes it (reconcile_liveness marks it dead). A replacement
+            # that comes up during the window is caught by the guard above on the
+            # NEXT sweep (which pops the dead Popen).
+            if (
+                st
+                and now < st["next_attempt_at"]
+                and st["restarts"] < self._supervisor_max_restarts
+            ):
                 backing_off.append(agent_id)
                 continue
 
@@ -687,7 +702,7 @@ class BusServer:
                 )
                 restarted.append(agent_id)
                 logger.info(
-                    "Supervisor: %s exited (code=%s), restarted (pid=%s, attempt=%d/%d, next_backoff=%.0fs)",
+                    "Supervisor: %s exited (code=%s), restarted (pid=%s, attempt=%d/%d, next_backoff=%gs)",
                     agent_id, exit_code, result.get("pid"), restarts + 1,
                     self._supervisor_max_restarts, backoff_s,
                 )

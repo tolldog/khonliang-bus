@@ -462,6 +462,34 @@ def test_scalar_backoff_config_accepted(tmp_path):
     assert bus._supervisor_backoff_s == [5.0]
 
 
+def test_backoff_config_sanitizes_bad_values(tmp_path):
+    """Negative / NaN / Inf backoff values would corrupt the now<next gate;
+    they're coerced to 0.0 (immediate retry) rather than wedging the supervisor."""
+    db = BusDB(str(tmp_path / "b.db"))
+    bus = BusServer(db, config={"supervisor_backoff_s": [-5.0, float("nan"), float("inf"), 5.0]})
+    assert bus._supervisor_backoff_s == [0.0, 0.0, 0.0, 5.0]
+
+
+def test_give_up_not_delayed_by_backoff_window(tmp_path, monkeypatch):
+    """Once the restart ceiling is reached, a further crash must give up promptly
+    — not sit in backing_off for one more (long) cooldown first."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[100.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 0.0}
+    bus._now = lambda: clock["t"]
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()          # restart #1 → restarts=1 (== max), next window 100s
+    clock["t"] = 1.0              # still deep inside the 100s window
+    _crash(bus, "a1")
+    result = bus.supervise_once()
+
+    assert "a1" in result["gave_up"]      # gave up immediately, not backing_off
+    assert result["backing_off"] == []
+
+
 def test_string_scalar_backoff_config(tmp_path):
     """A string scalar ("30" / "0.5") from quoted-YAML / env config is one
     value, not iterated char-by-char."""
