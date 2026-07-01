@@ -1041,28 +1041,46 @@ class BusDB:
             )
             return {"status": "merged" if before else "saved"}
 
-    def get_learnings(self, agent_type: str, *, min_confidence: float = 0.0) -> dict[str, Any]:
-        """Learnings for an agent_type grouped by role, each role's rules sorted
-        by confidence desc. Shape mirrors the register_ack ``learnings`` payload."""
+    def get_learnings(
+        self,
+        agent_type: str,
+        role_models: dict[str, str] | None = None,
+        *,
+        min_confidence: float = 0.0,
+    ) -> dict[str, Any]:
+        """Learnings for an agent scoped to its CURRENT model per role.
+
+        ``role_models`` is the agent's ``{role: model}`` map. Only learnings for
+        exactly those (role, model) pairs are returned — a model swap (7B -> 32B)
+        never leaks the other model's rules (fr_khonliang-bus_ffd4cf00). Without
+        the map the model can't be resolved, so nothing is returned (safe: never
+        seed an agent with wrong-model instructions). Shape mirrors the
+        register_ack ``learnings`` payload: ``{role: {model, rules[]}}``, rules
+        sorted by confidence desc."""
+        if not role_models:
+            return {}
+        result: dict[str, Any] = {}
         with self.conn() as c:
-            rows = c.execute(
-                """
-                SELECT role, model, learning, confidence, sample_count
-                FROM learnings
-                WHERE agent_type = ? AND confidence >= ?
-                ORDER BY role, confidence DESC, last_seen DESC
-                """,
-                (agent_type, min_confidence),
-            ).fetchall()
-        by_role: dict[str, Any] = {}
-        for r in rows:
-            entry = by_role.setdefault(r["role"], {"model": r["model"], "rules": []})
-            entry["rules"].append({
-                "learning": r["learning"],
-                "confidence": r["confidence"],
-                "sample_count": r["sample_count"],
-            })
-        return by_role
+            for role, model in role_models.items():
+                rows = c.execute(
+                    """
+                    SELECT learning, confidence, sample_count
+                    FROM learnings
+                    WHERE agent_type = ? AND role = ? AND model = ? AND confidence >= ?
+                    ORDER BY confidence DESC, last_seen DESC
+                    """,
+                    (agent_type, role, model, min_confidence),
+                ).fetchall()
+                if rows:
+                    result[role] = {
+                        "model": model,
+                        "rules": [
+                            {"learning": r["learning"], "confidence": r["confidence"],
+                             "sample_count": r["sample_count"]}
+                            for r in rows
+                        ],
+                    }
+        return result
 
     def list_learnings(
         self,

@@ -53,11 +53,28 @@ def test_get_learnings_grouped_by_role(tmp_path):
     db.save_learning(agent_type="researcher", role="summarizer", model="qwen2.5:7b", learning="s1", confidence=0.9)
     db.save_learning(agent_type="researcher", role="summarizer", model="qwen2.5:7b", learning="s2", confidence=0.7)
     db.save_learning(agent_type="researcher", role="extractor", model="llama3.2:3b", learning="e1", confidence=0.8)
-    grouped = db.get_learnings("researcher")
+    grouped = db.get_learnings("researcher", {"summarizer": "qwen2.5:7b", "extractor": "llama3.2:3b"})
     assert set(grouped) == {"summarizer", "extractor"}
     assert grouped["summarizer"]["model"] == "qwen2.5:7b"
     # sorted by confidence desc
     assert [r["learning"] for r in grouped["summarizer"]["rules"]] == ["s1", "s2"]
+
+
+def test_get_learnings_scoped_to_model(tmp_path):
+    """A role with learnings for two models delivers ONLY the requested model's
+    rules (model swap = clean slate)."""
+    db = _db(tmp_path)
+    db.save_learning(agent_type="researcher", role="summarizer", model="qwen2.5:7b", learning="7b-rule")
+    db.save_learning(agent_type="researcher", role="summarizer", model="qwen2.5:32b", learning="32b-rule")
+    got = db.get_learnings("researcher", {"summarizer": "qwen2.5:32b"})
+    assert [r["learning"] for r in got["summarizer"]["rules"]] == ["32b-rule"]  # no 7b leak
+
+
+def test_get_learnings_without_model_map_returns_nothing(tmp_path):
+    db = _db(tmp_path)
+    db.save_learning(agent_type="a", role="r", model="m", learning="x")
+    assert db.get_learnings("a") == {}          # can't scope → deliver nothing
+    assert db.get_learnings("a", {}) == {}
 
 
 def test_model_key_isolation(tmp_path):
@@ -73,7 +90,7 @@ def test_min_confidence_filter(tmp_path):
     db = _db(tmp_path)
     db.save_learning(agent_type="a", role="r", model="m", learning="high", confidence=0.9)
     db.save_learning(agent_type="a", role="r", model="m", learning="low", confidence=0.3)
-    grouped = db.get_learnings("a", min_confidence=0.5)
+    grouped = db.get_learnings("a", {"r": "m"}, min_confidence=0.5)
     assert [r["learning"] for r in grouped["r"]["rules"]] == ["high"]
 
 
@@ -126,19 +143,43 @@ def test_register_ack_includes_learnings(client):
         "model": "qwen2.5:7b", "learning": "truncate to 12K", "confidence": 0.9,
     })
     with client.websocket_connect("/v1/agent") as ws:
-        ws.send_json({"type": "register", "id": "researcher-1", "agent_type": "researcher", "pid": 1, "skills": []})
+        ws.send_json({
+            "type": "register", "id": "researcher-1", "agent_type": "researcher",
+            "pid": 1, "skills": [], "models": {"summarizer": "qwen2.5:7b"},
+        })
         ack = ws.receive_json()
         assert ack["type"] == "registered"
         assert "summarizer" in ack["learnings"]
         assert ack["learnings"]["summarizer"]["rules"][0]["learning"] == "truncate to 12K"
 
 
-def test_register_ack_omits_learnings_when_none(client):
+def test_register_ack_scopes_to_agents_model(client):
+    """A register with model X must not receive learnings saved for model Y."""
+    for m, lrn in (("qwen2.5:7b", "7b-rule"), ("qwen2.5:32b", "32b-rule")):
+        client.post("/v1/learnings", json={
+            "agent_type": "researcher", "role": "summarizer", "model": m, "learning": lrn,
+        })
+    with client.websocket_connect("/v1/agent") as ws:
+        ws.send_json({
+            "type": "register", "id": "researcher-1", "agent_type": "researcher",
+            "pid": 1, "skills": [], "models": {"summarizer": "qwen2.5:32b"},
+        })
+        ack = ws.receive_json()
+        rules = [r["learning"] for r in ack["learnings"]["summarizer"]["rules"]]
+        assert rules == ["32b-rule"]  # only the 32B instance's model
+
+
+def test_register_ack_omits_learnings_when_no_model_map(client):
+    # Learnings exist, but an agent that doesn't declare its models can't be
+    # scoped safely → nothing delivered.
+    client.post("/v1/learnings", json={
+        "agent_type": "fresh", "role": "r", "model": "m", "learning": "x",
+    })
     with client.websocket_connect("/v1/agent") as ws:
         ws.send_json({"type": "register", "id": "fresh-1", "agent_type": "fresh", "pid": 1, "skills": []})
         ack = ws.receive_json()
         assert ack["type"] == "registered"
-        assert "learnings" not in ack  # nothing to deliver
+        assert "learnings" not in ack
 
 
 def test_ws_save_learning_persists(client):

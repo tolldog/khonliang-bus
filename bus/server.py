@@ -2886,12 +2886,16 @@ class BusServer:
                             )
                     # Deliver persisted learnings in the register ack so the
                     # agent injects them into its role prompts on startup — no
-                    # separate fetch (fr_khonliang-bus_ffd4cf00).
+                    # separate fetch (fr_khonliang-bus_ffd4cf00). Scoped to the
+                    # agent's CURRENT model per role (its ``models`` map), so a
+                    # 32B instance never receives 7B-only rules. Old agents that
+                    # don't send ``models`` get nothing (they can't consume
+                    # learnings until the bus-lib Phase 2 anyway).
                     ack: dict[str, Any] = {"type": "registered", "id": agent_id}
                     agent_type = data.get("agent_type") or (
                         agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id
                     )
-                    learnings = self.db.get_learnings(agent_type)
+                    learnings = self.db.get_learnings(agent_type, data.get("models") or {})
                     if learnings:
                         ack["learnings"] = learnings
                     await ws.send_json(ack)
