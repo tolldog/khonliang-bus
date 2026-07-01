@@ -1274,18 +1274,21 @@ class BusServer:
             # rather than leaving a sticky autostart_failed row.
             self._autostart_failures.pop(agent_id, None)
             return {"error": f"lazy launch of {agent_id!r} failed: {result['error']}"}
-        # Poll for registration up to the launch budget. Async-sleep between cheap
-        # sqlite reads — never block the request loop with a sync sleep.
+        # Poll until the agent is actually REACHABLE — the same test the trigger
+        # uses, not merely "a row exists". A pid=0 WS row whose socket already
+        # dropped is non-dead by _derive_live_status but not reachable, so a bare
+        # ``!= dead`` check would report success and then fail against a dead
+        # callback. Async-sleep between cheap reads — never block the request loop.
         deadline = self._now() + self._lazy_launch_timeout_s
         while self._now() < deadline:
             reg = self.db.get_registration(agent_id)
-            if reg is not None and self._derive_live_status(reg) != "dead":
+            if not self._is_lazy_agent_down(agent_id, reg):
                 return {}
             await asyncio.sleep(0.1)
-        # Deadline passed. One last check — it may have come live in the final
-        # tick; if so, succeed rather than kill a working agent.
+        # Deadline passed. One last check — it may have come reachable in the
+        # final tick; if so, succeed rather than kill a working agent.
         reg = self.db.get_registration(agent_id)
-        if reg is not None and self._derive_live_status(reg) != "dead":
+        if not self._is_lazy_agent_down(agent_id, reg):
             return {}
         # Genuinely not up — stop the half-started process AND clear any stale
         # registration. A WS agent registers with pid=0, which _derive_live_status

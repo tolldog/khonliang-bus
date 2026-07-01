@@ -204,6 +204,26 @@ async def test_do_lazy_launch_clears_stale_ws_reg_and_spawns(tmp_path, monkeypat
     assert calls == ["a"]  # actually spawned (not a no-op already_running)
 
 
+async def test_do_lazy_launch_pid0_reg_without_reachability_times_out(tmp_path, monkeypatch):
+    """A pid=0 WS row whose socket dropped is non-dead but NOT reachable — the
+    poll must not report success (which would then fail against a dead callback);
+    it should hit the launch timeout."""
+    bus = _bus(tmp_path, lazy_eligible=["a"], lazy_launch_timeout_s=0.05)
+    _install(bus.db, "a")
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
+
+    def _fake(installed):
+        # Registers pid=0 but leaves NO live process → not reachable.
+        bus.db.register_agent(agent_id="a", agent_type="test", callback_url="ws", pid=0)
+        return {"id": "a", "pid": 0, "status": "started"}
+
+    bus._start_process = _fake
+
+    result = await bus._do_lazy_launch("a")
+
+    assert "did not register" in result["error"]  # not a false success
+
+
 async def test_do_lazy_launch_not_installed(tmp_path):
     bus = _bus(tmp_path, lazy_eligible=["a"])  # not installed
     result = await bus._do_lazy_launch("a")
