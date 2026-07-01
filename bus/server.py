@@ -1247,8 +1247,18 @@ class BusServer:
             if reg is not None and self._derive_live_status(reg) != "dead":
                 return {}
             await asyncio.sleep(0.1)
-        # Timed out — stop the half-started process; return a clean error (AC#3).
+        # Deadline passed. One last check — it may have come live in the final
+        # tick; if so, succeed rather than kill a working agent.
+        reg = self.db.get_registration(agent_id)
+        if reg is not None and self._derive_live_status(reg) != "dead":
+            return {}
+        # Genuinely not up — stop the half-started process AND clear any stale
+        # registration. A WS agent registers with pid=0, which _derive_live_status
+        # can't mark 'dead', so leaving the row would black-hole later agent_id
+        # calls onto a dead callback until the heartbeat ages out. Deregister for
+        # a clean slate so the next call relaunches (AC#3).
         self._stop_process(agent_id)
+        self.db.deregister_agent(agent_id)
         return {
             "error": (
                 f"lazy agent {agent_id!r} did not register within "

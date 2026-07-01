@@ -142,6 +142,31 @@ async def test_do_lazy_launch_timeout_stops_and_errors(tmp_path):
     assert stopped == ["a"]  # half-started process cleaned up
 
 
+async def test_lazy_launch_timeout_clears_stale_registration(tmp_path, monkeypatch):
+    """On timeout the row must be deregistered, not just the process killed — a
+    WS pid=0 row can't be derived-dead, so leaving it would black-hole later
+    agent_id calls onto a dead callback."""
+    import bus.server as srv
+
+    monkeypatch.setattr(srv, "_pid_alive", lambda pid: False)  # any pid reads dead
+    bus = _bus(tmp_path, lazy_eligible=["a"], lazy_launch_timeout_s=0.05)
+    _install(bus.db, "a")
+
+    def _fake(installed):
+        # Simulate a stale/broken registration that never becomes live.
+        bus.db.register_agent(agent_id="a", agent_type="test", callback_url="ws", pid=4242)
+        with bus._processes_lock:
+            bus._processes["a"] = _FakePopen(alive=True)
+        return {"id": "a", "pid": 4242, "status": "started"}
+
+    bus._start_process = _fake
+
+    result = await bus._do_lazy_launch("a")
+
+    assert "did not register" in result["error"]
+    assert bus.db.get_registration("a") is None  # stale row cleared
+
+
 async def test_do_lazy_launch_not_installed(tmp_path):
     bus = _bus(tmp_path, lazy_eligible=["a"])  # not installed
     result = await bus._do_lazy_launch("a")
