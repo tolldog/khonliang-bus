@@ -395,6 +395,29 @@ async def test_agent_type_reresolves_by_type_after_lazy_launch(tmp_path, monkeyp
     assert dispatched["agent_id"] == "b"   # normal type selection won
 
 
+async def test_agent_type_does_not_relaunch_reachable_lazy_agent(tmp_path, monkeypatch):
+    """For an agent_type request, the launch decision must use the lazy agent's
+    OWN registration — not the type-resolved reg (None when the only match is
+    stale/unhealthy) — else a still-reachable WS instance gets relaunched."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a", agent_type="reviewer")
+    bus.db.register_agent(agent_id="a", agent_type="reviewer", callback_url="ws", pid=0)
+    # Type routing finds nothing healthy, but the agent IS reachable over WS.
+    monkeypatch.setattr(bus.db, "get_healthy_agent_for_type", lambda t: None)
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: True)
+
+    launched: list[str] = []
+
+    async def _fake_lazy(agent_id):
+        launched.append(agent_id)
+        return {}
+    monkeypatch.setattr(bus, "_lazy_launch", _fake_lazy)
+
+    await bus.handle_request(RequestMessage(agent_type="reviewer", operation="x"))
+
+    assert launched == []  # own reg is reachable → no duplicate launch
+
+
 async def test_handle_request_no_lazy_for_non_lazy_agent(tmp_path, monkeypatch):
     bus = _bus(tmp_path)  # nothing lazy
     launched: list[str] = []

@@ -1426,7 +1426,12 @@ class BusServer:
         # where os.kill(pid,0) is reliable — so it can also re-launch an agent
         # whose row lingered after a crash. Non-lazy routing is unchanged.
         lazy_id = self._resolve_lazy_target(req)
-        if lazy_id and self._lazy_needs_launch(lazy_id, reg):
+        # Decide on the LAZY AGENT'S OWN registration, not the type-resolved reg:
+        # for an agent_type request ``reg`` is get_healthy_agent_for_type(), which
+        # is None when the only match is merely stale/unhealthy — that would
+        # relaunch a still-running lazy agent (e.g. a connected pid=0 WS instance
+        # whose status isn't 'healthy'). Its own row is the source of truth.
+        if lazy_id and self._lazy_needs_launch(lazy_id, self.db.get_registration(lazy_id)):
             launched = await self._lazy_launch(lazy_id)
             if launched.get("error"):
                 return {**launched, "trace_id": trace_id}
