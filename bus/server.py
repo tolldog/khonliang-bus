@@ -387,6 +387,12 @@ class BusServer:
         # In-flight lazy launches: agent_id -> asyncio.Task, so concurrent callers
         # for the same dead agent share ONE launch instead of racing to spawn.
         self._lazy_launches: dict[str, asyncio.Task] = {}
+        # Dual-bind (UDS + TCP) runs two uvicorn servers over ONE app, so the
+        # ASGI lifespan fires once per listener. Reference-count them: boot on
+        # the FIRST listener up, shut down on the LAST listener down — never tear
+        # the shared bus down under a still-serving listener if one exits early
+        # (fr_khonliang-bus_aa5b25cf). Counter arithmetic is atomic under asyncio.
+        self._lifespan_count = 0
         # Lazy agents an operator explicitly stopped: suppressed from cold-start
         # relaunch until a manual start or a fresh registration, so stop_agent's
         # "intentionally down" contract holds for lazy agents too (else the next
@@ -3172,11 +3178,25 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @asynccontextmanager
     async def lifespan(app):
-        bus.reconcile_on_boot()
-        bus.autostart_installed_agents()
-        bus.start_supervisor()
-        yield
-        await bus.shutdown()
+        # Reference-count listeners (dual-bind shares this app): boot once on the
+        # first, shut down once on the LAST — so a listener that exits early
+        # (e.g. a failed bind on the other) doesn't tear down a still-serving
+        # bus. Sync boot calls run atomically after the increment (no await).
+        bus._lifespan_count += 1
+        try:
+            # Boot INSIDE the try so a raising reconcile/autostart/start_supervisor
+            # still hits the finally — otherwise the increment would leak and the
+            # refcount would never reach 0 (no shutdown, boot skipped for the
+            # next listener) in exactly the failure case this guards.
+            if bus._lifespan_count == 1:
+                bus.reconcile_on_boot()
+                bus.autostart_installed_agents()
+                bus.start_supervisor()
+            yield
+        finally:
+            bus._lifespan_count -= 1
+            if bus._lifespan_count == 0:
+                await bus.shutdown()
 
     app = FastAPI(title="khonliang-bus", version="0.2.0", lifespan=lifespan)
 

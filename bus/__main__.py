@@ -1,13 +1,31 @@
-"""Entry point: python -m bus --port 8787 --db data/bus.db"""
+"""Entry point: python -m bus [--port 8787] [--db data/bus.db]
+
+Binds a Unix domain socket at ``~/.khonliang/bus.sock`` (local, default) AND a
+TCP listener (remote / transition), serving the same bus. See
+``docs/bus-transport-contract.md`` (fr_khonliang-bus_aa5b25cf).
+"""
 
 import argparse
+import asyncio
+import contextlib
 import logging
 import os
+import signal
+import socket
+import stat
 import sys
+from pathlib import Path
 
 import uvicorn
 
 from bus.server import create_app
+
+logger = logging.getLogger("bus")
+
+try:
+    DEFAULT_SOCK_PATH: Path | None = Path.home() / ".khonliang" / "bus.sock"
+except (RuntimeError, OSError):  # pragma: no cover - no resolvable home
+    DEFAULT_SOCK_PATH = None
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -18,11 +36,177 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_tcp(args) -> tuple[str, int] | None:
+    """(host, port) to bind for TCP, or None if TCP is disabled.
+
+    ``KHONLIANG_BUS_LISTEN`` wins over --host/--port: ``host:port`` overrides,
+    ``off``/``none``/empty disables TCP entirely (UDS-only)."""
+    listen = os.environ.get("KHONLIANG_BUS_LISTEN")
+    if listen is not None:
+        if listen.strip().lower() in {"off", "none", ""}:
+            return None
+        host, _, port = listen.rpartition(":")
+        return (host or "0.0.0.0", int(port))
+    return (args.host, args.port)
+
+
+def _clear_stale_socket(sock_path: Path) -> None:
+    """Reclaim a dead bus socket, but never delete anything we can't prove is one.
+
+    Only a path that IS a socket and gives a definitive ``ConnectionRefused``
+    (no listener) is unlinked. A non-socket file, a live listener, or an
+    ambiguous probe error (permission/timeout) makes the bus refuse to start
+    rather than silently deleting something — unlinking a misconfigured ``--uds``
+    that points at a real file would be data loss."""
+    if not sock_path.exists():
+        return
+    if not stat.S_ISSOCK(sock_path.stat().st_mode):
+        raise SystemExit(
+            f"bus: {sock_path} exists and is not a socket; refusing to overwrite it"
+        )
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.5)
+    try:
+        probe.connect(str(sock_path))
+    except ConnectionRefusedError:
+        sock_path.unlink(missing_ok=True)  # dead socket from a crashed bus
+        return
+    except OSError as e:
+        raise SystemExit(
+            f"bus: cannot probe existing socket {sock_path}: {e}; refusing to start"
+        )
+    else:
+        raise SystemExit(
+            f"bus: another bus is already listening on {sock_path}; refusing to start"
+        )
+    finally:
+        probe.close()
+
+
+def _validate_binds(tcp: tuple[str, int] | None, uds_path: Path | None) -> None:
+    """Reject bind combinations that can't work yet.
+
+    UDS-only (TCP disabled) is refused until agents are UDS-capable: internal
+    callers (``_start_process`` forwards bus_url as ``--bus``; the orchestrator
+    builds ``f'{bus_url}/v1/request'``) still assume an HTTP base URL, so a
+    ``unix://`` self-URL would break autostart/lazy launches and flow dispatch.
+    Lift this once bus-lib Phase 2 (fr_khonliang-bus-lib_042279e2) lands."""
+    if tcp is None and uds_path is None:
+        raise SystemExit("bus: both UDS and TCP disabled — nothing to bind")
+    if tcp is None:
+        raise SystemExit(
+            "bus: UDS-only mode (TCP disabled) requires UDS-capable agents — "
+            "bus-lib Phase 2 (fr_khonliang-bus-lib_042279e2) is not yet available. "
+            "Keep TCP enabled (dual-bind) for now."
+        )
+
+
+def _resolve_self_url(tcp: tuple[str, int] | None, uds_path: Path | None) -> str:
+    """The bus's own address, handed to spawned agents (as ``--bus``) and used
+    for internal self-calls. Prefer TCP (a real URL); in UDS-only mode advertise
+    the socket so agents reach a LIVE listener instead of a dead port. (UDS-only
+    requires UDS-capable agents — bus-lib Phase 2, fr_khonliang-bus-lib_042279e2.)"""
+    if tcp is not None:
+        return f"http://localhost:{tcp[1]}"
+    if uds_path is not None:
+        return f"unix://{uds_path}"
+    return "http://localhost:8787"
+
+
+async def _run_dual_bind(servers, uds_server, uds_path: Path | None) -> None:
+    """Serve all listeners; abort if ANY fails to bind (no partial-bind state).
+
+    uvicorn's ``serve()`` returns (doesn't raise) on a bind failure, so a bare
+    ``gather`` would keep the surviving listener and leave the bus half-bound —
+    a silent degradation that breaks the discovery contract. Instead: wait for
+    every listener to come up, and if one exits before all are started, tear the
+    rest down and fail startup."""
+    # Each uvicorn server captures process-wide SIGINT/SIGTERM (flipping only its
+    # OWN should_exit); with two servers the last-registered handler wins, so a
+    # signal would stop just one listener and gather() would hang. Disable
+    # per-server capture and install ONE handler that stops them all.
+    for s in servers:
+        s.capture_signals = contextlib.nullcontext
+    loop = asyncio.get_running_loop()
+
+    def _stop_all() -> None:
+        for s in servers:
+            s.should_exit = True
+
+    installed_sigs = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop_all)
+            installed_sigs.append(sig)
+        except (NotImplementedError, ValueError, RuntimeError):  # pragma: no cover
+            pass  # non-Unix loop / not main thread — best effort
+
+    task_of = {s: asyncio.create_task(s.serve()) for s in servers}
+    active = list(servers)
+    try:
+        while not all(s.started for s in active):
+            for s in list(active):
+                if task_of[s].done() and not s.started:
+                    # This listener's serve() returned before startup → bind
+                    # failed. UDS is OPTIONAL: degrade to the remaining listeners
+                    # (TCP keeps serving) rather than aborting. TCP is required,
+                    # so its failure is fatal.
+                    if s is uds_server:
+                        logger.warning("bus: UDS bind failed; continuing without it (TCP only)")
+                        active.remove(s)
+                    else:
+                        raise SystemExit("bus: TCP listener failed to bind; aborting startup")
+            if not active:
+                raise SystemExit("bus: no listener could bind; aborting startup")
+            if all(s.started for s in active):
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.gather(*(task_of[s] for s in active))  # all up — run until they stop
+    finally:
+        for sig in installed_sigs:
+            with contextlib.suppress(ValueError, NotImplementedError):
+                loop.remove_signal_handler(sig)
+        for s in servers:
+            s.should_exit = True
+        await asyncio.gather(*task_of.values(), return_exceptions=True)
+        # Remove the socket ("socket exists = bus running") — but ONLY if OUR
+        # server bound it. A UDS bind that lost a concurrent start race (never
+        # .started) belongs to the winner; deleting it would black-hole the live
+        # bus.
+        if uds_server is not None and uds_server.started and uds_path is not None:
+            uds_path.unlink(missing_ok=True)
+
+
+async def _serve(app, tcp: tuple[str, int] | None, uds_path: Path | None) -> None:
+    """Run the bus on TCP and/or UDS concurrently (one app, shared state)."""
+    servers = []
+    uds_server = None
+    if tcp is not None:
+        host, port = tcp
+        servers.append(uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info")))
+        logger.info("bus: TCP listener on %s:%d", host, port)
+    if uds_path is not None:
+        uds_server = uvicorn.Server(uvicorn.Config(app, uds=str(uds_path), log_level="info"))
+        servers.append(uds_server)
+        logger.info("bus: UDS listener on %s", uds_path)
+    await _run_dual_bind(servers, uds_server, uds_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="khonliang-bus agent platform")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--db", default="data/bus.db")
+    parser.add_argument(
+        "--uds",
+        default=None,
+        help=f"Unix domain socket path (default: {DEFAULT_SOCK_PATH}).",
+    )
+    parser.add_argument(
+        "--no-uds",
+        action="store_true",
+        help="Disable the UDS listener (TCP only).",
+    )
     # fr_khonliang-bus_aa096048: opt-in disclosure for the provenance HTTP route.
     # Default safe (redacted) because the bus binds 0.0.0.0 with no auth.
     # Local-trusted hosts opt in via either flag or env var; the env-var path
@@ -49,14 +233,38 @@ def main():
         stream=sys.stderr,
     )
 
+    tcp = _resolve_tcp(args)
+    # Absolutize a custom --uds: bus_url (unix://<path>) is forwarded to spawned
+    # agents launched under their OWN cwd, so a relative path would resolve to a
+    # different socket than the bus bound.
+    uds_path: Path | None = None if args.no_uds else (
+        Path(args.uds).expanduser().resolve() if args.uds else DEFAULT_SOCK_PATH
+    )
+
+    if uds_path is not None:
+        try:
+            uds_path.parent.mkdir(parents=True, exist_ok=True)
+            _clear_stale_socket(uds_path)
+        except OSError as e:
+            # No writable/resolvable home (containers, read-only fs): degrade to
+            # TCP rather than refusing to boot. _clear_stale_socket raises
+            # SystemExit (not OSError) for its intentional refusals, so those
+            # still propagate. If TCP is also off, _validate_binds errors below.
+            logger.warning("bus: cannot prepare UDS at %s (%s); UDS disabled", uds_path, e)
+            uds_path = None
+
+    _validate_binds(tcp, uds_path)  # refuse unusable combos
+
+    bus_url = _resolve_self_url(tcp, uds_path)
+
     app = create_app(
         db_path=args.db,
         config={
-            "bus_url": f"http://localhost:{args.port}",
+            "bus_url": bus_url,
             "provenance_disclose_full": args.provenance_disclose_full,
         },
     )
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    asyncio.run(_serve(app, tcp, uds_path))
 
 
 if __name__ == "__main__":
