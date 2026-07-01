@@ -2291,11 +2291,14 @@ class BusServer:
         }, redact_sensitive)
 
     #: Wire schema version for ``get_bus_welcome``. Bump when the response
-    #: shape changes in a way callers must adapt to (additive fields don't
-    #: warrant a bump — clients should ignore unknown keys per
-    #: ``feedback_cheap_irreversible_principle``). The top-level ``bus`` field
-    #: (fr_khonliang-bus_6638f4dc) is purely additive, so it does NOT bump this.
-    BUS_WELCOME_SCHEMA_VERSION = 1
+    #: shape changes in a way callers must adapt to. A new top-level FIELD is
+    #: additive (clients ignore unknown keys per ``feedback_cheap_irreversible_
+    #: principle``) and does NOT bump — e.g. the ``bus`` field
+    #: (fr_khonliang-bus_6638f4dc). A new ENUM VALUE in an existing field DOES
+    #: bump, since a consumer switching exhaustively over the documented set
+    #: can't otherwise tell it must handle the new branch.
+    #: v2 (fr_khonliang-bus_c81f7ab5): ``agents[].state`` gains ``lazy_eligible``.
+    BUS_WELCOME_SCHEMA_VERSION = 2
 
     def get_bus_welcome(self, detail: str = "brief") -> dict:
         """One-call cold-start discovery of the platform.
