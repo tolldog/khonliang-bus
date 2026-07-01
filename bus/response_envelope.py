@@ -75,18 +75,18 @@ def build_response_envelope(
     original result) so structured content stays structured
     (fr_khonliang-bus_c989e906).
     """
-    structured = content_type == "application/json"
+    # Structured handling requires the actual object (``value``) so we can keep
+    # it intact in ``content``. A caller passing pre-serialized JSON text WITHOUT
+    # value keeps the old text behavior (line-oriented preview) — no back-compat
+    # break, and the only production caller (the adapter) always passes value.
     has_value = value is not _UNSET
+    structured = has_value and content_type == "application/json"
     omitted = len(text) > budget.max_chars
     if structured:
         # No line-oriented preview for structured data — reassembling JSON
         # fragments wastes the very inline budget the envelope protects.
         findings: list[str] = []
-        summary = (
-            _structured_summary(value, producer=producer, operation=operation)
-            if has_value
-            else _summary(text, producer=producer, operation=operation)
-        )
+        summary = _structured_summary(value, producer=producer, operation=operation)
     else:
         findings = _findings(text, budget.max_chars, compact=not omitted)
         summary = _summary(text, producer=producer, operation=operation)
@@ -134,7 +134,7 @@ def build_response_envelope(
         # Too big to inline — full payload is in the artifact; give a bounded
         # text excerpt regardless of shape (structured excerpt stays a string).
         envelope["excerpt"] = _bounded_excerpt(text, budget.max_chars)
-    elif structured and has_value:
+    elif structured:  # implies has_value
         envelope["content"] = value  # keep the object/array/null — no reassembly
     else:
         envelope["content"] = text

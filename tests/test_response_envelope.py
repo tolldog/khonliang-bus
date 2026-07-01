@@ -134,11 +134,14 @@ def test_inlined_object_not_larger_than_string_path():
     assert len(dumps_envelope(env_obj)) <= len(dumps_envelope(env_str))
 
 
-def test_no_value_passed_falls_back_to_text():
-    """Backward-compat: a caller that doesn't pass value keeps text content."""
+def test_no_value_passed_keeps_old_text_behavior():
+    """Backward-compat: a caller passing pre-serialized JSON text but no value
+    keeps the OLD text behavior (string content + line-oriented findings) — the
+    structured path only engages when the object is available to keep intact."""
     env = build_response_envelope(
         ok=True, status="ok", producer="a", operation="op",
-        text='{"x": 1}', content_type="application/json",
+        text='{\n  "x": 1\n}', content_type="application/json",
         budget=ResponseBudget(max_chars=8000),
     )
-    assert env["content"] == '{"x": 1}'  # no value → text (sentinel default)
+    assert env["content"] == '{\n  "x": 1\n}'  # no value → string content
+    assert env["findings"]                      # old line-oriented preview kept
