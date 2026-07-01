@@ -4159,6 +4159,43 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             raise HTTPException(status_code=422, detail=error)
         return result
 
+    @app.get("/v1/logs/query")
+    async def logs_query(
+        agent_id: str = "",
+        since: float = 0.0,
+        until: float | None = None,
+        level: str = "",
+        pattern: str = "",
+        limit: int = 200,
+    ):
+        # Thin passthrough to the log agent's log_query skill via NORMAL routing
+        # — no new liveness machinery. The limp verdict is synthesized HERE
+        # because only the bus knows agent_log_dir, the L0 floor callers should
+        # fall back to (docs/log-agent-design.md; fr_khonliang-bus_70862caa).
+        result = await bus.handle_request(RequestMessage(
+            agent_type="log-agent",
+            operation="log_query",
+            args={
+                "agent_id": agent_id, "since": since, "until": until,
+                "level": level, "pattern": pattern, "limit": limit,
+            },
+            timeout=20.0,
+        ))
+        if isinstance(result, dict) and "no healthy agent" in str(result.get("error", "")):
+            raise HTTPException(status_code=503, detail={
+                "error": "log agent unreachable",
+                "hint": (
+                    f"raw log files at {bus.config.get('agent_log_dir')}"
+                    if bus.config.get("agent_log_dir")
+                    else "L0 file logging is disabled on this bus (--log-dir)"
+                ),
+            })
+        # Unwrap the dispatch envelope ({"result": payload, "trace_id"}) so
+        # callers get {lines, count, trace_id} directly.
+        if isinstance(result, dict) and isinstance(result.get("result"), dict):
+            return {**result["result"], "trace_id": result.get("trace_id")}
+        return result
+
     # Trust model: these routes are unauthenticated like every other bus HTTP
     # route (register / install / feedback). The network boundary is the trust
     # boundary — and POST /v1/install is already an unauthenticated RCE surface

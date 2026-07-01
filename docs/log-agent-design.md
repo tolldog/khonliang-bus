@@ -115,9 +115,19 @@ self-amplify. Its own logging is WARNING+ / batched summaries only.
   `ts=ingest-time, level=None`. Parse failure never drops a line.
 
 **Substrate contract** (`bus/log_agent/substrate.py`): `ingest(records)`,
-`query(...)`, `status()`. Phase 1: SQLite+FTS5 at `<agent_log_dir>/substrate.db`
-(own file, never the bus DB). Retention `retention_days` (default 14), enforced
-at startup + daily. Loki/Elastic are Phase 2 (mechanical by contract).
+`query(...)`, `status()`. Phase 1: SQLite at `<agent_log_dir>/substrate.db`
+(own file, never the bus DB); `pattern` is escaped-LIKE substring matching —
+predictable grep semantics, fast at single-host fleet volume (FTS5 is a
+Phase-2 optimization if volume demands; token-matching semantics would also
+surprise grep-minded callers). Retention `retention_days` (default 14,
+`KHONLIANG_LOG_RETENTION_DAYS`), enforced at startup + daily. Loki/Elastic are
+Phase 2 (mechanical by contract).
+
+**Running it**: `python -m bus.log_agent [--id log-agent] [--bus <url>]
+[--log-dir <dir>]` — bus auto-discovered when omitted; `--log-dir` must match
+the bus's. Install it like any agent
+(`command=.venv/bin/python, args=["-m", "bus.log_agent"]`) and
+autostart/supervision apply normally.
 
 **Bus passthrough + limp mode** (▸R9): a thin bus route `GET /v1/logs/query`
 forwards to the log agent via normal routing; on no-healthy it synthesizes the

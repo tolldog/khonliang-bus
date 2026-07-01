@@ -106,51 +106,10 @@ def _resolve_mcp_server_key(explicit: str | None) -> str:
 # documented key gets. Per-instance prefix lives on the adapter.
 MCP_TOOL_NAME_PREFIX: str = _mcp_tool_prefix(DEFAULT_MCP_SERVER_KEY)
 
-#: Well-known bus socket (docs/bus-transport-contract.md, fr_khonliang-bus_aa5b25cf).
-#: None when there's no resolvable home (unset $HOME in some containers) — then
-#: UDS auto-discovery is simply skipped and we fall back to TCP.
-try:
-    BUS_SOCK_PATH: Path | None = Path.home() / ".khonliang" / "bus.sock"
-except (RuntimeError, OSError):  # pragma: no cover - no resolvable home
-    BUS_SOCK_PATH = None
-
-
-def _socket_live(path: Path) -> bool:
-    """Whether a bus is actually listening on the socket — not merely that the
-    file exists. A stale socket (crashed UDS run, or the bus now on --no-uds)
-    must NOT be auto-selected over a healthy TCP listener."""
-    if not path.exists():
-        return False
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    probe.settimeout(0.3)
-    try:
-        probe.connect(str(path))
-        return True
-    except OSError:
-        return False
-    finally:
-        probe.close()
-
-
-def discover_bus(explicit: str | None = None) -> str:
-    """Resolve the bus address per the transport contract, first match wins:
-
-    1. ``explicit`` (a ``--bus`` CLI arg),
-    2. ``KHONLIANG_BUS_URL`` env var,
-    3. ``~/.khonliang/bus.sock`` if a bus is LIVE on it → ``unix://<abspath>``,
-    4. ``http://localhost:8787`` fallback (TCP default, transition-friendly).
-
-    Must stay identical to bus-lib's ``discover_bus`` — see
-    ``docs/bus-transport-contract.md``.
-    """
-    if explicit:
-        return explicit
-    env = os.environ.get("KHONLIANG_BUS_URL")
-    if env and env.strip():
-        return env.strip()
-    if BUS_SOCK_PATH is not None and _socket_live(BUS_SOCK_PATH):
-        return f"unix://{BUS_SOCK_PATH}"
-    return "http://localhost:8787"
+# Discovery moved to the dependency-free bus.discovery (fr_khonliang-bus_70862caa
+# PR 2) so non-MCP clients (the log agent) can import it without dragging in the
+# optional ``mcp`` package. Re-exported here for existing callers.
+from bus.discovery import BUS_SOCK_PATH, _socket_live, discover_bus  # noqa: F401
 
 
 class BusMCPAdapter:
@@ -1175,6 +1134,42 @@ class BusMCPAdapter:
                 params={"agent_type": agent_type, "role": role, "model": model, "limit": limit},
             )
             return json.dumps(rows or [], indent=2)
+
+        @mcp.tool()
+        async def bus_logs_query(
+            agent_id: str = "",
+            since: float = 0.0,
+            until: float | None = None,
+            level: str = "",
+            pattern: str = "",
+            limit: int = 200,
+        ) -> str:
+            """Query raw fleet logs via the log agent (fr_khonliang-bus_70862caa).
+
+            Filters: agent_id, time window (epoch seconds), level
+            (DEBUG..CRITICAL), substring pattern. Newest first. When the log
+            agent is down the bus returns a clear unreachable verdict with the
+            raw-file fallback path — never a silent empty result.
+            """
+            params: dict = {
+                "agent_id": agent_id, "since": since, "level": level,
+                "pattern": pattern, "limit": limit,
+            }
+            if until is not None:
+                params["until"] = until
+            # Raw request (not _get) so the 503 limp verdict's detail survives —
+            # same rationale as bus_webhook_check_funnel.
+            try:
+                r = await adapter._async_http.get(
+                    f"{adapter.bus_url}/v1/logs/query", params=params
+                )
+            except httpx.HTTPError as e:
+                return json.dumps({"error": f"bus unreachable: {e}"}, indent=2)
+            try:
+                body = r.json()
+            except ValueError:
+                body = {"error": r.text[:500]}
+            return json.dumps(body, indent=2)
 
         # Read-side ``bus_artifact_*`` MCP tools were retired with
         # khonliang-store Phase 4c (`fr_khonliang-bus_9151395d`).

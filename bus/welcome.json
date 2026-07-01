@@ -23,6 +23,9 @@
       "bus_learnings_save",
       "bus_learnings_list"
     ],
+    "logs": [
+      "bus_logs_query"
+    ],
     "lifecycle": [
       "bus_start_agent",
       "bus_stop_agent",
