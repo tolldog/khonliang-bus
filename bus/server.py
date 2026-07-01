@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import threading
 import time
@@ -1380,7 +1381,12 @@ class BusServer:
         if self._agent_log_dir is None:
             return None
         try:
-            path = self._agent_log_dir / f"{agent_id}.log"
+            # Sanitize the id into a single flat filename component: agent ids
+            # are unrestricted at install, so a separator (or "..") would turn
+            # this into an arbitrary-path write/rename primitive (codex). Keeps
+            # the PR-2 tailer's filename→agent_id derivation well-formed too.
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", agent_id).lstrip(".") or "agent"
+            path = self._agent_log_dir / f"{safe}.log"
             try:
                 if path.exists() and path.stat().st_size > self._agent_log_max_bytes:
                     path.replace(path.parent / (path.name + ".1"))

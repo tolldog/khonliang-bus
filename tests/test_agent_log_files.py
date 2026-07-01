@@ -195,6 +195,23 @@ def test_buslog_only_failure_keeps_agent_logs(tmp_path):
         _cleanup_buslog_handlers()
 
 
+def test_traversal_agent_id_stays_inside_log_dir(tmp_path):
+    """A crafted agent_id with path separators must not become a write outside
+    agent_log_dir (codex): the id is sanitized to a flat filename component."""
+    log_dir = tmp_path / "logs"
+    bus = _bus(tmp_path, agent_log_dir=str(log_dir))
+    evil_id = "../../escape/pwned"
+    _install_echo(bus.db, evil_id, tmp_path)
+
+    assert bus.start_agent(evil_id)["status"] == "started"
+    _wait_exit(bus, evil_id)
+
+    assert not (tmp_path / "escape").exists()          # nothing wrote outside
+    inside = list(log_dir.glob("*.log"))
+    assert len(inside) == 1                            # one flat, sanitized file
+    assert "hello-stdout" in inside[0].read_text()
+
+
 def test_agent_log_max_bytes_floor(tmp_path):
     bus = _bus(tmp_path, agent_log_dir=str(tmp_path / "logs"), agent_log_max_bytes=5)
     assert bus._agent_log_max_bytes == 1_000_000  # floored, not 5 bytes
