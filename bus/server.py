@@ -4045,6 +4045,14 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             raise HTTPException(status_code=422, detail=error)
         return result
 
+    # Trust model: these routes are unauthenticated like every other bus HTTP
+    # route (register / install / feedback). The network boundary is the trust
+    # boundary — and POST /v1/install is already an unauthenticated RCE surface
+    # (it Popen()s a command), which strictly dominates poisoning a learning, so
+    # gating learnings alone would be theater. Bus-wide auth is a separate
+    # cross-cutting concern. The WS save_learning path DOES bind identity because
+    # that's an in-fleet agent-vs-agent boundary (one agent must not spoof
+    # another's learnings); the HTTP path is the operator's local control surface.
     @app.post("/v1/learnings")
     def save_learning(req: LearningSaveRequest):
         result = bus.save_learning(
