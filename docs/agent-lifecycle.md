@@ -3,6 +3,19 @@
 How the bus launches and supervises the agents it spawns. All keys live in the
 bus config (`config/bus.yaml`).
 
+## Agent log files (L0 fleet logging)
+
+Spawned agents' stdout+stderr (merged) append to `<log_dir>/<agent_id>.log`;
+the bus's own log rotates at `<log_dir>/bus.log`. `--log-dir` /
+`KHONLIANG_BUS_LOG_DIR` (default `logs/agents`, cwd-relative like `--db`;
+production: `/opt/khonliang/logs`; empty string disables → DEVNULL, the
+pre-L0 behavior). Per-agent files rotate **at agent start** past
+`KHONLIANG_BUS_LOG_MAX_BYTES` (default 50MB, depth-1 `.log.1`); mid-flight
+rotation requires `copytruncate` logrotate — the child owns the fd. Children
+run with `PYTHONUNBUFFERED=1` so crash-adjacent lines reach the file. A
+log-layer failure never breaks a spawn (falls back to DEVNULL). Design +
+invariant: `docs/log-agent-design.md` (fr_khonliang-bus_70862caa).
+
 ## Lazy hot-load (`lazy_eligible`)
 
 Agents listed here are **not** started at boot and **not** supervisor-restarted

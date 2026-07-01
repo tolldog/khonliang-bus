@@ -42,6 +42,37 @@ from bus import webhook_install
 
 logger = logging.getLogger(__name__)
 
+#: Filename-safe charset for L0 log files. Deliberately EXCLUDES '.' (so '..'
+#: can't appear and the only dot is the appended '.log') and '%' (the escape
+#: char itself).
+_LOG_NAME_SAFE = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+
+
+def _log_file_name(agent_id: str) -> str:
+    """Percent-encode an agent id into a flat, INJECTIVE filename component.
+
+    Agent ids are unrestricted at install, so the mapping must (a) never
+    produce a path separator or ``..`` (no arbitrary-path write primitive) and
+    (b) be injective for ALL ids — heuristic sanitization + digest-on-change
+    still collided when one id was literally another's sanitized form (codex).
+    Percent-encoding is bijective by construction: every char outside the safe
+    set — including ``%`` itself and ``.`` — becomes ``%XX``, so distinct ids
+    always yield distinct names, real fleet ids (alnum/`-`/`_`) map to
+    themselves, and the output can never contain a separator or dot. Also
+    reversible, so the PR-2 tailer derives the exact agent_id back.
+    """
+    encoded = "".join(
+        c if c in _LOG_NAME_SAFE else f"%{ord(c):02X}"
+        for c in agent_id.encode("utf-8").decode("latin-1")
+    )
+    # Empty id → a bare "%": OUTSIDE the encoding's image (a real '%' always
+    # encodes to '%25', and every escape is %XX), so injectivity stays total —
+    # unlike a word fallback, which would collide with a real agent of that name.
+    return encoded or "%"
+
+
 #: Agent ids the bus reserves for itself. ``bus`` is the bus's own catalog
 #: identity (fr_khonliang-bus_6638f4dc) — bus_welcome renders it and
 #: bus_skills(agent_id="bus") returns the built-in tool catalog, so a real
@@ -411,6 +442,27 @@ class BusServer:
         # "intentionally down" contract holds for lazy agents too (else the next
         # skill call would immediately re-wake a maintenance-stopped worker).
         self._lazy_suppressed: set[str] = set()
+        # L0 fleet logging (fr_khonliang-bus_70862caa, docs/log-agent-design.md):
+        # spawned agents' stdout+stderr are appended to
+        # <agent_log_dir>/<agent_id>.log — the debugging floor that works with
+        # everything else dead. None ⇔ disabled (falls back to DEVNULL). The dir
+        # is mkdir'd once here, guarded: a log-layer failure must never degrade
+        # agent launch below today's behavior.
+        self._agent_log_dir: Path | None = None
+        raw_log_dir = self.config.get("agent_log_dir")
+        if raw_log_dir:
+            try:
+                d = Path(raw_log_dir).expanduser()
+                d.mkdir(parents=True, exist_ok=True)
+                self._agent_log_dir = d
+            except OSError as e:
+                logger.warning("agent_log_dir %r unusable (%s); agent logs disabled", raw_log_dir, e)
+        try:
+            self._agent_log_max_bytes = max(
+                1_000_000, int(self.config.get("agent_log_max_bytes", 50_000_000))
+            )
+        except (TypeError, ValueError):
+            self._agent_log_max_bytes = 50_000_000
         self.flow_engine = FlowEngine(db, self._http)
         self.artifacts = ArtifactStore(db)
         self.orchestrator = Orchestrator(
@@ -1346,6 +1398,32 @@ class BusServer:
             )
         }
 
+    def _open_agent_log(self, agent_id: str):
+        """Open the L0 append-mode log file for a spawned agent, or None.
+
+        Contract (docs/log-agent-design.md, PR 1): NEVER let a log-layer failure
+        break the spawn — any error here warns and falls back to DEVNULL, which
+        is exactly today's behavior. Rotation happens at start (rename to
+        ``.log.1`` past the size cap); the bus can't rotate mid-flight because
+        the CHILD owns the fd (mid-flight rotation is copytruncate-logrotate
+        territory, see the design doc).
+        """
+        if self._agent_log_dir is None:
+            return None
+        try:
+            path = self._agent_log_dir / f"{_log_file_name(agent_id)}.log"
+            try:
+                if path.exists() and path.stat().st_size > self._agent_log_max_bytes:
+                    path.replace(path.parent / (path.name + ".1"))
+            except OSError as e:
+                # Rotation is best-effort (a concurrent starter may have won the
+                # rename); appending to an oversized file beats failing.
+                logger.warning("log rotation for %s skipped: %s", agent_id, e)
+            return open(path, "ab")
+        except OSError as e:
+            logger.warning("agent log for %s unavailable (%s); using DEVNULL", agent_id, e)
+            return None
+
     def _start_process(self, installed: dict) -> dict:
         agent_id = installed["id"]
         bus_url = self.config.get("bus_url", "http://localhost:8787")
@@ -1354,12 +1432,17 @@ class BusServer:
             "--bus", bus_url,
             "--config", installed["config"],
         ]
+        log_file = self._open_agent_log(agent_id)
         try:
             proc = subprocess.Popen(
                 cmd,
                 cwd=installed["cwd"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_file if log_file is not None else subprocess.DEVNULL,
+                # Merge stderr into the same stream — one file per agent.
+                stderr=subprocess.STDOUT if log_file is not None else subprocess.DEVNULL,
+                # Python children block-buffer stdout (~8KB) when it isn't a tty,
+                # so crash-adjacent lines would die in the buffer on SIGKILL.
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
             with self._processes_lock:
                 self._processes[agent_id] = proc
@@ -1368,6 +1451,14 @@ class BusServer:
         except Exception as e:
             logger.error("Failed to start agent %s: %s", agent_id, e)
             return {"id": agent_id, "error": str(e)}
+        finally:
+            # The child inherited the fd; close the PARENT'S copy unconditionally
+            # and store nothing. The supervisor mutates _processes directly in
+            # several paths (it never calls _stop_process), so any held handle
+            # would leak once per crash-loop restart — child-owns-the-only-fd
+            # makes every lifecycle path (and bus restart) safe by construction.
+            if log_file is not None:
+                log_file.close()
 
     def _stop_process(self, agent_id: str) -> None:
         with self._processes_lock:
