@@ -122,6 +122,26 @@ async def test_bus_skills_for_bus_returns_catalog():
         assert name in text
 
 
+@pytest.mark.asyncio
+async def test_bus_skills_bus_excludes_agent_named_bus_worker():
+    """An agent whose id starts with 'bus_' has skill tools like
+    'bus_worker.do_thing' — those must NOT pollute the bus's own catalog."""
+    a = _adapter()
+    # Simulate a registered agent skill tool by adding it to the tracked set +
+    # exposing it as an MCP tool.
+    @a.mcp.tool(name="bus_worker.do_thing")
+    def _bus_worker_skill() -> str:  # pragma: no cover - never invoked
+        return ""
+
+    a._registered_tools.add("bus_worker.do_thing")
+
+    result = await a.mcp.call_tool("bus_skills", {"agent_id": "bus"})
+    text = result[1]["result"]
+
+    assert "bus_worker.do_thing" not in text
+    assert "bus_welcome" in text  # real bus tools still present
+
+
 # ---------------------------------------------------------------------------
 # welcome.json shape sanity
 # ---------------------------------------------------------------------------

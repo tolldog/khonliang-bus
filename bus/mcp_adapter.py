@@ -982,6 +982,11 @@ class BusMCPAdapter:
             """
             if agent_id == "bus":
                 tools = await mcp.list_tools()
+                # Built-in bus tools are those NOT tracked in _registered_tools
+                # (which holds only agent-skill + flow tools). A ``bus_``-prefix
+                # filter alone would wrongly include an agent whose id starts with
+                # ``bus_`` (its skill tools are ``bus_worker.skill``); excluding
+                # _registered_tools is the precise built-in-vs-agent discriminator.
                 bus_tools = sorted(
                     (
                         t.name,
@@ -989,7 +994,7 @@ class BusMCPAdapter:
                         if t.description else "",
                     )
                     for t in tools
-                    if t.name.startswith("bus_")
+                    if t.name.startswith("bus_") and t.name not in adapter._registered_tools
                 )
                 if not bus_tools:
                     return "no skills registered"
