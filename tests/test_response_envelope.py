@@ -113,6 +113,27 @@ def test_structured_summary_is_bounded():
     assert len(env["summary"]) <= SUMMARY_CHARS + 3  # +len('...')
 
 
+def test_inlined_object_not_larger_than_string_path():
+    """Inlining the object must not expand the final envelope more than the
+    pre-fix string-in-content path — object nesting is cheaper than JSON
+    string-escaping, so the budget guarantee isn't weakened (codex R2, measured:
+    at a ~6.3KB near-threshold payload the object envelope is smaller)."""
+    from bus.response_envelope import dumps_envelope
+    obj = {f"field_{i}": {"a": i, "note": "x" * 20} for i in range(120)}
+    text = json.dumps(obj, indent=2, sort_keys=True)
+    budget = ResponseBudget(max_chars=len(text) + 2000)  # ensure inlined
+    env_obj = build_response_envelope(
+        ok=True, status="ok", producer="a", operation="op",
+        text=text, content_type="application/json", value=obj, budget=budget,
+    )
+    env_str = build_response_envelope(  # no value → old string-in-content path
+        ok=True, status="ok", producer="a", operation="op",
+        text=text, content_type="application/json", budget=budget,
+    )
+    assert env_obj["omitted"] is False
+    assert len(dumps_envelope(env_obj)) <= len(dumps_envelope(env_str))
+
+
 def test_no_value_passed_falls_back_to_text():
     """Backward-compat: a caller that doesn't pass value keeps text content."""
     env = build_response_envelope(
