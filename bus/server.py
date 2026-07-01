@@ -1253,8 +1253,18 @@ class BusServer:
         installed = self.db.get_installed_agent(agent_id)
         if installed is None:
             return {"error": f"lazy agent {agent_id!r} is not installed"}
-        # start_agent gives the derived-liveness 'already_running' guard (a
-        # concurrent launch that already registered won't double-spawn) and
+        # start_agent's 'already_running' guard is pid-derived, so a stale pid=0
+        # WS row from a prior (now-exited) instance would make it no-op WITHOUT
+        # spawning a replacement. Re-check real liveness: if it actually came up
+        # (concurrent launch / WS reconnect) we're done; otherwise clear the stale
+        # row so start_agent's guard sees no live registration and truly spawns.
+        reg = self.db.get_registration(agent_id)
+        if reg is not None:
+            if not self._is_lazy_agent_down(agent_id, reg):
+                return {}
+            self._stop_process(agent_id)
+            self.db.deregister_agent(agent_id)
+        # start_agent still guards against a same-tick concurrent spawn and
         # records spawn failures.
         result = self.start_agent(agent_id)
         if result.get("status") == "already_running":

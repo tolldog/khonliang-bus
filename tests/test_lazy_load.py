@@ -187,6 +187,23 @@ async def test_lazy_launch_timeout_clears_stale_registration(tmp_path, monkeypat
     assert bus.db.get_registration("a") is None  # stale row cleared
 
 
+async def test_do_lazy_launch_clears_stale_ws_reg_and_spawns(tmp_path, monkeypatch):
+    """A stale pid=0 WS registration from a prior exited instance must be cleared
+    so start_agent actually spawns — otherwise its pid-derived already_running
+    guard would no-op and never relaunch."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    # Stale row: registered pid=0, but no WS connection and no live process → down.
+    bus.db.register_agent(agent_id="a", agent_type="test", callback_url="ws", pid=0)
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
+    calls = _patch_launch(bus, register=True)  # spawn re-registers it live
+
+    result = await bus._do_lazy_launch("a")
+
+    assert result == {}
+    assert calls == ["a"]  # actually spawned (not a no-op already_running)
+
+
 async def test_do_lazy_launch_not_installed(tmp_path):
     bus = _bus(tmp_path, lazy_eligible=["a"])  # not installed
     result = await bus._do_lazy_launch("a")
