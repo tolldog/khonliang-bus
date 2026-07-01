@@ -226,6 +226,42 @@ async def test_lifespan_refcount_balanced_on_boot_failure(tmp_path, monkeypatch)
     assert calls["shutdown"] == 1  # finally ran → refcount hit 0 → shutdown
 
 
+class _FakeServer:
+    """Minimal uvicorn.Server stand-in: ``fail=True`` returns from serve()
+    without ever setting ``started`` (a bind failure)."""
+
+    def __init__(self, fail: bool = False):
+        self.started = False
+        self.should_exit = False
+        self._fail = fail
+
+    async def serve(self):
+        if self._fail:
+            return  # bind failed → serve returns without starting
+        self.started = True
+        while not self.should_exit:
+            await asyncio.sleep(0.01)
+
+
+async def test_run_dual_bind_aborts_on_bind_failure():
+    good, bad = _FakeServer(), _FakeServer(fail=True)
+    with pytest.raises(SystemExit):
+        await busmain._run_dual_bind([good, bad], None, None)
+    assert good.should_exit  # survivor was torn down, not left serving alone
+
+
+async def test_run_dual_bind_both_up_serves_until_exit():
+    a, b = _FakeServer(), _FakeServer()
+
+    async def _stop_soon():
+        while not (a.started and b.started):
+            await asyncio.sleep(0.01)
+        a.should_exit = True
+        b.should_exit = True
+
+    await asyncio.gather(busmain._run_dual_bind([a, b], None, None), _stop_soon())
+
+
 # ---------------------------------------------------------------------------
 # E2E: bus binds a real UDS; the adapter's transport reaches it
 # ---------------------------------------------------------------------------

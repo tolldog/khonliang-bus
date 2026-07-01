@@ -111,6 +111,33 @@ def _resolve_self_url(tcp: tuple[str, int] | None, uds_path: Path | None) -> str
     return "http://localhost:8787"
 
 
+async def _run_dual_bind(servers, uds_server, uds_path: Path | None) -> None:
+    """Serve all listeners; abort if ANY fails to bind (no partial-bind state).
+
+    uvicorn's ``serve()`` returns (doesn't raise) on a bind failure, so a bare
+    ``gather`` would keep the surviving listener and leave the bus half-bound —
+    a silent degradation that breaks the discovery contract. Instead: wait for
+    every listener to come up, and if one exits before all are started, tear the
+    rest down and fail startup."""
+    tasks = [asyncio.create_task(s.serve()) for s in servers]
+    try:
+        while not all(s.started for s in servers):
+            if any(t.done() for t in tasks):
+                raise SystemExit("bus: a listener failed to bind; aborting startup")
+            await asyncio.sleep(0.05)
+        await asyncio.gather(*tasks)  # all up — run until they stop
+    finally:
+        for s in servers:
+            s.should_exit = True
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Remove the socket ("socket exists = bus running") — but ONLY if OUR
+        # server bound it. A UDS bind that lost a concurrent start race (never
+        # .started) belongs to the winner; deleting it would black-hole the live
+        # bus.
+        if uds_server is not None and uds_server.started and uds_path is not None:
+            uds_path.unlink(missing_ok=True)
+
+
 async def _serve(app, tcp: tuple[str, int] | None, uds_path: Path | None) -> None:
     """Run the bus on TCP and/or UDS concurrently (one app, shared state)."""
     servers = []
@@ -123,15 +150,7 @@ async def _serve(app, tcp: tuple[str, int] | None, uds_path: Path | None) -> Non
         uds_server = uvicorn.Server(uvicorn.Config(app, uds=str(uds_path), log_level="info"))
         servers.append(uds_server)
         logger.info("bus: UDS listener on %s", uds_path)
-    try:
-        await asyncio.gather(*(s.serve() for s in servers))
-    finally:
-        # Clean up the socket so "socket exists = bus running" holds — but ONLY
-        # if OUR server actually bound it. If our UDS bind lost a concurrent
-        # start race (never .started), the socket belongs to the winner; deleting
-        # it would black-hole the live bus.
-        if uds_server is not None and uds_server.started and uds_path is not None:
-            uds_path.unlink(missing_ok=True)
+    await _run_dual_bind(servers, uds_server, uds_path)
 
 
 def main():
