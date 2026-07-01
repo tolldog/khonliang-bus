@@ -20,7 +20,10 @@ from bus.server import create_app
 
 logger = logging.getLogger("bus")
 
-DEFAULT_SOCK_PATH = Path.home() / ".khonliang" / "bus.sock"
+try:
+    DEFAULT_SOCK_PATH: Path | None = Path.home() / ".khonliang" / "bus.sock"
+except (RuntimeError, OSError):  # pragma: no cover - no resolvable home
+    DEFAULT_SOCK_PATH = None
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -176,11 +179,20 @@ def main():
     uds_path: Path | None = None if args.no_uds else (
         Path(args.uds).expanduser() if args.uds else DEFAULT_SOCK_PATH
     )
-    _validate_binds(tcp, uds_path)  # refuse unusable combos before touching the fs
 
     if uds_path is not None:
-        uds_path.parent.mkdir(parents=True, exist_ok=True)
-        _clear_stale_socket(uds_path)
+        try:
+            uds_path.parent.mkdir(parents=True, exist_ok=True)
+            _clear_stale_socket(uds_path)
+        except OSError as e:
+            # No writable/resolvable home (containers, read-only fs): degrade to
+            # TCP rather than refusing to boot. _clear_stale_socket raises
+            # SystemExit (not OSError) for its intentional refusals, so those
+            # still propagate. If TCP is also off, _validate_binds errors below.
+            logger.warning("bus: cannot prepare UDS at %s (%s); UDS disabled", uds_path, e)
+            uds_path = None
+
+    _validate_binds(tcp, uds_path)  # refuse unusable combos
 
     bus_url = _resolve_self_url(tcp, uds_path)
 

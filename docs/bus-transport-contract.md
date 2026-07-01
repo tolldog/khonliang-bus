@@ -40,11 +40,16 @@ coordinate.
 
 1. **Explicit override** — `--bus <url>` CLI arg (highest priority).
 2. **Environment** — `KHONLIANG_BUS_URL` env var.
-3. **Auto-discovery** — if `~/.khonliang/bus.sock` exists → return
-   `unix://<absolute-socket-path>`.
+3. **Auto-discovery** — if a bus is **live** on `~/.khonliang/bus.sock`
+   (connectable, not merely present) → return `unix://<absolute-socket-path>`.
+   A stale socket (crashed run, or the bus now on `--no-uds`) must be ignored so
+   discovery falls through to the healthy TCP listener.
 4. **Fallback** — `http://localhost:8787` (TCP default, for backward-compat
    during the transition; a client MAY choose to raise instead once the fleet
    has migrated).
+
+If there is no resolvable home directory (unset `$HOME` in some containers),
+skip step 3 and fall through — never crash resolving the path.
 
 ## Address forms
 

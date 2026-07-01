@@ -33,12 +33,30 @@ def test_discover_bus_env(monkeypatch):
     assert discover_bus() == "http://env:2"
 
 
-def test_discover_bus_socket(monkeypatch, tmp_path):
+def test_discover_bus_live_socket(monkeypatch, tmp_path):
     monkeypatch.delenv("KHONLIANG_BUS_URL", raising=False)
     sock = tmp_path / "bus.sock"
-    sock.touch()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock))
+    srv.listen(1)  # a live listener
     monkeypatch.setattr("bus.mcp_adapter.BUS_SOCK_PATH", sock)
-    assert discover_bus() == f"unix://{sock}"
+    try:
+        assert discover_bus() == f"unix://{sock}"
+    finally:
+        srv.close()
+        sock.unlink(missing_ok=True)
+
+
+def test_discover_bus_ignores_dead_socket(monkeypatch, tmp_path):
+    """A stale socket (exists but nothing listening — crashed run, or bus now on
+    --no-uds) must not be selected over the healthy TCP fallback."""
+    monkeypatch.delenv("KHONLIANG_BUS_URL", raising=False)
+    sock = tmp_path / "bus.sock"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(sock))
+    s.close()  # socket file remains, nothing listening
+    monkeypatch.setattr("bus.mcp_adapter.BUS_SOCK_PATH", sock)
+    assert discover_bus() == "http://localhost:8787"
 
 
 def test_discover_bus_fallback(monkeypatch, tmp_path):
