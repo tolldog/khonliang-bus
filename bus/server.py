@@ -1244,7 +1244,16 @@ class BusServer:
         if task is None:
             task = asyncio.create_task(self._do_lazy_launch(agent_id))
             self._lazy_launches[agent_id] = task
-            task.add_done_callback(lambda t: self._lazy_launches.pop(agent_id, None))
+
+            def _clear(done: asyncio.Task, _aid: str = agent_id) -> None:
+                # Identity-guarded: only clear if THIS task is still the tracked
+                # one, so a callback firing after a newer launch was registered
+                # for the same agent can't drop the newer task (which would let a
+                # third caller spawn a duplicate).
+                if self._lazy_launches.get(_aid) is done:
+                    self._lazy_launches.pop(_aid, None)
+
+            task.add_done_callback(_clear)
         # shield: a cancelled caller must not cancel the shared launch that other
         # waiters still depend on.
         return await asyncio.shield(task)
