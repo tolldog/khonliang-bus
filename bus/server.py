@@ -404,7 +404,13 @@ class BusServer:
         ``healthy`` with stale PIDs — so :meth:`start_agent` returns
         ``already_running`` against PIDs that no longer exist and operators
         must :meth:`restart_agent` to break the no-op cycle (fr_khonliang-bus_5c58c4e9).
+
+        Also purges any catalog rows for RESERVED_AGENT_IDS: reservation now
+        blocks new install/register, but an UPGRADED deployment could already
+        hold a real agent named ``bus`` that would otherwise be silently
+        shadowed by the synthetic self-catalog (fr_khonliang-bus_6638f4dc).
         """
+        purged = self._purge_reserved_agents()
         pids_reaped = 0
         kept = 0
         for reg in self.db.get_registrations():
@@ -418,8 +424,33 @@ class BusServer:
             self.db.deregister_agent(reg["id"])
             pids_reaped += 1
             logger.info("Reconciled agent %s on boot (pid=%s not alive)", reg["id"], pid)
-        logger.info("Boot reconciliation: pids_reaped=%d kept=%d", pids_reaped, kept)
+        logger.info("Boot reconciliation: pids_reaped=%d kept=%d purged_reserved=%d", pids_reaped, kept, purged)
+        # Return shape unchanged (pids_reaped/kept) — the reserved purge is a
+        # boot-hygiene side effect logged above, not part of the public result.
         return {"pids_reaped": pids_reaped, "kept": kept}
+
+    def _purge_reserved_agents(self) -> int:
+        """Remove any catalog rows (registration + install + welcome) for a
+        RESERVED_AGENT_ID left over from before the reservation existed, so an
+        upgraded deployment doesn't have a real agent shadowed by the synthetic
+        bus self-catalog. Returns the count purged."""
+        purged = 0
+        for agent_id in RESERVED_AGENT_IDS:
+            had = (
+                self.db.get_registration(agent_id) is not None
+                or self.db.get_installed_agent(agent_id) is not None
+            )
+            if not had:
+                continue
+            self._stop_process(agent_id)
+            self.db.deregister_agent(agent_id)
+            self.db.uninstall_agent(agent_id)
+            purged += 1
+            logger.warning(
+                "Purged reserved agent id %r from the catalog on boot "
+                "(reserved for the bus's own self-catalog)", agent_id,
+            )
+        return purged
 
     def autostart_installed_agents(self) -> dict:
         """Walk ``installed_agents`` and launch each via :meth:`start_agent`.
@@ -2105,6 +2136,11 @@ class BusServer:
         )
 
         for agent_id in all_ids:
+            # A reserved id (e.g. ``bus``) is rendered by the synthetic ``bus``
+            # field below, not as a pseudo-agent — skip any residual catalog row
+            # (e.g. a welcome that survived deregister) so it isn't double-listed.
+            if agent_id in RESERVED_AGENT_IDS:
+                continue
             svc = services_by_id.get(agent_id)
             inst = installed_by_id.get(agent_id)
             welcome_record = welcomes.get(agent_id)

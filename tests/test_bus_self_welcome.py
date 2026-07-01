@@ -170,6 +170,34 @@ async def test_bus_is_a_reserved_agent_id(tmp_path):
     assert db.get_registration("bus") is None
 
 
+def test_boot_purges_preexisting_bus_agent(tmp_path):
+    """An upgraded deployment that already has a real 'bus' agent (from before
+    the reservation) must have it purged on boot, not left shadowed."""
+    db = BusDB(str(tmp_path / "b.db"))
+    # Simulate a pre-reservation catalog row written directly at the db layer.
+    db.install_agent(agent_id="bus", agent_type="x", command="/bin/true", args=[], cwd="/tmp", config="/tmp/c.yaml")
+    db.register_agent(agent_id="bus", agent_type="x", callback_url="cb", pid=0)
+
+    bus = BusServer(db, config={})
+    bus.reconcile_on_boot()
+
+    assert db.get_registration("bus") is None
+    assert db.get_installed_agent("bus") is None
+
+
+def test_bus_welcome_skips_residual_bus_row(tmp_path):
+    """Even a residual 'bus' catalog row (e.g. a welcome that survived
+    deregister) must not appear as a pseudo-agent in agents[]."""
+    db = BusDB(str(tmp_path / "b.db"))
+    db.set_agent_welcome("bus", {"role": "stale"})  # welcome-only residue
+
+    bus = BusServer(db, config={})
+    w = bus.get_bus_welcome(detail="brief")
+
+    assert all(a["agent_id"] != "bus" for a in w["agents"])  # not double-listed
+    assert w["bus"]["kind"] == "bus"                          # synthetic entry still present
+
+
 @pytest.mark.asyncio
 async def test_bus_skills_bus_excludes_agent_named_bus_worker():
     """An agent whose id starts with 'bus_' has skill tools like
