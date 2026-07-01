@@ -87,8 +87,16 @@ def test_lazy_config_parses_str_and_dict_forms(tmp_path):
 
 def test_resolve_lazy_target_by_id(tmp_path):
     bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
     assert bus._resolve_lazy_target(RequestMessage(agent_id="a", operation="x")) == "a"
     assert bus._resolve_lazy_target(RequestMessage(agent_id="other", operation="x")) is None
+
+
+def test_resolve_lazy_target_requires_install(tmp_path):
+    """A lazy_config entry whose agent was uninstalled is not launchable — don't
+    take the cold-start path (it'd only produce a synthetic 'not installed')."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])  # 'a' NOT installed
+    assert bus._resolve_lazy_target(RequestMessage(agent_id="a", operation="x")) is None
 
 
 def test_resolve_lazy_target_by_type_single_match(tmp_path):
@@ -238,6 +246,40 @@ async def test_handle_request_triggers_lazy_launch_for_lazy_target(tmp_path, mon
     result = await bus.handle_request(RequestMessage(agent_id="a", operation="ping"))
     assert launched == ["a"]
     assert result.get("dispatched") is True  # got past resolution to dispatch
+
+
+async def test_agent_type_reresolves_by_type_after_lazy_launch(tmp_path, monkeypatch):
+    """An agent_type request that cold-starts a lazy agent must re-run normal
+    type selection afterward — not force the lazy instance (another healthy
+    agent of the type may have appeared during the launch window)."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a", agent_type="reviewer")
+
+    calls = {"n": 0}
+    other = {"id": "b", "agent_type": "reviewer", "pid": 0, "status": "healthy", "callback_url": "ws"}
+
+    def _staged_type(atype):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else other  # none first (triggers lazy), b on re-resolve
+
+    monkeypatch.setattr(bus.db, "get_healthy_agent_for_type", _staged_type)
+
+    async def _fake_lazy(agent_id):
+        return {}
+    monkeypatch.setattr(bus, "_lazy_launch", _fake_lazy)
+
+    dispatched = {}
+
+    async def _fake_dispatch(**kwargs):
+        dispatched["agent_id"] = kwargs["agent_id"]
+        dispatched["reg"] = kwargs["reg"]
+        return {"ok": True}
+    monkeypatch.setattr(bus, "_dispatch_resolved_request", _fake_dispatch)
+
+    await bus.handle_request(RequestMessage(agent_type="reviewer", operation="x"))
+
+    assert calls["n"] == 2                 # re-resolved by TYPE, not forced to lazy_id
+    assert dispatched["agent_id"] == "b"   # normal type selection won
 
 
 async def test_handle_request_no_lazy_for_non_lazy_agent(tmp_path, monkeypatch):

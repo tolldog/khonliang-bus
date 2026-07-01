@@ -1185,9 +1185,19 @@ class BusServer:
         None. Direct ``agent_id``: the id itself if lazy-eligible. By
         ``agent_type``: only when EXACTLY ONE installed lazy-eligible agent
         matches the type (an ambiguous multi-match falls through to normal
-        no-healthy rather than guessing which one to start)."""
+        no-healthy rather than guessing which one to start).
+
+        Both paths require an INSTALL row — a lazy_config entry whose agent was
+        uninstalled is not launchable (reusing its launch spec is the whole
+        point), so it must not take the cold-start path.
+        """
         if req.agent_id:
-            return req.agent_id if req.agent_id in self._lazy_config else None
+            return (
+                req.agent_id
+                if req.agent_id in self._lazy_config
+                and self.db.get_installed_agent(req.agent_id) is not None
+                else None
+            )
         if req.agent_type:
             matches = [
                 aid for aid in self._lazy_config
@@ -1363,7 +1373,15 @@ class BusServer:
             launched = await self._lazy_launch(lazy_id)
             if launched.get("error"):
                 return {**launched, "trace_id": trace_id}
-            reg = self.db.get_registration(lazy_id)
+            # Re-resolve the SAME way the original request did — for an
+            # agent_type request, re-run normal type selection rather than
+            # forcing the lazy instance (another healthy agent of that type may
+            # have appeared during the launch window).
+            reg = (
+                self.db.get_registration(req.agent_id)
+                if req.agent_id
+                else self.db.get_healthy_agent_for_type(req.agent_type)
+            )
 
         if not reg:
             return {"error": f"no healthy agent found for {req.agent_id or req.agent_type}", "trace_id": trace_id}
@@ -2295,7 +2313,7 @@ class BusServer:
             # next skill call. Surface it as ``lazy_eligible`` so callers know the
             # skills are available on demand (fr_khonliang-bus_c81f7ab5 AC#5). A
             # LIVE lazy agent keeps its runtime status.
-            if agent_id in self._lazy_config and state in {
+            if inst and agent_id in self._lazy_config and state in {
                 "cataloged_dead", "dead", "deregistered"
             }:
                 state = "lazy_eligible"
