@@ -182,8 +182,9 @@ async def test_lifespan_boots_once_for_dual_bind(tmp_path, monkeypatch):
     await cm2.__aenter__()
     assert calls["boot"] == 1  # booted once despite two lifespan entries
     await cm1.__aexit__(None, None, None)
+    assert calls["shutdown"] == 0  # one listener gone, other still serving → NOT torn down
     await cm2.__aexit__(None, None, None)
-    assert calls["shutdown"] == 1  # shut down once
+    assert calls["shutdown"] == 1  # shut down on the LAST listener out
 
 
 # ---------------------------------------------------------------------------

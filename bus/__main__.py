@@ -111,18 +111,23 @@ def _resolve_self_url(tcp: tuple[str, int] | None, uds_path: Path | None) -> str
 async def _serve(app, tcp: tuple[str, int] | None, uds_path: Path | None) -> None:
     """Run the bus on TCP and/or UDS concurrently (one app, shared state)."""
     servers = []
+    uds_server = None
     if tcp is not None:
         host, port = tcp
         servers.append(uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info")))
         logger.info("bus: TCP listener on %s:%d", host, port)
     if uds_path is not None:
-        servers.append(uvicorn.Server(uvicorn.Config(app, uds=str(uds_path), log_level="info")))
+        uds_server = uvicorn.Server(uvicorn.Config(app, uds=str(uds_path), log_level="info"))
+        servers.append(uds_server)
         logger.info("bus: UDS listener on %s", uds_path)
     try:
         await asyncio.gather(*(s.serve() for s in servers))
     finally:
-        # Clean up the socket so "socket exists = bus running" holds.
-        if uds_path is not None:
+        # Clean up the socket so "socket exists = bus running" holds — but ONLY
+        # if OUR server actually bound it. If our UDS bind lost a concurrent
+        # start race (never .started), the socket belongs to the winner; deleting
+        # it would black-hole the live bus.
+        if uds_server is not None and uds_server.started and uds_path is not None:
             uds_path.unlink(missing_ok=True)
 
 
