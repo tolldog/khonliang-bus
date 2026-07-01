@@ -205,6 +205,27 @@ async def test_lifespan_boots_once_for_dual_bind(tmp_path, monkeypatch):
     assert calls["shutdown"] == 1  # shut down on the LAST listener out
 
 
+async def test_lifespan_refcount_balanced_on_boot_failure(tmp_path, monkeypatch):
+    """If boot raises, the refcount must still unwind (finally runs) and shutdown
+    fire — else the count leaks at 1 and the bus serves unreconciled."""
+    import bus.server as srv
+    calls = {"shutdown": 0}
+
+    def _boom(self):
+        raise RuntimeError("boot failed")
+    monkeypatch.setattr(srv.BusServer, "reconcile_on_boot", _boom)
+
+    async def _fake_shutdown(self):
+        calls["shutdown"] += 1
+    monkeypatch.setattr(srv.BusServer, "shutdown", _fake_shutdown)
+
+    app = create_app(db_path=str(tmp_path / "b.db"), config={})
+    cm = app.router.lifespan_context(app)
+    with pytest.raises(RuntimeError):
+        await cm.__aenter__()
+    assert calls["shutdown"] == 1  # finally ran → refcount hit 0 → shutdown
+
+
 # ---------------------------------------------------------------------------
 # E2E: bus binds a real UDS; the adapter's transport reaches it
 # ---------------------------------------------------------------------------

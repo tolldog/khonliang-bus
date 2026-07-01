@@ -3183,11 +3183,15 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         # (e.g. a failed bind on the other) doesn't tear down a still-serving
         # bus. Sync boot calls run atomically after the increment (no await).
         bus._lifespan_count += 1
-        if bus._lifespan_count == 1:
-            bus.reconcile_on_boot()
-            bus.autostart_installed_agents()
-            bus.start_supervisor()
         try:
+            # Boot INSIDE the try so a raising reconcile/autostart/start_supervisor
+            # still hits the finally — otherwise the increment would leak and the
+            # refcount would never reach 0 (no shutdown, boot skipped for the
+            # next listener) in exactly the failure case this guards.
+            if bus._lifespan_count == 1:
+                bus.reconcile_on_boot()
+                bus.autostart_installed_agents()
+                bus.start_supervisor()
             yield
         finally:
             bus._lifespan_count -= 1
