@@ -367,6 +367,14 @@ class BusDB:
                 (agent_id, encoded),
             )
 
+    def delete_agent_welcome(self, agent_id: str) -> bool:
+        """Delete an agent's persisted welcome. Returns True if a row was
+        removed. Used to purge reserved-id rows (welcomes survive deregister,
+        so this is the only way to clear them)."""
+        with self.conn() as c:
+            r = c.execute("DELETE FROM welcomes WHERE agent_id = ?", (agent_id,))
+            return r.rowcount > 0
+
     def get_agent_welcome(self, agent_id: str) -> dict[str, Any] | None:
         """Return the persisted welcome plus the updated_at timestamp,
         or ``None`` if no welcome has ever been published for this agent_id.

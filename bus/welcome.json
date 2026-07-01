@@ -1,0 +1,50 @@
+{
+  "kind": "bus",
+  "identity": "khonliang-bus — durable hub for the externalized-memory agent ecosystem",
+  "role": "routes skill calls to agents; persists the catalog (registrations, skills, welcomes, artifacts, traces); manages agent lifecycle (install / start / stop / restart, autostart, crash supervision); bridges GitHub webhooks to bus events",
+  "boundaries": "the bus itself is not a dispatchable agent — it has no callback and is never a routing target; agents are peer services it fronts",
+  "skills_by_category": {
+    "discovery": [
+      "bus_welcome",
+      "bus_status",
+      "bus_services",
+      "bus_skills",
+      "bus_matrix",
+      "bus_topics",
+      "bus_flows"
+    ],
+    "diagnostics": [
+      "bus_diagnose",
+      "bus_agent_provenance",
+      "bus_trace",
+      "bus_feedback"
+    ],
+    "lifecycle": [
+      "bus_start_agent",
+      "bus_stop_agent",
+      "bus_restart_agent",
+      "bus_refresh_skills",
+      "bus_force_resync"
+    ],
+    "events": [
+      "bus_wait_for_event"
+    ],
+    "artifacts": [
+      "bus_artifact_distill",
+      "bus_artifact_distill_many"
+    ],
+    "webhooks": [
+      "bus_webhook_install",
+      "bus_webhook_audit",
+      "bus_webhook_repair",
+      "bus_webhook_install_fleet",
+      "bus_webhook_audit_fleet",
+      "bus_webhook_check_funnel"
+    ]
+  },
+  "suggested_next": [
+    "bus_welcome(detail='full') for the full platform + per-agent orientation",
+    "bus_skills(agent_id='bus') for the bus tool list with descriptions",
+    "bus_status for platform counts (agents, skills, flows)"
+  ]
+}

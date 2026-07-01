@@ -338,6 +338,21 @@ class BusMCPAdapter:
             )
             if p.get("identity"):
                 lines.append(p["identity"])
+            # The bus as a first-class catalog entry (fr_khonliang-bus_6638f4dc).
+            b = w.get("bus")
+            if isinstance(b, dict):
+                lines.append("")
+                lines.append(
+                    f"BUS: {b.get('identity', 'khonliang-bus')} "
+                    f"[{b.get('state', '?')}] ({b.get('skill_count', 0)} skills)"
+                )
+                if b.get("role"):
+                    lines.append(f"  role: {b['role']}")
+                if detail == "full":
+                    for cat, names in (b.get("skills_by_category") or {}).items():
+                        lines.append(f"  {cat}: {', '.join(names)}")
+                    if b.get("boundaries"):
+                        lines.append(f"  boundaries: {b['boundaries']}")
             lines.append("")
             lines.append("AGENTS:")
             for a in w.get("agents", []):
@@ -957,7 +972,36 @@ class BusMCPAdapter:
 
         @mcp.tool()
         async def bus_skills(agent_id: str = "") -> str:
-            """List skills. Optionally filter by agent_id."""
+            """List skills. Optionally filter by agent_id.
+
+            ``agent_id='bus'`` returns the bus's OWN tool catalog — the bus is a
+            first-class participant in its own catalog (fr_khonliang-bus_6638f4dc).
+            ``bus`` is a reserved agent id (the bus rejects real agents claiming
+            it), so this is unambiguously the built-in tool list, served from the
+            adapter's actually-registered ``bus_*`` tools (the source of truth) so
+            it can never drift from what's callable.
+            """
+            if agent_id == "bus":
+                tools = await mcp.list_tools()
+                # Built-in bus tools are those NOT tracked in _registered_tools
+                # (which holds only agent-skill + flow tools). A ``bus_``-prefix
+                # filter alone would wrongly include an agent whose id starts with
+                # ``bus_`` (its skill tools are ``bus_worker.skill``); excluding
+                # _registered_tools is the precise built-in-vs-agent discriminator.
+                def _first_line(desc: str | None) -> str:
+                    lines = (desc or "").strip().splitlines()
+                    return lines[0] if lines else ""  # guard whitespace-only descs
+
+                bus_tools = sorted(
+                    (t.name, _first_line(t.description))
+                    for t in tools
+                    if t.name.startswith("bus_") and t.name not in adapter._registered_tools
+                )
+                if not bus_tools:
+                    return "no skills registered"
+                lines = ["\n  bus:"]
+                lines += [f"    {name} — {desc}" for name, desc in bus_tools]
+                return "\n".join(lines).strip()
             params = {"agent_id": agent_id} if agent_id else {}
             skills = adapter._get("/v1/skills", params=params)
             if not skills:

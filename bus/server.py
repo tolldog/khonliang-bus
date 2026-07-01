@@ -22,6 +22,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from functools import lru_cache
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -39,6 +41,32 @@ from bus.webhooks import build_topic, summarize, verify_signature
 from bus import webhook_install
 
 logger = logging.getLogger(__name__)
+
+#: Agent ids the bus reserves for itself. ``bus`` is the bus's own catalog
+#: identity (fr_khonliang-bus_6638f4dc) — bus_welcome renders it and
+#: bus_skills(agent_id="bus") returns the built-in tool catalog, so a real
+#: agent must not claim the name (it would create ambiguous filter semantics).
+RESERVED_AGENT_IDS = frozenset({"bus"})
+
+
+@lru_cache(maxsize=1)
+def load_bus_self_welcome() -> dict:
+    """The bus's own welcome blob (``bus/welcome.json``).
+
+    Static content loaded lazily on first call and cached, so ``bus_welcome`` can render
+    the bus as a first-class participant in its own catalog without touching
+    the agent registry (fr_khonliang-bus_6638f4dc). The declared ``bus_*`` skill
+    list is asserted against the adapter's actually-registered tools by
+    ``tests/test_bus_self_welcome.py`` so it can't silently drift.
+    """
+    with Path(__file__).with_name("welcome.json").open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def bus_self_skill_names() -> list[str]:
+    """Flattened list of every skill the bus declares in its welcome catalog."""
+    cats = load_bus_self_welcome().get("skills_by_category", {})
+    return [name for skills in cats.values() for name in skills]
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +404,13 @@ class BusServer:
         ``healthy`` with stale PIDs — so :meth:`start_agent` returns
         ``already_running`` against PIDs that no longer exist and operators
         must :meth:`restart_agent` to break the no-op cycle (fr_khonliang-bus_5c58c4e9).
+
+        Also purges any catalog rows for RESERVED_AGENT_IDS: reservation now
+        blocks new install/register, but an UPGRADED deployment could already
+        hold a real agent named ``bus`` that would otherwise be silently
+        shadowed by the synthetic self-catalog (fr_khonliang-bus_6638f4dc).
         """
+        purged = self._purge_reserved_agents()
         pids_reaped = 0
         kept = 0
         for reg in self.db.get_registrations():
@@ -390,8 +424,45 @@ class BusServer:
             self.db.deregister_agent(reg["id"])
             pids_reaped += 1
             logger.info("Reconciled agent %s on boot (pid=%s not alive)", reg["id"], pid)
-        logger.info("Boot reconciliation: pids_reaped=%d kept=%d", pids_reaped, kept)
+        logger.info("Boot reconciliation: pids_reaped=%d kept=%d purged_reserved=%d", pids_reaped, kept, purged)
+        # Return shape unchanged (pids_reaped/kept) — the reserved purge is a
+        # boot-hygiene side effect logged above, not part of the public result.
         return {"pids_reaped": pids_reaped, "kept": kept}
+
+    def _purge_reserved_agents(self) -> int:
+        """Remove any catalog rows (registration + install + welcome) for a
+        RESERVED_AGENT_ID left over from before the reservation existed, so an
+        upgraded deployment doesn't have a real agent shadowed by the synthetic
+        bus self-catalog. Returns the count purged."""
+        purged = 0
+        for agent_id in RESERVED_AGENT_IDS:
+            had = (
+                self.db.get_registration(agent_id) is not None
+                or self.db.get_installed_agent(agent_id) is not None
+                or self.db.get_agent_welcome(agent_id) is not None
+            )
+            if not had:
+                continue
+            # Purge the CATALOG rows only — deliberately do NOT signal the
+            # persisted PID. A bare stored PID can't prove ownership, and after a
+            # reboot / PID reuse ``_pid_alive`` may be true for an unrelated
+            # process under the same UID; killing it would be worse than the row
+            # cleanup. This matches the normal boot reconciliation above, which
+            # also only deregisters stale-PID rows and never signals them.
+            # (_stop_process still terminates a process THIS instance spawned.)
+            self._stop_process(agent_id)
+            self.db.deregister_agent(agent_id)
+            self.db.uninstall_agent(agent_id)
+            # Welcomes survive deregister, so clear it explicitly — otherwise
+            # /v1/agents/<id>/welcome + /v1/agents/welcomes still leak the stale
+            # blob for the reserved id.
+            self.db.delete_agent_welcome(agent_id)
+            purged += 1
+            logger.warning(
+                "Purged reserved agent id %r from the catalog on boot "
+                "(reserved for the bus's own self-catalog)", agent_id,
+            )
+        return purged
 
     def autostart_installed_agents(self) -> dict:
         """Walk ``installed_agents`` and launch each via :meth:`start_agent`.
@@ -991,6 +1062,8 @@ class BusServer:
     # -- agent lifecycle --
 
     def install_agent(self, req: InstallRequest) -> dict:
+        if req.id in RESERVED_AGENT_IDS:
+            return {"id": req.id, "error": f"'{req.id}' is a reserved agent id"}
         self.db.install_agent(
             agent_id=req.id,
             agent_type=req.agent_type,
@@ -1112,6 +1185,11 @@ class BusServer:
     # -- agent registration --
 
     async def register_agent(self, req: RegisterRequest) -> dict:
+        if req.id in RESERVED_AGENT_IDS:
+            return {
+                "id": req.id,
+                "error": f"'{req.id}' is a reserved agent id (the bus's own catalog)",
+            }
         self.db.register_agent(
             agent_id=req.id,
             agent_type=req.id.rsplit("-", 1)[0] if "-" in req.id else req.id,
@@ -2015,7 +2093,8 @@ class BusServer:
     #: Wire schema version for ``get_bus_welcome``. Bump when the response
     #: shape changes in a way callers must adapt to (additive fields don't
     #: warrant a bump — clients should ignore unknown keys per
-    #: ``feedback_cheap_irreversible_principle``).
+    #: ``feedback_cheap_irreversible_principle``). The top-level ``bus`` field
+    #: (fr_khonliang-bus_6638f4dc) is purely additive, so it does NOT bump this.
     BUS_WELCOME_SCHEMA_VERSION = 1
 
     def get_bus_welcome(self, detail: str = "brief") -> dict:
@@ -2069,6 +2148,11 @@ class BusServer:
         )
 
         for agent_id in all_ids:
+            # A reserved id (e.g. ``bus``) is rendered by the synthetic ``bus``
+            # field below, not as a pseudo-agent — skip any residual catalog row
+            # (e.g. a welcome that survived deregister) so it isn't double-listed.
+            if agent_id in RESERVED_AGENT_IDS:
+                continue
             svc = services_by_id.get(agent_id)
             inst = installed_by_id.get(agent_id)
             welcome_record = welcomes.get(agent_id)
@@ -2153,6 +2237,34 @@ class BusServer:
         suggested.append("bus_skills(agent_id=<id>) for full per-agent skill schemas")
         suggested.append("bus_topics for the event surface (subscribe via bus_wait_for_event)")
 
+        # The bus as a first-class entry in its own catalog (symmetric with
+        # agents, per fr_khonliang-bus_6638f4dc) — a sibling top-level ``bus``
+        # field rather than an entry in ``agents[]``, so consumers iterating the
+        # agent list don't get a non-dispatchable pseudo-agent (the bus has no
+        # callback and is never a routing target). Content is synthesized from
+        # bus/welcome.json at read time — no registry/catalog write.
+        blob = load_bus_self_welcome()
+        skill_names = bus_self_skill_names()
+        bus_entry: dict = {
+            "kind": "bus",
+            "identity": blob.get("identity", ""),
+            "role": blob.get("role", ""),
+            "skill_count": len(skill_names),
+            # If this call is being answered, the bus process is up.
+            "state": "healthy",
+        }
+        if detail == "full":
+            # Copy nested structures out of the cached blob so a caller mutating
+            # the response can't corrupt the process-lifetime cache.
+            bus_entry["skills_by_category"] = {
+                cat: list(names)
+                for cat, names in blob.get("skills_by_category", {}).items()
+            }
+            for k in ("boundaries", "suggested_next"):
+                val = blob.get(k)
+                if val:
+                    bus_entry[k] = list(val) if isinstance(val, list) else val
+
         return {
             "platform": {
                 "name": "khonliang",
@@ -2163,6 +2275,7 @@ class BusServer:
                 "bus_uptime_s": int(time.time() - self._started_at),
                 "schema_version": self.BUS_WELCOME_SCHEMA_VERSION,
             },
+            "bus": bus_entry,
             "agents": agents,
             "suggested_next": suggested,
         }
@@ -2436,6 +2549,16 @@ class BusServer:
 
                 if msg_type == "register":
                     agent_id = data["id"]
+                    if agent_id in RESERVED_AGENT_IDS:
+                        # Reserved for the bus's own catalog — reject and close
+                        # rather than let a real agent shadow it.
+                        await ws.send_json({
+                            "type": "register_error",
+                            "error": f"'{agent_id}' is a reserved agent id (the bus's own catalog)",
+                        })
+                        agent_id = None
+                        await ws.close()
+                        return
                     self._agent_connections[agent_id] = ws
                     # Store registration in DB.
                     # launch_spec / launch_info: optional handshake extension
@@ -2892,6 +3015,13 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.post("/v1/agents/{agent_id}/welcome")
     def agent_welcome_set(agent_id: str, payload: dict[str, Any]):
+        # Reserved ids (e.g. ``bus``) can't hold an agent welcome — the bus's own
+        # welcome is synthesized from bus/welcome.json (fr_khonliang-bus_6638f4dc).
+        if agent_id in RESERVED_AGENT_IDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{agent_id}' is a reserved agent id",
+            )
         # Late-update / operator-override path for the welcome catalog
         # (fr_khonliang-bus_f96722dd "POST /v1/agents/<id>/welcome").
         # Accepts a JSON dict; persists it as the agent's welcome. Idempotent:

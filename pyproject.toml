@@ -23,6 +23,11 @@ khonliang-bus = "bus.__main__:main"
 [tool.setuptools.packages.find]
 include = ["bus*"]
 
+[tool.setuptools.package-data]
+# Ship the bus self-welcome blob (fr_khonliang-bus_6638f4dc) with the package
+# so a wheel/sdist install can still load it at runtime.
+bus = ["*.json"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
