@@ -141,20 +141,34 @@ async def _run_dual_bind(servers, uds_server, uds_path: Path | None) -> None:
         except (NotImplementedError, ValueError, RuntimeError):  # pragma: no cover
             pass  # non-Unix loop / not main thread — best effort
 
-    tasks = [asyncio.create_task(s.serve()) for s in servers]
+    task_of = {s: asyncio.create_task(s.serve()) for s in servers}
+    active = list(servers)
     try:
-        while not all(s.started for s in servers):
-            if any(t.done() for t in tasks):
-                raise SystemExit("bus: a listener failed to bind; aborting startup")
+        while not all(s.started for s in active):
+            for s in list(active):
+                if task_of[s].done() and not s.started:
+                    # This listener's serve() returned before startup → bind
+                    # failed. UDS is OPTIONAL: degrade to the remaining listeners
+                    # (TCP keeps serving) rather than aborting. TCP is required,
+                    # so its failure is fatal.
+                    if s is uds_server:
+                        logger.warning("bus: UDS bind failed; continuing without it (TCP only)")
+                        active.remove(s)
+                    else:
+                        raise SystemExit("bus: TCP listener failed to bind; aborting startup")
+            if not active:
+                raise SystemExit("bus: no listener could bind; aborting startup")
+            if all(s.started for s in active):
+                break
             await asyncio.sleep(0.05)
-        await asyncio.gather(*tasks)  # all up — run until they stop
+        await asyncio.gather(*(task_of[s] for s in active))  # all up — run until they stop
     finally:
         for sig in installed_sigs:
             with contextlib.suppress(ValueError, NotImplementedError):
                 loop.remove_signal_handler(sig)
         for s in servers:
             s.should_exit = True
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*task_of.values(), return_exceptions=True)
         # Remove the socket ("socket exists = bus running") — but ONLY if OUR
         # server bound it. A UDS bind that lost a concurrent start race (never
         # .started) belongs to the winner; deleting it would black-hole the live

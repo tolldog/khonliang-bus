@@ -251,6 +251,27 @@ async def test_run_dual_bind_aborts_on_bind_failure():
     assert good.should_exit  # survivor was torn down, not left serving alone
 
 
+async def test_run_dual_bind_degrades_when_uds_fails(tmp_path):
+    """UDS is optional — if its bind fails but TCP is up, keep serving TCP
+    (don't abort). Only a TCP failure is fatal."""
+    tcp = _FakeServer()
+    uds = _FakeServer(fail=True)
+
+    async def _stop_tcp():
+        while not tcp.started:
+            await asyncio.sleep(0.01)
+        tcp.should_exit = True
+
+    # servers = [tcp, uds]; uds_server=uds → uds fail degrades, tcp serves.
+    sock = tmp_path / "bus.sock"
+    await asyncio.gather(
+        busmain._run_dual_bind([tcp, uds], uds, sock),  # no raise
+        _stop_tcp(),
+    )
+    assert tcp.started  # TCP served despite the UDS bind failure
+    assert not sock.exists()  # UDS never .started → not unlinked (nothing to remove)
+
+
 async def test_run_dual_bind_both_up_serves_until_exit():
     a, b = _FakeServer(), _FakeServer()
 
