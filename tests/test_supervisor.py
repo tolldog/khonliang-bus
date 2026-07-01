@@ -502,6 +502,48 @@ def test_restart_failure_keeps_supervising_then_gives_up(tmp_path):
     assert "broken" not in bus._processes
 
 
+def test_backoff_deregisters_stale_registration(tmp_path, monkeypatch):
+    """While an agent backs off, its stale registration is cleared so request
+    routing / get_registration don't resolve a dead callback during cooldown."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    bus._now = lambda: 10.0
+
+    proc = _FakePopen(pid=4242, alive=False, returncode=1)
+    bus._processes["a1"] = proc
+    # Prior restart put it in backoff; its own registration row is still present.
+    bus._supervisor_backoff["a1"] = {"restarts": 1, "next_attempt_at": 100.0, "last_restart_at": 0.0}
+    db.register_agent(agent_id="a1", agent_type="test", callback_url="cb", pid=4242)
+
+    result = bus.supervise_once()
+
+    assert result["backing_off"] == ["a1"]
+    assert db.get_registration("a1") is None  # dead row cleared during backoff
+
+
+def test_replacement_during_backoff_stops_tracking_dead_popen(tmp_path):
+    """A replacement that registers during backoff is caught by the guard (which
+    runs BEFORE the backoff skip): the dead Popen is dropped so lifecycle ops
+    don't act on it, and the replacement's registration is not wiped."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    bus._now = lambda: 10.0
+
+    bus._processes["a1"] = _FakePopen(pid=4242, alive=False, returncode=1)
+    bus._supervisor_backoff["a1"] = {"restarts": 1, "next_attempt_at": 100.0, "last_restart_at": 0.0}
+    # Replacement registered out-of-band with a DIFFERENT pid.
+    db.register_agent(agent_id="a1", agent_type="test", callback_url="cb", pid=9999)
+
+    result = bus.supervise_once()
+
+    assert result["alive"] == ["a1"]
+    assert "a1" not in bus._processes            # dead Popen dropped
+    assert "a1" not in bus._supervisor_backoff
+    assert db.get_registration("a1") is not None  # replacement not wiped
+
+
 def test_restart_on_crash_false_disables_restart(tmp_path, monkeypatch):
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
