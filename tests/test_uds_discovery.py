@@ -97,6 +97,17 @@ def test_resolve_tcp_override(monkeypatch):
     assert busmain._resolve_tcp(_Args()) == ("127.0.0.1", 9999)
 
 
+def test_resolve_self_url_prefers_tcp():
+    from pathlib import Path
+    assert busmain._resolve_self_url(("0.0.0.0", 8787), Path("/x/bus.sock")) == "http://localhost:8787"
+
+
+def test_resolve_self_url_uds_only():
+    from pathlib import Path
+    # TCP disabled → advertise the socket, not a dead port.
+    assert busmain._resolve_self_url(None, Path("/x/bus.sock")) == "unix:///x/bus.sock"
+
+
 def test_clear_stale_socket_removes_dead(tmp_path):
     sock = tmp_path / "bus.sock"
     sock.touch()  # a file, nothing listening → stale

@@ -68,6 +68,18 @@ def _clear_stale_socket(sock_path: Path) -> None:
     sock_path.unlink(missing_ok=True)  # stale from a crashed bus
 
 
+def _resolve_self_url(tcp: tuple[str, int] | None, uds_path: Path | None) -> str:
+    """The bus's own address, handed to spawned agents (as ``--bus``) and used
+    for internal self-calls. Prefer TCP (a real URL); in UDS-only mode advertise
+    the socket so agents reach a LIVE listener instead of a dead port. (UDS-only
+    requires UDS-capable agents — bus-lib Phase 2, fr_khonliang-bus-lib_042279e2.)"""
+    if tcp is not None:
+        return f"http://localhost:{tcp[1]}"
+    if uds_path is not None:
+        return f"unix://{uds_path}"
+    return "http://localhost:8787"
+
+
 async def _serve(app, tcp: tuple[str, int] | None, uds_path: Path | None) -> None:
     """Run the bus on TCP and/or UDS concurrently (one app, shared state)."""
     servers = []
@@ -138,10 +150,7 @@ def main():
     if tcp is None and uds_path is None:
         raise SystemExit("bus: both UDS and TCP disabled — nothing to bind")
 
-    # bus_url is the bus's self-reference for internal HTTP; prefer the TCP
-    # address (a real URL), else the UDS path is not a usable http URL so fall
-    # back to a localhost default (UDS-only is an advanced mode).
-    bus_url = f"http://localhost:{tcp[1]}" if tcp is not None else "http://localhost:8787"
+    bus_url = _resolve_self_url(tcp, uds_path)
 
     app = create_app(
         db_path=args.db,
