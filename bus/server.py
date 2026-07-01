@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 def load_bus_self_welcome() -> dict:
     """The bus's own welcome blob (``bus/welcome.json``).
 
-    Static content loaded at startup and cached, so ``bus_welcome`` can render
+    Static content loaded lazily on first call and cached, so ``bus_welcome`` can render
     the bus as a first-class participant in its own catalog without touching
     the agent registry (fr_khonliang-bus_6638f4dc). The declared ``bus_*`` skill
     list is asserted against the adapter's actually-registered tools by

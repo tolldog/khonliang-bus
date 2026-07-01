@@ -123,6 +123,20 @@ async def test_bus_skills_for_bus_returns_catalog():
 
 
 @pytest.mark.asyncio
+async def test_bus_skills_bus_handles_whitespace_only_description():
+    """A bus tool with a whitespace-only description must not crash the catalog
+    (`.strip().splitlines()[0]` would IndexError on an empty split)."""
+    a = _adapter()
+
+    @a.mcp.tool(name="bus_blankdesc", description="   \n  ")
+    def _blank() -> str:  # pragma: no cover - never invoked
+        return ""
+
+    result = await a.mcp.call_tool("bus_skills", {"agent_id": "bus"})  # must not raise
+    assert "bus_blankdesc" in result[1]["result"]
+
+
+@pytest.mark.asyncio
 async def test_bus_skills_bus_includes_real_agent_named_bus(monkeypatch):
     """'bus' isn't a reserved agent id — if a real agent registers as 'bus', its
     skills must still be discoverable alongside the built-in catalog."""

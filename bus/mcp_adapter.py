@@ -987,12 +987,12 @@ class BusMCPAdapter:
                 # filter alone would wrongly include an agent whose id starts with
                 # ``bus_`` (its skill tools are ``bus_worker.skill``); excluding
                 # _registered_tools is the precise built-in-vs-agent discriminator.
+                def _first_line(desc: str | None) -> str:
+                    lines = (desc or "").strip().splitlines()
+                    return lines[0] if lines else ""  # guard whitespace-only descs
+
                 bus_tools = sorted(
-                    (
-                        t.name,
-                        (t.description or "").strip().splitlines()[0]
-                        if t.description else "",
-                    )
+                    (t.name, _first_line(t.description))
                     for t in tools
                     if t.name.startswith("bus_") and t.name not in adapter._registered_tools
                 )
