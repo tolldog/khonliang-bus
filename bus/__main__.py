@@ -180,14 +180,20 @@ async def _run_dual_bind(servers, uds_server, uds_path: Path | None) -> None:
 
 async def _serve(app, tcp: tuple[str, int] | None, uds_path: Path | None) -> None:
     """Run the bus on TCP and/or UDS concurrently (one app, shared state)."""
+    # log_config=None: leave logging to OUR root config instead of uvicorn's
+    # dictConfig, whose logger tree doesn't propagate to root — without this,
+    # ASGI stack traces / startup errors / access lines would bypass bus.log
+    # and the L0 debugging floor would miss exactly the failures it exists for.
+    # With no handlers of their own, uvicorn's loggers propagate to root
+    # (stderr + the rotating bus.log handler).
     servers = []
     uds_server = None
     if tcp is not None:
         host, port = tcp
-        servers.append(uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info")))
+        servers.append(uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info", log_config=None)))
         logger.info("bus: TCP listener on %s:%d", host, port)
     if uds_path is not None:
-        uds_server = uvicorn.Server(uvicorn.Config(app, uds=str(uds_path), log_level="info"))
+        uds_server = uvicorn.Server(uvicorn.Config(app, uds=str(uds_path), log_level="info", log_config=None))
         servers.append(uds_server)
         logger.info("bus: UDS listener on %s", uds_path)
     await _run_dual_bind(servers, uds_server, uds_path)
