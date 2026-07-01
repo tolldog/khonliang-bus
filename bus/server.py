@@ -1426,7 +1426,7 @@ class BusServer:
         # Deliver model-scoped learnings on the HTTP register path too, so
         # HTTP-registered agents aren't silently starved (fr_khonliang-bus_ffd4cf00).
         resp: dict[str, Any] = {"id": req.id, "status": "registered"}
-        agent_type = req.id.rsplit("-", 1)[0] if "-" in req.id else req.id
+        agent_type = self._resolve_agent_type(req.id)  # install-first (id != type safe)
         learnings = self.db.get_learnings(agent_type, req.models or {})
         if learnings:
             resp["learnings"] = learnings
@@ -1444,6 +1444,17 @@ class BusServer:
         return {"id": req.id, "status": "not_registered"}
 
     # -- learnings (fr_khonliang-bus_ffd4cf00) --
+
+    def _resolve_agent_type(self, agent_id: str, declared: str | None = None) -> str:
+        """The agent_type to scope learnings by. Prefer the INSTALLED row's
+        agent_type — operator-set at install, so it's trusted and can't be
+        spoofed by a register payload, and it's correct even when id != type
+        (custom-id installs). Fall back to the declared type (WS) / id-derivation
+        for ad-hoc, not-installed agents (which are self-declared by design)."""
+        inst = self.db.get_installed_agent(agent_id)
+        if inst and inst.get("agent_type"):
+            return inst["agent_type"]
+        return declared or (agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id)
 
     def save_learning(
         self,
@@ -2903,9 +2914,8 @@ class BusServer:
                     # don't send ``models`` get nothing (they can't consume
                     # learnings until the bus-lib Phase 2 anyway).
                     ack: dict[str, Any] = {"type": "registered", "id": agent_id}
-                    registered_type = data.get("agent_type") or (
-                        agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id
-                    )
+                    # Trusted for installed agents (spoof-proof); declared for ad-hoc.
+                    registered_type = self._resolve_agent_type(agent_id, data.get("agent_type"))
                     learnings = self.db.get_learnings(registered_type, data.get("models") or {})
                     if learnings:
                         ack["learnings"] = learnings
@@ -2914,11 +2924,14 @@ class BusServer:
                     await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "registered"})
 
                 elif msg_type == "save_learning":
-                    # Bind to THIS socket's registered identity — never trust the
-                    # payload's agent_type/source, or a compromised agent could
-                    # poison another agent type's learnings (fed back via its
-                    # register ack) or forge 'operator' provenance. Operator saves
-                    # come through the authenticated HTTP/MCP path instead.
+                    # Bind to THIS socket's resolved agent_type (install-anchored
+                    # + trusted for installed agents; self-declared for ad-hoc)
+                    # and force source='agent' — an installed agent can't poison
+                    # another type's learnings, and no WS client can forge
+                    # 'operator' provenance (operator saves use the HTTP/MCP
+                    # path). The ad-hoc-declares-an-installed-type residual is
+                    # dominated by the pre-existing install-RCE surface on the
+                    # same unauthenticated port (see the /v1/learnings comment).
                     if registered_type:
                         self.save_learning(
                             agent_type=registered_type,

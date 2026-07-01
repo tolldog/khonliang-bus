@@ -111,6 +111,30 @@ def test_min_confidence_filter(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_resolve_agent_type_prefers_install(tmp_path):
+    """Installed agents are anchored to their operator-set install-time type
+    (trusted, spoof-proof, and correct when id != type); ad-hoc agents fall back
+    to declared/id-derived."""
+    bus = BusServer(_db(tmp_path), config={})
+    bus.db.install_agent(agent_id="primary", agent_type="researcher",
+                         command="/bin/true", args=[], cwd="/tmp", config="/c.yaml")
+    assert bus._resolve_agent_type("primary", declared="spoofed") == "researcher"  # install wins over payload
+    assert bus._resolve_agent_type("adhoc-1", declared="adhoc") == "adhoc"          # not installed → declared
+    assert bus._resolve_agent_type("researcher-2") == "researcher"                  # id-derived fallback
+
+
+def test_http_register_custom_id_scopes_by_installed_type(client):
+    """id != agent_type installs (R5-P2): learnings saved under the real
+    agent_type are returned even though the id differs."""
+    client.post("/v1/install", json={
+        "id": "primary", "agent_type": "researcher",
+        "command": "/bin/true", "args": [], "cwd": "/tmp", "config": "/c.yaml",
+    })
+    client.post("/v1/learnings", json={"agent_type": "researcher", "role": "r", "model": "m", "learning": "x"})
+    r = client.post("/v1/register", json={"id": "primary", "callback": "c", "pid": 1, "models": {"r": "m"}})
+    assert r.json()["learnings"]["r"]["rules"][0]["learning"] == "x"
+
+
 def test_server_save_learning_requires_fields(tmp_path):
     bus = BusServer(_db(tmp_path), config={})
     assert "error" in bus.save_learning(agent_type="a", role="", model="m", learning="x")
