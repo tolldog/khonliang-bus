@@ -148,6 +148,53 @@ def _readlink(path: str) -> str:
         return ""
 
 
+def _cleanup_buslog_handlers():
+    """Remove any bus.log handlers _setup_file_logging attached to the root
+    logger so tests don't leak handlers into each other."""
+    import logging
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if isinstance(h, logging.handlers.RotatingFileHandler):
+            root.removeHandler(h)
+            h.close()
+
+
+def test_setup_file_logging_happy_path(tmp_path):
+    import bus.__main__ as busmain
+    try:
+        assert busmain._setup_file_logging(str(tmp_path / "logs")) == str(tmp_path / "logs")
+        assert (tmp_path / "logs").is_dir()
+    finally:
+        _cleanup_buslog_handlers()
+
+
+def test_setup_file_logging_empty_disables(tmp_path):
+    import bus.__main__ as busmain
+    assert busmain._setup_file_logging("") == ""
+    assert busmain._setup_file_logging(None) == ""
+
+
+def test_setup_file_logging_unusable_dir_disables(tmp_path):
+    import bus.__main__ as busmain
+    blocker = tmp_path / "f"
+    blocker.write_text("x")
+    assert busmain._setup_file_logging(str(blocker / "logs")) == ""
+
+
+def test_buslog_only_failure_keeps_agent_logs(tmp_path):
+    """A bus.log-only failure (bus.log is a directory) must not disable
+    per-agent logging in a still-usable dir — no layer degrades the one below
+    it (codex R1)."""
+    import bus.__main__ as busmain
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "bus.log").mkdir()  # RotatingFileHandler open fails; dir is fine
+    try:
+        assert busmain._setup_file_logging(str(log_dir)) == str(log_dir)  # NOT disabled
+    finally:
+        _cleanup_buslog_handlers()
+
+
 def test_agent_log_max_bytes_floor(tmp_path):
     bus = _bus(tmp_path, agent_log_dir=str(tmp_path / "logs"), agent_log_max_bytes=5)
     assert bus._agent_log_max_bytes == 1_000_000  # floored, not 5 bytes

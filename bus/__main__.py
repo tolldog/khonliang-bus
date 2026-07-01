@@ -193,6 +193,39 @@ async def _serve(app, tcp: tuple[str, int] | None, uds_path: Path | None) -> Non
     await _run_dual_bind(servers, uds_server, uds_path)
 
 
+def _setup_file_logging(raw_log_dir: str | None) -> str:
+    """Prepare the L0 log dir and attach the bus.log handler; return the
+    effective log dir ("" = file logging disabled).
+
+    Failure semantics follow the design invariant (no layer may degrade the one
+    below it): an unusable DIRECTORY disables everything (agent files can't be
+    written either), but a bus.log-only failure (e.g. bus.log is a directory or
+    an unwritable file) merely skips the bus's own handler — per-agent files in
+    the still-usable dir keep working. The bus owns the bus.log handle, so a
+    RotatingFileHandler is safe here (unlike the agent files, whose fds the
+    children own)."""
+    log_dir = raw_log_dir.strip() if raw_log_dir else ""
+    if not log_dir:
+        return ""
+    try:
+        log_dir_path = Path(log_dir).expanduser()
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("bus: log dir %s unusable (%s); file logging disabled", log_dir, e)
+        return ""
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            log_dir_path / "bus.log", maxBytes=50_000_000, backupCount=1
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+        )
+        logging.getLogger().addHandler(handler)
+    except OSError as e:
+        logger.warning("bus: bus.log unavailable (%s); agent logs unaffected", e)
+    return log_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="khonliang-bus agent platform")
     parser.add_argument("--port", type=int, default=8787)
@@ -249,21 +282,7 @@ def main():
     # (the bus owns this handle, so in-process rotation is safe — unlike the
     # agent files, whose fds the children own). Guarded: an unwritable dir
     # skips the handler; stderr/systemd logging is unaffected either way.
-    log_dir = args.log_dir.strip() if args.log_dir else ""
-    if log_dir:
-        try:
-            log_dir_path = Path(log_dir).expanduser()
-            log_dir_path.mkdir(parents=True, exist_ok=True)
-            handler = logging.handlers.RotatingFileHandler(
-                log_dir_path / "bus.log", maxBytes=50_000_000, backupCount=1
-            )
-            handler.setFormatter(
-                logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
-            )
-            logging.getLogger().addHandler(handler)
-        except OSError as e:
-            logger.warning("bus: log dir %s unusable (%s); file logging disabled", log_dir, e)
-            log_dir = ""
+    log_dir = _setup_file_logging(args.log_dir)
 
     tcp = _resolve_tcp(args)
     # Absolutize a custom --uds: bus_url (unix://<path>) is forwarded to spawned
