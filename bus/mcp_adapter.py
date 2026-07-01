@@ -1006,9 +1006,20 @@ class BusMCPAdapter:
                 real = adapter._get("/v1/skills", params={"agent_id": "bus"})
                 if real:
                     lines.append("\n  bus (registered agent):")
-                    lines += [
-                        f"    {s['name']} — {s.get('description', '')}" for s in real
-                    ]
+                    for s in real:
+                        # Surface the fitted tool handle for a name-capped skill
+                        # (same as the normal branch) — otherwise the advertised
+                        # raw name isn't callable.
+                        raw = f"{s['agent_id']}.{s['name']}"
+                        fitted = adapter._fit_tool_name(raw)
+                        handle = (
+                            f"  [tool: {fitted}]"
+                            if fitted != raw and fitted in adapter._registered_tools
+                            else ""
+                        )
+                        lines.append(
+                            f"    {s['name']} — {s.get('description', '')}{handle}"
+                        )
                 if not lines:
                     return "no skills registered"
                 return "\n".join(lines).strip()

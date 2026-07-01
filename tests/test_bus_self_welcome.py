@@ -79,6 +79,21 @@ def test_bus_welcome_includes_bus_entry(tmp_path):
     assert all(a["agent_id"] != "bus" for a in w["agents"])
 
 
+def test_bus_welcome_full_does_not_leak_cached_blob(tmp_path):
+    """Mutating the returned bus.skills_by_category / suggested_next must not
+    corrupt the process-lifetime cached welcome blob."""
+    db = BusDB(str(tmp_path / "b.db"))
+    bus = BusServer(db, config={})
+
+    w1 = bus.get_bus_welcome(detail="full")
+    w1["bus"]["skills_by_category"]["discovery"].append("bus_INJECTED")
+    w1["bus"]["suggested_next"].append("INJECTED")
+
+    w2 = bus.get_bus_welcome(detail="full")
+    assert "bus_INJECTED" not in w2["bus"]["skills_by_category"]["discovery"]
+    assert "INJECTED" not in w2["bus"]["suggested_next"]
+
+
 def test_bus_welcome_full_has_skill_categories(tmp_path):
     db = BusDB(str(tmp_path / "b.db"))
     bus = BusServer(db, config={})
@@ -144,7 +159,7 @@ async def test_bus_skills_bus_includes_real_agent_named_bus(monkeypatch):
 
     def _fake_get(path, params=None):
         if path == "/v1/skills" and params == {"agent_id": "bus"}:
-            return [{"name": "real_skill", "description": "a real agent skill"}]
+            return [{"agent_id": "bus", "name": "real_skill", "description": "a real agent skill"}]
         return None
 
     a._get = _fake_get

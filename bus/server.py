@@ -2193,10 +2193,16 @@ class BusServer:
             "state": "healthy",
         }
         if detail == "full":
-            bus_entry["skills_by_category"] = blob.get("skills_by_category", {})
+            # Copy nested structures out of the cached blob so a caller mutating
+            # the response can't corrupt the process-lifetime cache.
+            bus_entry["skills_by_category"] = {
+                cat: list(names)
+                for cat, names in blob.get("skills_by_category", {}).items()
+            }
             for k in ("boundaries", "suggested_next"):
-                if blob.get(k):
-                    bus_entry[k] = blob[k]
+                val = blob.get(k)
+                if val:
+                    bus_entry[k] = list(val) if isinstance(val, list) else val
 
         return {
             "platform": {
