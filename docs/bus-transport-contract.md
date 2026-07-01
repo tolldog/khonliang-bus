@@ -21,9 +21,14 @@ coordinate.
    `~/.khonliang/` if absent), serving **both** HTTP (`/v1/…`) and WebSocket
    (`/v1/agent`, `/v1/subscribe`) on that one socket.
 2. The bus **also** binds TCP (default `0.0.0.0:8787`, override via
-   `KHONLIANG_BUS_LISTEN=host:port`, disable via `KHONLIANG_BUS_LISTEN=off`) so
-   remote callers and not-yet-migrated agents keep working during the
-   transition. UDS + TCP serve the same bus (one process, one app, shared state).
+   `KHONLIANG_BUS_LISTEN=host:port`) so remote callers and not-yet-migrated
+   agents keep working during the transition. UDS + TCP serve the same bus (one
+   process, one app, shared state). **Disabling TCP (`KHONLIANG_BUS_LISTEN=off`,
+   UDS-only) is refused until Phase 2** — the bus's own internal callers
+   (`_start_process` forwards `bus_url` as `--bus`; the orchestrator builds
+   `f"{bus_url}/v1/request"`) still assume an HTTP base URL, so a `unix://`
+   self-URL would break autostart/lazy launches and flow dispatch. The gate
+   lifts when bus-lib Phase 2 (fr_khonliang-bus-lib_042279e2) lands.
 3. **Socket existence ⟺ a bus is/was listening.** On clean shutdown the bus
    unlinks the socket. A *stale* socket left by a crash is unlinked by the next
    bus start (only if nothing is listening on it — a live bus's socket is never

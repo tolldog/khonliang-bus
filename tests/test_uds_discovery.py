@@ -110,9 +110,38 @@ def test_resolve_self_url_uds_only():
 
 def test_clear_stale_socket_removes_dead(tmp_path):
     sock = tmp_path / "bus.sock"
-    sock.touch()  # a file, nothing listening → stale
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(sock))
+    s.close()  # socket file remains, nothing listening → stale, ConnectionRefused
+    assert sock.exists()
     busmain._clear_stale_socket(sock)
     assert not sock.exists()
+
+
+def test_clear_stale_socket_refuses_non_socket(tmp_path):
+    """A --uds pointing at a real file must NOT be silently deleted."""
+    f = tmp_path / "bus.sock"
+    f.write_text("important data")
+    with pytest.raises(SystemExit):
+        busmain._clear_stale_socket(f)
+    assert f.exists()  # data preserved
+
+
+def test_validate_binds_rejects_uds_only(tmp_path):
+    from pathlib import Path
+    # UDS-only is blocked until bus-lib Phase 2 (internal callers assume HTTP).
+    with pytest.raises(SystemExit):
+        busmain._validate_binds(None, Path("/x/bus.sock"))
+
+
+def test_validate_binds_rejects_nothing(tmp_path):
+    with pytest.raises(SystemExit):
+        busmain._validate_binds(None, None)
+
+
+def test_validate_binds_allows_dual(tmp_path):
+    from pathlib import Path
+    busmain._validate_binds(("0.0.0.0", 8787), Path("/x/bus.sock"))  # no raise
 
 
 def test_clear_stale_socket_refuses_live(tmp_path):

@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import socket
+import stat
 import sys
 from pathlib import Path
 
@@ -45,27 +46,54 @@ def _resolve_tcp(args) -> tuple[str, int] | None:
 
 
 def _clear_stale_socket(sock_path: Path) -> None:
-    """Remove a stale socket from a crashed bus, but never clobber a live one.
+    """Reclaim a dead bus socket, but never delete anything we can't prove is one.
 
-    If something is already listening on the path, a second bus must NOT start
-    (single-bus-per-host). If nothing answers, the file is a leftover from a
-    crash and is safe to unlink so the fresh bind succeeds."""
+    Only a path that IS a socket and gives a definitive ``ConnectionRefused``
+    (no listener) is unlinked. A non-socket file, a live listener, or an
+    ambiguous probe error (permission/timeout) makes the bus refuse to start
+    rather than silently deleting something — unlinking a misconfigured ``--uds``
+    that points at a real file would be data loss."""
     if not sock_path.exists():
         return
+    if not stat.S_ISSOCK(sock_path.stat().st_mode):
+        raise SystemExit(
+            f"bus: {sock_path} exists and is not a socket; refusing to overwrite it"
+        )
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     probe.settimeout(0.5)
     try:
         probe.connect(str(sock_path))
-        live = True
-    except OSError:
-        live = False
-    finally:
-        probe.close()
-    if live:
+    except ConnectionRefusedError:
+        sock_path.unlink(missing_ok=True)  # dead socket from a crashed bus
+        return
+    except OSError as e:
+        raise SystemExit(
+            f"bus: cannot probe existing socket {sock_path}: {e}; refusing to start"
+        )
+    else:
         raise SystemExit(
             f"bus: another bus is already listening on {sock_path}; refusing to start"
         )
-    sock_path.unlink(missing_ok=True)  # stale from a crashed bus
+    finally:
+        probe.close()
+
+
+def _validate_binds(tcp: tuple[str, int] | None, uds_path: Path | None) -> None:
+    """Reject bind combinations that can't work yet.
+
+    UDS-only (TCP disabled) is refused until agents are UDS-capable: internal
+    callers (``_start_process`` forwards bus_url as ``--bus``; the orchestrator
+    builds ``f'{bus_url}/v1/request'``) still assume an HTTP base URL, so a
+    ``unix://`` self-URL would break autostart/lazy launches and flow dispatch.
+    Lift this once bus-lib Phase 2 (fr_khonliang-bus-lib_042279e2) lands."""
+    if tcp is None and uds_path is None:
+        raise SystemExit("bus: both UDS and TCP disabled — nothing to bind")
+    if tcp is None:
+        raise SystemExit(
+            "bus: UDS-only mode (TCP disabled) requires UDS-capable agents — "
+            "bus-lib Phase 2 (fr_khonliang-bus-lib_042279e2) is not yet available. "
+            "Keep TCP enabled (dual-bind) for now."
+        )
 
 
 def _resolve_self_url(tcp: tuple[str, int] | None, uds_path: Path | None) -> str:
@@ -140,15 +168,14 @@ def main():
     )
 
     tcp = _resolve_tcp(args)
+    uds_path: Path | None = None if args.no_uds else (
+        Path(args.uds).expanduser() if args.uds else DEFAULT_SOCK_PATH
+    )
+    _validate_binds(tcp, uds_path)  # refuse unusable combos before touching the fs
 
-    uds_path: Path | None = None
-    if not args.no_uds:
-        uds_path = Path(args.uds).expanduser() if args.uds else DEFAULT_SOCK_PATH
+    if uds_path is not None:
         uds_path.parent.mkdir(parents=True, exist_ok=True)
         _clear_stale_socket(uds_path)
-
-    if tcp is None and uds_path is None:
-        raise SystemExit("bus: both UDS and TCP disabled — nothing to bind")
 
     bus_url = _resolve_self_url(tcp, uds_path)
 
