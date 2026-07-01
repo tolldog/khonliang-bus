@@ -42,6 +42,12 @@ from bus import webhook_install
 
 logger = logging.getLogger(__name__)
 
+#: Agent ids the bus reserves for itself. ``bus`` is the bus's own catalog
+#: identity (fr_khonliang-bus_6638f4dc) — bus_welcome renders it and
+#: bus_skills(agent_id="bus") returns the built-in tool catalog, so a real
+#: agent must not claim the name (it would create ambiguous filter semantics).
+RESERVED_AGENT_IDS = frozenset({"bus"})
+
 
 @lru_cache(maxsize=1)
 def load_bus_self_welcome() -> dict:
@@ -1013,6 +1019,8 @@ class BusServer:
     # -- agent lifecycle --
 
     def install_agent(self, req: InstallRequest) -> dict:
+        if req.id in RESERVED_AGENT_IDS:
+            return {"id": req.id, "error": f"'{req.id}' is a reserved agent id"}
         self.db.install_agent(
             agent_id=req.id,
             agent_type=req.agent_type,
@@ -1134,6 +1142,11 @@ class BusServer:
     # -- agent registration --
 
     async def register_agent(self, req: RegisterRequest) -> dict:
+        if req.id in RESERVED_AGENT_IDS:
+            return {
+                "id": req.id,
+                "error": f"'{req.id}' is a reserved agent id (the bus's own catalog)",
+            }
         self.db.register_agent(
             agent_id=req.id,
             agent_type=req.id.rsplit("-", 1)[0] if "-" in req.id else req.id,
@@ -2488,6 +2501,16 @@ class BusServer:
 
                 if msg_type == "register":
                     agent_id = data["id"]
+                    if agent_id in RESERVED_AGENT_IDS:
+                        # Reserved for the bus's own catalog — reject and close
+                        # rather than let a real agent shadow it.
+                        await ws.send_json({
+                            "type": "register_error",
+                            "error": f"'{agent_id}' is a reserved agent id (the bus's own catalog)",
+                        })
+                        agent_id = None
+                        await ws.close()
+                        return
                     self._agent_connections[agent_id] = ws
                     # Store registration in DB.
                     # launch_spec / launch_info: optional handshake extension

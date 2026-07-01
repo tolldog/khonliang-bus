@@ -152,23 +152,22 @@ async def test_bus_skills_bus_handles_whitespace_only_description():
 
 
 @pytest.mark.asyncio
-async def test_bus_skills_bus_includes_real_agent_named_bus(monkeypatch):
-    """'bus' isn't a reserved agent id — if a real agent registers as 'bus', its
-    skills must still be discoverable alongside the built-in catalog."""
-    a = _adapter()
+async def test_bus_is_a_reserved_agent_id(tmp_path):
+    """'bus' is reserved for the bus's own catalog — a real agent must not be
+    able to install or register under it (that would create ambiguous
+    bus_skills(agent_id='bus') semantics)."""
+    from bus.server import RegisterRequest, InstallRequest
 
-    def _fake_get(path, params=None):
-        if path == "/v1/skills" and params == {"agent_id": "bus"}:
-            return [{"agent_id": "bus", "name": "real_skill", "description": "a real agent skill"}]
-        return None
+    db = BusDB(str(tmp_path / "b.db"))
+    bus = BusServer(db, config={})
 
-    a._get = _fake_get
+    inst = bus.install_agent(InstallRequest(id="bus", agent_type="x", command="/bin/true", args=[], cwd="/tmp", config="/tmp/c.yaml"))
+    assert "reserved" in inst.get("error", "")
 
-    result = await a.mcp.call_tool("bus_skills", {"agent_id": "bus"})
-    text = result[1]["result"]
-
-    assert "bus_welcome" in text   # built-in bus tools
-    assert "real_skill" in text    # a real 'bus' agent is not shadowed
+    reg = await bus.register_agent(RegisterRequest(id="bus", callback="http://x", pid=1))
+    assert "reserved" in reg.get("error", "")
+    # And nothing got written.
+    assert db.get_registration("bus") is None
 
 
 @pytest.mark.asyncio

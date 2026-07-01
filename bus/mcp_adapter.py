@@ -975,10 +975,11 @@ class BusMCPAdapter:
             """List skills. Optionally filter by agent_id.
 
             ``agent_id='bus'`` returns the bus's OWN tool catalog — the bus is a
-            first-class participant in its own catalog (fr_khonliang-bus_6638f4dc)
-            even though it isn't a registered agent. Served from the adapter's
-            actually-registered ``bus_*`` tools (the source of truth), so it can
-            never drift from what's callable.
+            first-class participant in its own catalog (fr_khonliang-bus_6638f4dc).
+            ``bus`` is a reserved agent id (the bus rejects real agents claiming
+            it), so this is unambiguously the built-in tool list, served from the
+            adapter's actually-registered ``bus_*`` tools (the source of truth) so
+            it can never drift from what's callable.
             """
             if agent_id == "bus":
                 tools = await mcp.list_tools()
@@ -996,32 +997,10 @@ class BusMCPAdapter:
                     for t in tools
                     if t.name.startswith("bus_") and t.name not in adapter._registered_tools
                 )
-                lines = []
-                if bus_tools:
-                    lines.append("\n  bus (built-in):")
-                    lines += [f"    {name} — {desc}" for name, desc in bus_tools]
-                # ``bus`` isn't a reserved agent id, so a real agent could also
-                # register under it — don't shadow it: append its registered
-                # skills too, so nothing becomes undiscoverable via this path.
-                real = adapter._get("/v1/skills", params={"agent_id": "bus"})
-                if real:
-                    lines.append("\n  bus (registered agent):")
-                    for s in real:
-                        # Surface the fitted tool handle for a name-capped skill
-                        # (same as the normal branch) — otherwise the advertised
-                        # raw name isn't callable.
-                        raw = f"{s['agent_id']}.{s['name']}"
-                        fitted = adapter._fit_tool_name(raw)
-                        handle = (
-                            f"  [tool: {fitted}]"
-                            if fitted != raw and fitted in adapter._registered_tools
-                            else ""
-                        )
-                        lines.append(
-                            f"    {s['name']} — {s.get('description', '')}{handle}"
-                        )
-                if not lines:
+                if not bus_tools:
                     return "no skills registered"
+                lines = ["\n  bus:"]
+                lines += [f"    {name} — {desc}" for name, desc in bus_tools]
                 return "\n".join(lines).strip()
             params = {"agent_id": agent_id} if agent_id else {}
             skills = adapter._get("/v1/skills", params=params)
