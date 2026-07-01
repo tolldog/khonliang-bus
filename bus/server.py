@@ -387,6 +387,12 @@ class BusServer:
         # In-flight lazy launches: agent_id -> asyncio.Task, so concurrent callers
         # for the same dead agent share ONE launch instead of racing to spawn.
         self._lazy_launches: dict[str, asyncio.Task] = {}
+        # Dual-bind (UDS + TCP) runs two uvicorn servers over ONE app, so the
+        # ASGI lifespan fires twice — these guard the boot/shutdown side effects
+        # (reconcile / autostart / supervisor) to run exactly once
+        # (fr_khonliang-bus_aa5b25cf). The check-and-set is atomic under asyncio.
+        self._booted = False
+        self._shutdown_started = False
         # Lazy agents an operator explicitly stopped: suppressed from cold-start
         # relaunch until a manual start or a fresh registration, so stop_agent's
         # "intentionally down" contract holds for lazy agents too (else the next
@@ -3172,11 +3178,18 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @asynccontextmanager
     async def lifespan(app):
-        bus.reconcile_on_boot()
-        bus.autostart_installed_agents()
-        bus.start_supervisor()
+        # Guarded to run once even when two servers (UDS + TCP) share this app.
+        # The check-and-set + the sync boot calls run atomically under asyncio
+        # (no await before the flag is set), so there's no double-boot race.
+        if not bus._booted:
+            bus._booted = True
+            bus.reconcile_on_boot()
+            bus.autostart_installed_agents()
+            bus.start_supervisor()
         yield
-        await bus.shutdown()
+        if not bus._shutdown_started:
+            bus._shutdown_started = True
+            await bus.shutdown()
 
     app = FastAPI(title="khonliang-bus", version="0.2.0", lifespan=lifespan)
 

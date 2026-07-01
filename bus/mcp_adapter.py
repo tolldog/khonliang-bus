@@ -7,17 +7,20 @@ A thin FastMCP bridge that:
   4. Routes tool calls through the bus via POST /v1/request
   5. Subscribes to bus.registry_changed for dynamic tool refresh
 
-Invocation::
+Invocation (``--bus`` optional — auto-discovers ``~/.khonliang/bus.sock``, see
+``docs/bus-transport-contract.md``)::
 
+    python -m bus.mcp_adapter                 # discover: env → UDS → TCP default
+    python -m bus.mcp_adapter --bus unix:///home/me/.khonliang/bus.sock
     python -m bus.mcp_adapter --bus http://localhost:8787
 
-Or in .mcp.json::
+Or in .mcp.json (no bus URL needed)::
 
     {
       "mcpServers": {
         "khonliang": {
           "command": "python",
-          "args": ["-m", "bus.mcp_adapter", "--bus", "http://localhost:8787"]
+          "args": ["-m", "bus.mcp_adapter"]
         }
       }
     }
@@ -33,6 +36,7 @@ import logging
 import math
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -101,6 +105,30 @@ def _resolve_mcp_server_key(explicit: str | None) -> str:
 # documented key gets. Per-instance prefix lives on the adapter.
 MCP_TOOL_NAME_PREFIX: str = _mcp_tool_prefix(DEFAULT_MCP_SERVER_KEY)
 
+#: Well-known bus socket (docs/bus-transport-contract.md, fr_khonliang-bus_aa5b25cf).
+BUS_SOCK_PATH = Path.home() / ".khonliang" / "bus.sock"
+
+
+def discover_bus(explicit: str | None = None) -> str:
+    """Resolve the bus address per the transport contract, first match wins:
+
+    1. ``explicit`` (a ``--bus`` CLI arg),
+    2. ``KHONLIANG_BUS_URL`` env var,
+    3. ``~/.khonliang/bus.sock`` if it exists → ``unix://<abspath>``,
+    4. ``http://localhost:8787`` fallback (TCP default, transition-friendly).
+
+    Must stay identical to bus-lib's ``discover_bus`` — see
+    ``docs/bus-transport-contract.md``.
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get("KHONLIANG_BUS_URL")
+    if env and env.strip():
+        return env.strip()
+    if BUS_SOCK_PATH.exists():
+        return f"unix://{BUS_SOCK_PATH}"
+    return "http://localhost:8787"
+
 
 class BusMCPAdapter:
     """Translates between MCP (stdio, Claude-facing) and the bus (HTTP).
@@ -147,7 +175,16 @@ class BusMCPAdapter:
         default_timeout_s: float | None = None,
         mcp_server_key: str | None = None,
     ):
-        self.bus_url = bus_url.rstrip("/")
+        # A ``unix://<path>`` target routes over a Unix domain socket
+        # (docs/bus-transport-contract.md, fr_khonliang-bus_aa5b25cf): httpx needs
+        # a dummy scheme+host to build request URLs, and the uds= transport dials
+        # the socket. A normal ``http(s)://…`` target is used as-is.
+        self._uds_path: str | None = None
+        if bus_url.startswith("unix://"):
+            self._uds_path = bus_url[len("unix://"):]
+            self.bus_url = "http://localhost"
+        else:
+            self.bus_url = bus_url.rstrip("/")
         self.default_timeout_s = (
             float(default_timeout_s)
             if default_timeout_s is not None
@@ -172,8 +209,17 @@ class BusMCPAdapter:
         # pass a per-request ``timeout=`` kwarg which overrides the client
         # default, so slow skills can run to completion while short calls
         # still return quickly.
-        self._http = httpx.Client(timeout=httpx.Timeout(self.default_timeout_s))
-        self._async_http = httpx.AsyncClient(timeout=httpx.Timeout(self.default_timeout_s))
+        _timeout = httpx.Timeout(self.default_timeout_s)
+        if self._uds_path is not None:
+            self._http = httpx.Client(
+                transport=httpx.HTTPTransport(uds=self._uds_path), timeout=_timeout
+            )
+            self._async_http = httpx.AsyncClient(
+                transport=httpx.AsyncHTTPTransport(uds=self._uds_path), timeout=_timeout
+            )
+        else:
+            self._http = httpx.Client(timeout=_timeout)
+            self._async_http = httpx.AsyncClient(timeout=_timeout)
         self._closed = False
         self.mcp = FastMCP("khonliang-bus")
         self._registered_tools: set[str] = set()
@@ -1783,7 +1829,15 @@ def _resolve_default_timeout(cli_value: float | None) -> float:
 
 def main():
     parser = argparse.ArgumentParser(description="khonliang-bus MCP adapter")
-    parser.add_argument("--bus", default="http://localhost:8787", help="Bus URL")
+    parser.add_argument(
+        "--bus",
+        default=None,
+        help=(
+            "Bus address (http://host:port or unix://<sock>). Optional — when "
+            "omitted, resolved via discover_bus(): KHONLIANG_BUS_URL env, then "
+            "~/.khonliang/bus.sock, then http://localhost:8787."
+        ),
+    )
     parser.add_argument(
         "--default-timeout",
         type=float,
@@ -1828,8 +1882,9 @@ def main():
         default_timeout = _resolve_default_timeout(args.default_timeout)
     except ValueError as exc:
         parser.error(str(exc))
+    bus_addr = discover_bus(args.bus)
     adapter = BusMCPAdapter(
-        args.bus,
+        bus_addr,
         default_timeout_s=default_timeout,
         mcp_server_key=args.mcp_server_key,
     )
@@ -1843,7 +1898,7 @@ def main():
     logger.info(
         "Bus-MCP adapter started. %d tools registered. Bus: %s Default timeout: %.1fs",
         tool_count,
-        args.bus,
+        bus_addr,
         default_timeout,
     )
 
