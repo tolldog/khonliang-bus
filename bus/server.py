@@ -584,21 +584,16 @@ class BusServer:
                 alive.append(agent_id)
                 continue
 
-            # Our crashed instance is confirmed dead with no replacement present:
-            # clear its stale registration NOW (not just at the eventual restart)
-            # so request routing / get_registration stop resolving a dead callback
-            # during the backoff window. Idempotent across sweeps — once cleared,
-            # ``reg`` is None on the next pass. ``deregister_agent`` also drops the
-            # agent's skills/flows; the replacement guard above already ruled out a
-            # live peer, so this only removes our own dead row.
-            if reg is not None:
-                self.db.deregister_agent(agent_id)
-
-            # Still inside the backoff window: skip the restart this sweep (leave
-            # the dead Popen so a later sweep re-sees it). The stale registration
-            # is already cleared above, and a replacement that comes up during the
-            # window is caught by the guard on the NEXT sweep (which pops the dead
-            # Popen), so lifecycle ops won't act on the stale entry.
+            # Still inside the backoff window: skip the restart this sweep, leaving
+            # the dead Popen so a later sweep re-sees it. We deliberately DON'T
+            # deregister the crashed row here — it stays visible on
+            # get_services/diagnose (as a derived-'dead' agent) instead of
+            # vanishing for the whole cooldown. Routing is protected separately:
+            # type-based routing filters on healthy (reconcile_liveness marks it
+            # dead), and handle_request gates direct agent_id dispatch on live
+            # status. A replacement that comes up during the window is caught by
+            # the guard above on the NEXT sweep (which pops the dead Popen), so
+            # lifecycle ops won't act on the stale entry.
             if st and now < st["next_attempt_at"]:
                 backing_off.append(agent_id)
                 continue
@@ -652,9 +647,15 @@ class BusServer:
                 logger.error("Supervisor: %s — %s; marking autostart_failed", agent_id, reason)
                 continue
 
-            # The stale registration was already cleared above (before the
-            # backoff-window check), so _start_process / start_agent won't see a
-            # leftover 'healthy' row.
+            # At the actual restart instant (window elapsed), clear our crashed
+            # instance's stale row so the freshly-spawned process re-registers
+            # cleanly. During the preceding backoff window the row is left in
+            # place for observability (get_services/diagnose show the outage);
+            # this only removes it for the brief gap until re-registration —
+            # matching v1's crash→restart behaviour. ``reg`` was re-checked by the
+            # replacement guard above, so this only ever drops our own dead row.
+            if reg is not None:
+                self.db.deregister_agent(agent_id)
             result = self._start_process(installed)  # overwrites _processes[id] on success
             backoff_s = self._supervisor_backoff_s[
                 min(restarts, len(self._supervisor_backoff_s) - 1)

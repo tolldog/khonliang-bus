@@ -502,9 +502,10 @@ def test_restart_failure_keeps_supervising_then_gives_up(tmp_path):
     assert "broken" not in bus._processes
 
 
-def test_backoff_deregisters_stale_registration(tmp_path, monkeypatch):
-    """While an agent backs off, its stale registration is cleared so request
-    routing / get_registration don't resolve a dead callback during cooldown."""
+def test_backoff_preserves_registration_for_visibility(tmp_path, monkeypatch):
+    """A backing-off agent keeps its registration row (so get_services/diagnose
+    still show the outage) — routing safety comes from derived-liveness, not
+    from deleting the row."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
     bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
@@ -512,14 +513,18 @@ def test_backoff_deregisters_stale_registration(tmp_path, monkeypatch):
 
     proc = _FakePopen(pid=4242, alive=False, returncode=1)
     bus._processes["a1"] = proc
-    # Prior restart put it in backoff; its own registration row is still present.
     bus._supervisor_backoff["a1"] = {"restarts": 1, "next_attempt_at": 100.0, "last_restart_at": 0.0}
     db.register_agent(agent_id="a1", agent_type="test", callback_url="cb", pid=4242)
 
     result = bus.supervise_once()
 
     assert result["backing_off"] == ["a1"]
-    assert db.get_registration("a1") is None  # dead row cleared during backoff
+    assert db.get_registration("a1") is not None       # row preserved (visible)
+    # get_services still lists it (as derived-'dead'), so operators see the
+    # outage during cooldown instead of it vanishing (R9). pid 4242 is dead →
+    # derived status is 'dead', so routing correctly excludes it.
+    row = next((s for s in bus.get_services() if s["id"] == "a1"), None)
+    assert row is not None and row["status"] == "dead"
 
 
 def test_replacement_during_backoff_stops_tracking_dead_popen(tmp_path):
