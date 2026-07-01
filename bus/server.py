@@ -664,14 +664,13 @@ class BusServer:
                 self._supervisor_backoff.pop(agent_id, None)
                 alive.append(agent_id)
                 continue
-            # No replacement: clear our crashed instance's stale row so the
-            # freshly-spawned process re-registers cleanly. During the preceding
-            # backoff window the row is left in place for observability
-            # (get_services/diagnose show the outage); this only removes it for
-            # the brief gap until re-registration — matching v1's crash→restart
-            # behaviour.
-            if reg_now is not None:
-                self.db.deregister_agent(agent_id)
+            # No replacement — restart. We deliberately do NOT deregister the
+            # crashed row first: a successful respawn re-registers (INSERT OR
+            # REPLACE overwrites it), and if the spawn FAILS the row stays visible
+            # on get_services (as derived-'dead') for the whole backoff period
+            # instead of the agent vanishing until eventual give-up. Routing is
+            # unaffected — reconcile_liveness marks the stale row dead, and
+            # start_agent's guard reads derived liveness, so neither resolves it.
             result = self._start_process(installed)  # overwrites _processes[id] on success
             backoff_s = self._supervisor_backoff_s[
                 min(restarts, len(self._supervisor_backoff_s) - 1)
@@ -1063,10 +1062,12 @@ class BusServer:
         with self._processes_lock:
             proc = self._processes.pop(agent_id, None)
         # Operator-/lifecycle-initiated stop (stop_agent, uninstall, restart):
-        # drop supervisor backoff state so the agent isn't treated as mid-
-        # crash-loop on its next start. The supervisor never calls _stop_process,
-        # so this can't race its own restart bookkeeping.
+        # drop supervisor backoff AND any give-up failure record — an explicit
+        # stop means "this agent is intentionally down", so it must not linger as
+        # a synthetic autostart_failed outage on /v1/services. The supervisor
+        # never calls _stop_process, so this can't race its own bookkeeping.
         self._supervisor_backoff.pop(agent_id, None)
+        self._autostart_failures.pop(agent_id, None)
         if proc and proc.poll() is None:
             proc.terminate()
             try:
