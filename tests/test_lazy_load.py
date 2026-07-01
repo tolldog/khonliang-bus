@@ -511,6 +511,19 @@ async def test_explicit_stop_suppresses_lazy_relaunch(tmp_path, monkeypatch):
     assert "a" not in bus._lazy_suppressed
 
 
+def test_uninstall_clears_lazy_suppression(tmp_path):
+    """stop → uninstall → install of the same id must not leave the fresh
+    install cold-start-disabled (suppression is keyed by agent_id)."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    bus.stop_agent("a")
+    assert "a" in bus._lazy_suppressed
+
+    bus.uninstall_agent("a")
+
+    assert "a" not in bus._lazy_suppressed  # no leak into a reinstall
+
+
 def test_bus_welcome_suppressed_lazy_not_shown_eligible(tmp_path):
     """A stopped lazy agent shows cataloged_dead, not lazy_eligible (it won't
     auto-wake)."""

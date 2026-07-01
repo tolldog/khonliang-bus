@@ -31,9 +31,20 @@ lazy_launch_timeout_s: 30         # wait-for-register budget on a cold launch
 - `bus_welcome` shows a dormant lazy agent as **`lazy_eligible`** (distinct from
   `cataloged_dead`) so callers know its skills are available on demand.
 
-**Not yet shipped (Phase 2):** `idle_shutdown_s` (stop after N seconds idle,
-draining in-flight calls) and a `start_only` flag (return once live without
-invoking a skill).
+An explicit `stop_agent` on a lazy agent keeps it down (suppresses cold-start
+relaunch) until a manual start or a fresh registration; uninstall clears that
+suppression.
+
+**Not yet shipped (Phase 2 — lazy lifecycle + concurrency):**
+- `idle_shutdown_s` (stop after N seconds idle, draining in-flight calls) and a
+  `start_only` flag (return once live without invoking a skill).
+- Cancelling an in-flight cold start when `stop_agent` is issued *mid-launch*
+  (today a request that raced just before the stop can still finish booting the
+  worker). Belongs with Phase 2's in-flight-call tracking.
+- WS agents that register a non-zero PID: liveness currently trusts the PID
+  (`os.kill`), so a dropped socket for a `pid>0` WS agent isn't detected until
+  heartbeat-stale. Real agents use `pid=0` WS or a bus-spawned local PID, so
+  this is a non-standard-shape residual.
 
 ## Supervisor (crash restart + backoff)
 

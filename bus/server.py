@@ -1125,6 +1125,10 @@ class BusServer:
         # Drop any recorded autostart/supervisor-give-up failure so an
         # uninstalled agent doesn't linger on the autostart_failed surface.
         self._autostart_failures.pop(agent_id, None)
+        # Clear lazy-stop suppression too — lazy eligibility is keyed by agent_id,
+        # so a stop→uninstall→install of the same id must not leave the fresh
+        # install cold-start-disabled (fr_khonliang-bus_c81f7ab5).
+        self._lazy_suppressed.discard(agent_id)
         if self.db.uninstall_agent(agent_id):
             self.db.deregister_agent(agent_id)
             logger.info("Uninstalled agent %s", agent_id)
