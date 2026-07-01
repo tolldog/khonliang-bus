@@ -133,19 +133,6 @@ def test_lazy_reachable_matrix(tmp_path, monkeypatch):
     assert bus._lazy_agent_reachable("a", {"pid": 0, "status": "healthy"}) is True   # live spawned process
 
 
-def test_lazy_needs_launch_avoids_duplicate(tmp_path, monkeypatch):
-    """_lazy_needs_launch: launch only when NOT reachable AND no live process —
-    a live process with a dropped registration is mid-startup, not a launch cue
-    (else we'd spawn a duplicate)."""
-    bus = _bus(tmp_path, lazy_eligible=["a"])
-    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
-
-    assert bus._lazy_needs_launch("a", None) is True  # no reg, no proc → launch
-
-    bus._processes["a"] = _FakePopen(alive=True)  # process coming up, reg dropped
-    assert bus._lazy_needs_launch("a", None) is False  # don't duplicate a live process
-
-
 async def test_do_lazy_launch_no_duplicate_when_process_alive(tmp_path, monkeypatch):
     """If a spawned process is still alive but its registration dropped,
     _do_lazy_launch must NOT spawn a second one — it polls for the existing
@@ -416,6 +403,57 @@ async def test_agent_type_does_not_relaunch_reachable_lazy_agent(tmp_path, monke
     await bus.handle_request(RequestMessage(agent_type="reviewer", operation="x"))
 
     assert launched == []  # own reg is reachable → no duplicate launch
+
+
+async def test_handle_request_joins_launch_when_process_coming_up(tmp_path, monkeypatch):
+    """A request arriving while a lazy agent is spawned-but-not-registered must
+    go through _lazy_launch (which dedups/waits), not skip to no-healthy."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    bus._processes["a"] = _FakePopen(alive=True)  # spawned, not registered yet
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
+
+    launched: list[str] = []
+
+    async def _fake_lazy(agent_id):
+        launched.append(agent_id)
+        bus.db.register_agent(agent_id=agent_id, agent_type="test", callback_url="ws", pid=0)
+        return {}
+    monkeypatch.setattr(bus, "_lazy_launch", _fake_lazy)
+
+    async def _fake_dispatch(**k):
+        return {"ok": True}
+    monkeypatch.setattr(bus, "_dispatch_resolved_request", _fake_dispatch)
+
+    result = await bus.handle_request(RequestMessage(agent_id="a", operation="x"))
+
+    assert launched == ["a"]          # joined the launch (not no-healthy)
+    assert result.get("ok") is True
+
+
+async def test_agent_type_skips_lazy_when_healthy_agent_exists(tmp_path, monkeypatch):
+    """An agent_type request that already resolved a healthy agent must NOT
+    cold-start the dormant lazy worker."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a", agent_type="reviewer")
+    healthy_b = {"id": "b", "agent_type": "reviewer", "pid": 0, "status": "healthy", "callback_url": "ws"}
+    monkeypatch.setattr(bus.db, "get_healthy_agent_for_type", lambda t: healthy_b)
+
+    launched: list[str] = []
+
+    async def _fake_lazy(agent_id):
+        launched.append(agent_id)
+        return {}
+    monkeypatch.setattr(bus, "_lazy_launch", _fake_lazy)
+
+    async def _fake_dispatch(**k):
+        return {"ok": True, "who": k["agent_id"]}
+    monkeypatch.setattr(bus, "_dispatch_resolved_request", _fake_dispatch)
+
+    result = await bus.handle_request(RequestMessage(agent_type="reviewer", operation="x"))
+
+    assert launched == []             # healthy 'b' serves → no cold-start
+    assert result.get("who") == "b"
 
 
 async def test_handle_request_no_lazy_for_non_lazy_agent(tmp_path, monkeypatch):

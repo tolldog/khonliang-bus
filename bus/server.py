@@ -1232,18 +1232,6 @@ class BusServer:
             return True  # real live local pid
         return self.is_agent_ws_connected(agent_id) or self._lazy_process_alive(agent_id)
 
-    def _lazy_needs_launch(self, agent_id: str, reg: dict | None) -> bool:
-        """Whether a skill call should (re)launch the lazy agent.
-
-        Launch only when it's neither reachable NOR already coming up: a live
-        spawned process with a dropped/absent registration is mid-startup (or a
-        just-deregistered instance still exiting), so relaunching would spawn a
-        DUPLICATE (codex). That case waits for the existing process to register.
-        """
-        if self._lazy_agent_reachable(agent_id, reg):
-            return False
-        return not self._lazy_process_alive(agent_id)
-
     async def _lazy_launch(self, agent_id: str) -> dict:
         """Launch a dead lazy-eligible agent and wait for it to register.
 
@@ -1426,24 +1414,28 @@ class BusServer:
         # where os.kill(pid,0) is reliable — so it can also re-launch an agent
         # whose row lingered after a crash. Non-lazy routing is unchanged.
         lazy_id = self._resolve_lazy_target(req)
-        # Decide on the LAZY AGENT'S OWN registration, not the type-resolved reg:
-        # for an agent_type request ``reg`` is get_healthy_agent_for_type(), which
-        # is None when the only match is merely stale/unhealthy — that would
-        # relaunch a still-running lazy agent (e.g. a connected pid=0 WS instance
-        # whose status isn't 'healthy'). Its own row is the source of truth.
-        if lazy_id and self._lazy_needs_launch(lazy_id, self.db.get_registration(lazy_id)):
-            launched = await self._lazy_launch(lazy_id)
-            if launched.get("error"):
-                return {**launched, "trace_id": trace_id}
-            # Re-resolve the SAME way the original request did — for an
-            # agent_type request, re-run normal type selection rather than
-            # forcing the lazy instance (another healthy agent of that type may
-            # have appeared during the launch window).
-            reg = (
-                self.db.get_registration(req.agent_id)
-                if req.agent_id
-                else self.db.get_healthy_agent_for_type(req.agent_type)
-            )
+        if lazy_id:
+            # Decide on the LAZY AGENT'S OWN registration (its source of truth),
+            # not the type-resolved ``reg``. Launch (or JOIN an in-flight launch)
+            # whenever the lazy agent isn't reachable — _lazy_launch dedups so a
+            # burst of cold calls shares one launch and later callers WAIT rather
+            # than get no-healthy; _do_lazy_launch won't duplicate a live process.
+            # For an agent_type request, skip entirely if type routing already
+            # resolved a healthy agent (``reg`` set) — don't cold-start a dormant
+            # worker when another instance already serves the type.
+            own_reg = self.db.get_registration(lazy_id)
+            already_served = reg is not None if req.agent_type else False
+            if not already_served and not self._lazy_agent_reachable(lazy_id, own_reg):
+                launched = await self._lazy_launch(lazy_id)
+                if launched.get("error"):
+                    return {**launched, "trace_id": trace_id}
+                # Re-resolve the SAME way the original request did (by type for a
+                # type request — another healthy agent may have appeared).
+                reg = (
+                    self.db.get_registration(req.agent_id)
+                    if req.agent_id
+                    else self.db.get_healthy_agent_for_type(req.agent_type)
+                )
 
         if not reg:
             return {"error": f"no healthy agent found for {req.agent_id or req.agent_type}", "trace_id": trace_id}
