@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import math
+import hashlib
 import os
 import re
 import subprocess
@@ -1383,9 +1384,15 @@ class BusServer:
         try:
             # Sanitize the id into a single flat filename component: agent ids
             # are unrestricted at install, so a separator (or "..") would turn
-            # this into an arbitrary-path write/rename primitive (codex). Keeps
-            # the PR-2 tailer's filename→agent_id derivation well-formed too.
+            # this into an arbitrary-path write/rename primitive (codex). When
+            # sanitization changed anything, append a short stable digest of the
+            # ORIGINAL id so distinct ids can't collapse onto one file
+            # (`a/b` vs `a_b`) — same idiom as the adapter's _fit_tool_name.
+            # Normal ids (the whole real fleet) keep their clean name.
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", agent_id).lstrip(".") or "agent"
+            if safe != agent_id:
+                digest = hashlib.blake2s(agent_id.encode(), digest_size=4).hexdigest()
+                safe = f"{safe}-{digest}"
             path = self._agent_log_dir / f"{safe}.log"
             try:
                 if path.exists() and path.stat().st_size > self._agent_log_max_bytes:

@@ -212,6 +212,25 @@ def test_traversal_agent_id_stays_inside_log_dir(tmp_path):
     assert "hello-stdout" in inside[0].read_text()
 
 
+def test_sanitized_ids_do_not_collide(tmp_path):
+    """Distinct ids that sanitize identically ('a/b' vs 'a_b') must map to
+    DIFFERENT files (digest suffix) — no interleaving/rotation clobbering.
+    A clean id keeps its clean, digest-free name."""
+    log_dir = tmp_path / "logs"
+    bus = _bus(tmp_path, agent_log_dir=str(log_dir))
+    log_dir.mkdir(exist_ok=True)
+
+    f1 = bus._open_agent_log("a/b")
+    f2 = bus._open_agent_log("a_b")
+    f3 = bus._open_agent_log("researcher-primary")
+    try:
+        assert f1.name != f2.name                       # injective
+        assert f3.name.endswith("researcher-primary.log")  # clean id untouched
+    finally:
+        for f in (f1, f2, f3):
+            f.close()
+
+
 def test_agent_log_max_bytes_floor(tmp_path):
     bus = _bus(tmp_path, agent_log_dir=str(tmp_path / "logs"), agent_log_max_bytes=5)
     assert bus._agent_log_max_bytes == 1_000_000  # floored, not 5 bytes
