@@ -2037,8 +2037,9 @@ class BusServer:
     #: Wire schema version for ``get_bus_welcome``. Bump when the response
     #: shape changes in a way callers must adapt to (additive fields don't
     #: warrant a bump — clients should ignore unknown keys per
-    #: ``feedback_cheap_irreversible_principle``).
-    BUS_WELCOME_SCHEMA_VERSION = 2
+    #: ``feedback_cheap_irreversible_principle``). The top-level ``bus`` field
+    #: (fr_khonliang-bus_6638f4dc) is purely additive, so it does NOT bump this.
+    BUS_WELCOME_SCHEMA_VERSION = 1
 
     def get_bus_welcome(self, detail: str = "brief") -> dict:
         """One-call cold-start discovery of the platform.

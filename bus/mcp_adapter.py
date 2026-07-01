@@ -996,10 +996,21 @@ class BusMCPAdapter:
                     for t in tools
                     if t.name.startswith("bus_") and t.name not in adapter._registered_tools
                 )
-                if not bus_tools:
+                lines = []
+                if bus_tools:
+                    lines.append("\n  bus (built-in):")
+                    lines += [f"    {name} — {desc}" for name, desc in bus_tools]
+                # ``bus`` isn't a reserved agent id, so a real agent could also
+                # register under it — don't shadow it: append its registered
+                # skills too, so nothing becomes undiscoverable via this path.
+                real = adapter._get("/v1/skills", params={"agent_id": "bus"})
+                if real:
+                    lines.append("\n  bus (registered agent):")
+                    lines += [
+                        f"    {s['name']} — {s.get('description', '')}" for s in real
+                    ]
+                if not lines:
                     return "no skills registered"
-                lines = ["\n  bus:"]
-                lines += [f"    {name} — {desc}" for name, desc in bus_tools]
                 return "\n".join(lines).strip()
             params = {"agent_id": agent_id} if agent_id else {}
             skills = adapter._get("/v1/skills", params=params)

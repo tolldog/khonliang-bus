@@ -123,6 +123,26 @@ async def test_bus_skills_for_bus_returns_catalog():
 
 
 @pytest.mark.asyncio
+async def test_bus_skills_bus_includes_real_agent_named_bus(monkeypatch):
+    """'bus' isn't a reserved agent id — if a real agent registers as 'bus', its
+    skills must still be discoverable alongside the built-in catalog."""
+    a = _adapter()
+
+    def _fake_get(path, params=None):
+        if path == "/v1/skills" and params == {"agent_id": "bus"}:
+            return [{"name": "real_skill", "description": "a real agent skill"}]
+        return None
+
+    a._get = _fake_get
+
+    result = await a.mcp.call_tool("bus_skills", {"agent_id": "bus"})
+    text = result[1]["result"]
+
+    assert "bus_welcome" in text   # built-in bus tools
+    assert "real_skill" in text    # a real 'bus' agent is not shadowed
+
+
+@pytest.mark.asyncio
 async def test_bus_skills_bus_excludes_agent_named_bus_worker():
     """An agent whose id starts with 'bus_' has skill tools like
     'bus_worker.do_thing' — those must NOT pollute the bus's own catalog."""
