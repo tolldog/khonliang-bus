@@ -187,23 +187,23 @@ def test_boot_purges_preexisting_bus_agent(tmp_path):
     assert db.get_agent_welcome("bus") is None  # welcome purged on every surface
 
 
-def test_boot_purge_terminates_running_reserved_agent(tmp_path, monkeypatch):
-    """A pre-existing reserved 'bus' agent that's a live EXTERNAL process must be
-    SIGTERM'd before its catalog rows are deleted — else the row-delete orphans
-    a running process no longer manageable through the bus."""
+def test_boot_purge_does_not_signal_stale_pid(tmp_path, monkeypatch):
+    """The reserved-id purge must NOT signal the persisted PID — a bare stored
+    PID can't prove ownership (PID reuse), so the bus only clears the rows,
+    matching the normal boot-reconciliation contract."""
     import bus.server as srv
 
     db = BusDB(str(tmp_path / "b.db"))
     db.register_agent(agent_id="bus", agent_type="x", callback_url="cb", pid=54321)
-    monkeypatch.setattr(srv, "_pid_alive", lambda pid: pid == 54321)
-    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(srv, "_pid_alive", lambda pid: True)  # pretend it's alive
+    killed: list = []
     monkeypatch.setattr(srv.os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
     bus = BusServer(db, config={})
     bus.reconcile_on_boot()
 
-    assert (54321, srv.signal.SIGTERM) in killed  # terminated before row-delete
-    assert db.get_registration("bus") is None
+    assert killed == []                          # never signals a stale PID
+    assert db.get_registration("bus") is None    # but the row is purged
 
 
 def test_reserved_id_welcome_write_rejected(tmp_path):
