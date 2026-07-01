@@ -90,3 +90,34 @@ def test_empty_object_summary():
     assert env["findings"] == []
     assert env["content"] == {}
     assert "empty object" in env["summary"]
+
+
+def test_json_null_preserved_as_none():
+    """A skill returning JSON null must arrive as structured None, not the
+    string 'null' (all JSON shapes stay structured)."""
+    env = build_response_envelope(
+        ok=True, status="ok", producer="agent", operation="op",
+        text="null", content_type="application/json", value=None,
+        budget=ResponseBudget(max_chars=8000),
+    )
+    assert env["findings"] == []
+    assert env["content"] is None
+    assert env["summary"].endswith("null")
+
+
+def test_structured_summary_is_bounded():
+    """A dict with very long keys must not produce an unbounded summary."""
+    from bus.response_envelope import SUMMARY_CHARS
+    obj = {"k" * 5000: 1, "another_" * 500: 2}
+    env = _env(obj)
+    assert len(env["summary"]) <= SUMMARY_CHARS + 3  # +len('...')
+
+
+def test_no_value_passed_falls_back_to_text():
+    """Backward-compat: a caller that doesn't pass value keeps text content."""
+    env = build_response_envelope(
+        ok=True, status="ok", producer="a", operation="op",
+        text='{"x": 1}', content_type="application/json",
+        budget=ResponseBudget(max_chars=8000),
+    )
+    assert env["content"] == '{"x": 1}'  # no value → text (sentinel default)

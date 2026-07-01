@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from typing import Any
 
 
+#: Sentinel: distinguishes "no value passed" (use ``text``) from a real ``None``
+#: result (JSON ``null``, which must stay structured in ``content``).
+_UNSET: Any = object()
+
 DEFAULT_INLINE_CHARS = 8000
 HARD_INLINE_CHARS = 16000
 HIGH_DETAIL_INLINE_CHARS = 64000
@@ -60,7 +64,7 @@ def build_response_envelope(
     budget: ResponseBudget,
     artifact: dict[str, Any] | None = None,
     content_type: str = "text/plain",
-    value: Any = None,
+    value: Any = _UNSET,
 ) -> dict[str, Any]:
     """Build the standard compact envelope returned to MCP clients.
 
@@ -72,12 +76,17 @@ def build_response_envelope(
     (fr_khonliang-bus_c989e906).
     """
     structured = content_type == "application/json"
+    has_value = value is not _UNSET
     omitted = len(text) > budget.max_chars
     if structured:
         # No line-oriented preview for structured data — reassembling JSON
         # fragments wastes the very inline budget the envelope protects.
         findings: list[str] = []
-        summary = _structured_summary(value, producer=producer, operation=operation)
+        summary = (
+            _structured_summary(value, producer=producer, operation=operation)
+            if has_value
+            else _summary(text, producer=producer, operation=operation)
+        )
     else:
         findings = _findings(text, budget.max_chars, compact=not omitted)
         summary = _summary(text, producer=producer, operation=operation)
@@ -125,8 +134,8 @@ def build_response_envelope(
         # Too big to inline — full payload is in the artifact; give a bounded
         # text excerpt regardless of shape (structured excerpt stays a string).
         envelope["excerpt"] = _bounded_excerpt(text, budget.max_chars)
-    elif structured and value is not None:
-        envelope["content"] = value  # keep the object/array — no reassembly
+    elif structured and has_value:
+        envelope["content"] = value  # keep the object/array/null — no reassembly
     else:
         envelope["content"] = text
     return envelope
@@ -154,15 +163,21 @@ def _structured_summary(value: Any, *, producer: str, operation: str) -> str:
     if isinstance(value, dict):
         n = len(value)
         if not n:
-            return f"{prefix} empty object"
-        keys = ", ".join(str(k) for k in list(value)[:5])
-        more = ", ..." if n > 5 else ""
-        return f"{prefix} object with {n} field(s) ({keys}{more})"
-    if isinstance(value, list):
-        return f"{prefix} array of {len(value)} item(s)"
-    if value is None:
-        return f"{prefix} structured result"
-    return f"{prefix} {type(value).__name__}"
+            summary = f"{prefix} empty object"
+        else:
+            keys = ", ".join(str(k) for k in list(value)[:5])
+            more = ", ..." if n > 5 else ""
+            summary = f"{prefix} object with {n} field(s) ({keys}{more})"
+    elif isinstance(value, list):
+        summary = f"{prefix} array of {len(value)} item(s)"
+    elif value is None:
+        summary = f"{prefix} null"
+    else:
+        summary = f"{prefix} {type(value).__name__}"
+    # Same bound as _summary — long keys must not blow the inline budget.
+    if len(summary) > SUMMARY_CHARS:
+        summary = summary[:SUMMARY_CHARS].rstrip() + "..."
+    return summary
 
 
 def _findings(text: str, max_chars: int, *, compact: bool) -> list[str]:
