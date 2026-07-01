@@ -1031,42 +1031,30 @@ class BusDB:
         reinforced upward (max) — repeated discovery increases trust. Returns
         ``status`` 'saved' (new) or 'merged'."""
         confidence = max(0.0, min(1.0, float(confidence)))
+        rank = _source_rank(source)
         with self.conn() as c:
-            existing = c.execute(
-                "SELECT id, confidence, source FROM learnings "
-                "WHERE agent_type=? AND role=? AND model=? AND learning=?",
-                (agent_type, role, model, learning),
-            ).fetchone()
-            if existing:
-                # Keep the MOST-AUTHORITATIVE provenance across merges: an
-                # operator-confirmed rule stays 'operator' even if an agent
-                # re-discovers it, and an agent rule upgrades when an operator
-                # confirms it. Confidence reinforces upward.
-                merged_source = (
-                    source if _source_rank(source) >= _source_rank(existing["source"])
-                    else existing["source"]
-                )
-                c.execute(
-                    """
-                    UPDATE learnings SET
-                        sample_count = sample_count + 1,
-                        last_seen = datetime('now'),
-                        confidence = MAX(confidence, ?),
-                        source = ?,
-                        context = CASE WHEN ? != '' THEN ? ELSE context END
-                    WHERE id = ?
-                    """,
-                    (confidence, merged_source, context, context, existing["id"]),
-                )
-                return {"status": "merged"}
-            c.execute(
+            # Atomic upsert (no SELECT-then-write TOCTOU under concurrent
+            # writers). Merge keeps the MOST-AUTHORITATIVE provenance — the
+            # source-rank CASE upgrades an agent rule when an operator confirms
+            # it and never downgrades on re-discovery. RETURNING sample_count
+            # tells saved (1) from merged (>1) accurately.
+            row = c.execute(
                 """
                 INSERT INTO learnings (agent_type, role, model, learning, confidence, context, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agent_type, role, model, learning) DO UPDATE SET
+                    sample_count = sample_count + 1,
+                    last_seen = datetime('now'),
+                    confidence = MAX(confidence, excluded.confidence),
+                    context = CASE WHEN excluded.context != '' THEN excluded.context ELSE context END,
+                    source = CASE WHEN ? >= (CASE source
+                        WHEN 'operator' THEN 4 WHEN 'feedback' THEN 3 WHEN 'harvest' THEN 2 ELSE 1 END)
+                        THEN excluded.source ELSE source END
+                RETURNING sample_count
                 """,
-                (agent_type, role, model, learning, confidence, context, source),
-            )
-            return {"status": "saved"}
+                (agent_type, role, model, learning, confidence, context, source, rank),
+            ).fetchone()
+            return {"status": "saved" if row["sample_count"] == 1 else "merged"}
 
     def get_learnings(
         self,

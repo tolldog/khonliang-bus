@@ -181,6 +181,30 @@ def test_register_ack_scopes_to_agents_model(client):
         assert rules == ["32b-rule"]  # only the 32B instance's model
 
 
+def test_http_register_returns_scoped_learnings(client):
+    """HTTP-registered agents (POST /v1/register) get the same model-scoped
+    learnings as WS agents — no mixed-fleet starvation."""
+    client.post("/v1/learnings", json={
+        "agent_type": "researcher", "role": "summarizer",
+        "model": "qwen2.5:7b", "learning": "truncate to 12K",
+    })
+    r = client.post("/v1/register", json={
+        "id": "researcher-1", "callback": "http://localhost:9", "pid": 1,
+        "models": {"summarizer": "qwen2.5:7b"},
+    })
+    body = r.json()
+    assert body["status"] == "registered"
+    assert body["learnings"]["summarizer"]["rules"][0]["learning"] == "truncate to 12K"
+
+
+def test_http_register_without_models_omits_learnings(client):
+    client.post("/v1/learnings", json={
+        "agent_type": "researcher", "role": "r", "model": "m", "learning": "x",
+    })
+    r = client.post("/v1/register", json={"id": "researcher-2", "callback": "c", "pid": 1})
+    assert "learnings" not in r.json()
+
+
 def test_register_ack_omits_learnings_when_no_model_map(client):
     # Learnings exist, but an agent that doesn't declare its models can't be
     # scoped safely → nothing delivered.

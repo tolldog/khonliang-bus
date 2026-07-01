@@ -101,6 +101,9 @@ class RegisterRequest(BaseModel):
     # welcomes table; older bus-lib agents omit it and the bus stores nothing
     # (queries return None until the agent re-registers with the new lib).
     welcome: dict[str, Any] | None = None
+    # Per-role current model map ({role: model}), so the register response can
+    # scope delivered learnings to this agent's models (fr_khonliang-bus_ffd4cf00).
+    models: dict[str, str] = {}
 
 
 class HeartbeatRequest(BaseModel):
@@ -1420,7 +1423,14 @@ class BusServer:
         logger.info("Registered agent %s at %s (pid=%d, %d skills)", req.id, req.callback, req.pid, len(req.skills))
         # Notify subscribers of registry change
         await self._publish_event("bus.registry_changed", {"agent_id": req.id, "action": "registered"})
-        return {"id": req.id, "status": "registered"}
+        # Deliver model-scoped learnings on the HTTP register path too, so
+        # HTTP-registered agents aren't silently starved (fr_khonliang-bus_ffd4cf00).
+        resp: dict[str, Any] = {"id": req.id, "status": "registered"}
+        agent_type = req.id.rsplit("-", 1)[0] if "-" in req.id else req.id
+        learnings = self.db.get_learnings(agent_type, req.models or {})
+        if learnings:
+            resp["learnings"] = learnings
+        return resp
 
     async def deregister_agent(self, agent_id: str) -> dict:
         if self.db.deregister_agent(agent_id):
