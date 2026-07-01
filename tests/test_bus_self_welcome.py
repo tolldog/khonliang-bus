@@ -177,12 +177,27 @@ def test_boot_purges_preexisting_bus_agent(tmp_path):
     # Simulate a pre-reservation catalog row written directly at the db layer.
     db.install_agent(agent_id="bus", agent_type="x", command="/bin/true", args=[], cwd="/tmp", config="/tmp/c.yaml")
     db.register_agent(agent_id="bus", agent_type="x", callback_url="cb", pid=0)
+    db.set_agent_welcome("bus", {"role": "stale real agent"})
 
     bus = BusServer(db, config={})
     bus.reconcile_on_boot()
 
     assert db.get_registration("bus") is None
     assert db.get_installed_agent("bus") is None
+    assert db.get_agent_welcome("bus") is None  # welcome purged on every surface
+
+
+def test_reserved_id_welcome_write_rejected(tmp_path):
+    """POST /v1/agents/bus/welcome must reject the reserved id, not persist a
+    real-agent welcome that would leak on the welcome endpoints."""
+    from fastapi.testclient import TestClient
+    from bus.server import create_app
+
+    app = create_app(db_path=str(tmp_path / "b.db"), config={})
+    client = TestClient(app)
+    r = client.post("/v1/agents/bus/welcome", json={"role": "x"})
+    assert r.status_code == 400
+    assert "reserved" in r.json()["detail"]
 
 
 def test_bus_welcome_skips_residual_bus_row(tmp_path):

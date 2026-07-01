@@ -439,12 +439,17 @@ class BusServer:
             had = (
                 self.db.get_registration(agent_id) is not None
                 or self.db.get_installed_agent(agent_id) is not None
+                or self.db.get_agent_welcome(agent_id) is not None
             )
             if not had:
                 continue
             self._stop_process(agent_id)
             self.db.deregister_agent(agent_id)
             self.db.uninstall_agent(agent_id)
+            # Welcomes survive deregister, so clear it explicitly — otherwise
+            # /v1/agents/<id>/welcome + /v1/agents/welcomes still leak the stale
+            # blob for the reserved id.
+            self.db.delete_agent_welcome(agent_id)
             purged += 1
             logger.warning(
                 "Purged reserved agent id %r from the catalog on boot "
@@ -3003,6 +3008,13 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
 
     @app.post("/v1/agents/{agent_id}/welcome")
     def agent_welcome_set(agent_id: str, payload: dict[str, Any]):
+        # Reserved ids (e.g. ``bus``) can't hold an agent welcome — the bus's own
+        # welcome is synthesized from bus/welcome.json (fr_khonliang-bus_6638f4dc).
+        if agent_id in RESERVED_AGENT_IDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{agent_id}' is a reserved agent id",
+            )
         # Late-update / operator-override path for the welcome catalog
         # (fr_khonliang-bus_f96722dd "POST /v1/agents/<id>/welcome").
         # Accepts a JSON dict; persists it as the agent's welcome. Idempotent:
