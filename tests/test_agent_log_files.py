@@ -212,10 +212,27 @@ def test_traversal_agent_id_stays_inside_log_dir(tmp_path):
     assert "hello-stdout" in inside[0].read_text()
 
 
+def test_log_file_name_is_injective_and_flat():
+    """The id→filename mapping must be injective for ALL ids (percent-encoding
+    is bijective — no crafted id can collide with another's encoded form) and
+    can never contain a separator or dot."""
+    from bus.server import _log_file_name
+
+    ids = [
+        "researcher-primary",       # clean fleet id → itself
+        "a/b", "a_b", "a%2Fb",      # the collision families from codex R3/R5
+        "a_b-1b16b1df",             # crafted to look like a digest-suffixed name
+        "..", ".", "", "a.b",
+        "unicode-ключ",
+    ]
+    names = [_log_file_name(i) for i in ids]
+    assert len(set(names)) == len(names)                 # injective across all
+    assert _log_file_name("researcher-primary") == "researcher-primary"
+    for n in names:
+        assert "/" not in n and "\\" not in n and "." not in n  # flat, dotless
+
+
 def test_sanitized_ids_do_not_collide(tmp_path):
-    """Distinct ids that sanitize identically ('a/b' vs 'a_b') must map to
-    DIFFERENT files (digest suffix) — no interleaving/rotation clobbering.
-    A clean id keeps its clean, digest-free name."""
     log_dir = tmp_path / "logs"
     bus = _bus(tmp_path, agent_log_dir=str(log_dir))
     log_dir.mkdir(exist_ok=True)
@@ -224,7 +241,7 @@ def test_sanitized_ids_do_not_collide(tmp_path):
     f2 = bus._open_agent_log("a_b")
     f3 = bus._open_agent_log("researcher-primary")
     try:
-        assert f1.name != f2.name                       # injective
+        assert f1.name != f2.name                       # distinct files
         assert f3.name.endswith("researcher-primary.log")  # clean id untouched
     finally:
         for f in (f1, f2, f3):

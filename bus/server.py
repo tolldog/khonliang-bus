@@ -15,9 +15,7 @@ import asyncio
 import json
 import logging
 import math
-import hashlib
 import os
-import re
 import subprocess
 import threading
 import time
@@ -43,6 +41,34 @@ from bus.webhooks import build_topic, summarize, verify_signature
 from bus import webhook_install
 
 logger = logging.getLogger(__name__)
+
+#: Filename-safe charset for L0 log files. Deliberately EXCLUDES '.' (so '..'
+#: can't appear and the only dot is the appended '.log') and '%' (the escape
+#: char itself).
+_LOG_NAME_SAFE = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+
+
+def _log_file_name(agent_id: str) -> str:
+    """Percent-encode an agent id into a flat, INJECTIVE filename component.
+
+    Agent ids are unrestricted at install, so the mapping must (a) never
+    produce a path separator or ``..`` (no arbitrary-path write primitive) and
+    (b) be injective for ALL ids — heuristic sanitization + digest-on-change
+    still collided when one id was literally another's sanitized form (codex).
+    Percent-encoding is bijective by construction: every char outside the safe
+    set — including ``%`` itself and ``.`` — becomes ``%XX``, so distinct ids
+    always yield distinct names, real fleet ids (alnum/`-`/`_`) map to
+    themselves, and the output can never contain a separator or dot. Also
+    reversible, so the PR-2 tailer derives the exact agent_id back.
+    """
+    encoded = "".join(
+        c if c in _LOG_NAME_SAFE else f"%{ord(c):02X}"
+        for c in agent_id.encode("utf-8").decode("latin-1")
+    )
+    return encoded or "agent"
+
 
 #: Agent ids the bus reserves for itself. ``bus`` is the bus's own catalog
 #: identity (fr_khonliang-bus_6638f4dc) — bus_welcome renders it and
@@ -1382,18 +1408,7 @@ class BusServer:
         if self._agent_log_dir is None:
             return None
         try:
-            # Sanitize the id into a single flat filename component: agent ids
-            # are unrestricted at install, so a separator (or "..") would turn
-            # this into an arbitrary-path write/rename primitive (codex). When
-            # sanitization changed anything, append a short stable digest of the
-            # ORIGINAL id so distinct ids can't collapse onto one file
-            # (`a/b` vs `a_b`) — same idiom as the adapter's _fit_tool_name.
-            # Normal ids (the whole real fleet) keep their clean name.
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", agent_id).lstrip(".") or "agent"
-            if safe != agent_id:
-                digest = hashlib.blake2s(agent_id.encode(), digest_size=4).hexdigest()
-                safe = f"{safe}-{digest}"
-            path = self._agent_log_dir / f"{safe}.log"
+            path = self._agent_log_dir / f"{_log_file_name(agent_id)}.log"
             try:
                 if path.exists() and path.stat().st_size > self._agent_log_max_bytes:
                     path.replace(path.parent / (path.name + ".1"))
