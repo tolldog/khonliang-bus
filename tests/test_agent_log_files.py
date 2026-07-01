@@ -223,6 +223,7 @@ def test_log_file_name_is_injective_and_flat():
         "a/b", "a_b", "a%2Fb",      # the collision families from codex R3/R5
         "a_b-1b16b1df",             # crafted to look like a digest-suffixed name
         "..", ".", "", "a.b",
+        "agent", "%",               # empty-id fallback must not collide with these
         "unicode-ключ",
     ]
     names = [_log_file_name(i) for i in ids]

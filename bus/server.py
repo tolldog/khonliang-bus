@@ -67,7 +67,10 @@ def _log_file_name(agent_id: str) -> str:
         c if c in _LOG_NAME_SAFE else f"%{ord(c):02X}"
         for c in agent_id.encode("utf-8").decode("latin-1")
     )
-    return encoded or "agent"
+    # Empty id → a bare "%": OUTSIDE the encoding's image (a real '%' always
+    # encodes to '%25', and every escape is %XX), so injectivity stays total —
+    # unlike a word fallback, which would collide with a real agent of that name.
+    return encoded or "%"
 
 
 #: Agent ids the bus reserves for itself. ``bus`` is the bus's own catalog
