@@ -107,6 +107,16 @@ class HeartbeatRequest(BaseModel):
     id: str
 
 
+class LearningSaveRequest(BaseModel):
+    agent_type: str
+    role: str
+    model: str
+    learning: str
+    confidence: float = 0.7
+    context: str = ""
+    source: str = "agent"
+
+
 class RequestMessage(BaseModel):
     agent_id: str | None = None
     agent_type: str | None = None
@@ -1422,6 +1432,34 @@ class BusServer:
         if self.db.heartbeat(req.id):
             return {"id": req.id, "status": "ok"}
         return {"id": req.id, "status": "not_registered"}
+
+    # -- learnings (fr_khonliang-bus_ffd4cf00) --
+
+    def save_learning(
+        self,
+        *,
+        agent_type: str,
+        role: str,
+        model: str,
+        learning: str,
+        confidence: float = 0.7,
+        context: str = "",
+        source: str = "agent",
+    ) -> dict:
+        """Persist a per-(agent_type, role, model) learning (dedup-merged in the
+        db). Phase 1 persists only; live push to running instances lands with the
+        bus-lib agent-side that consumes it."""
+        if not (agent_type and role and model and learning):
+            return {"error": "agent_type, role, model, and learning are required"}
+        try:
+            conf = float(confidence)
+        except (TypeError, ValueError):
+            conf = 0.7
+        result = self.db.save_learning(
+            agent_type=agent_type, role=role, model=model, learning=learning,
+            confidence=conf, context=str(context or ""), source=str(source or "agent"),
+        )
+        return {"agent_type": agent_type, "role": role, "model": model, **result}
 
     # -- request/reply --
 
@@ -2846,9 +2884,30 @@ class BusServer:
                                 "Welcome rejected during WS register for %s: %s",
                                 agent_id, e,
                             )
-                    await ws.send_json({"type": "registered", "id": agent_id})
+                    # Deliver persisted learnings in the register ack so the
+                    # agent injects them into its role prompts on startup — no
+                    # separate fetch (fr_khonliang-bus_ffd4cf00).
+                    ack: dict[str, Any] = {"type": "registered", "id": agent_id}
+                    agent_type = data.get("agent_type") or (
+                        agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id
+                    )
+                    learnings = self.db.get_learnings(agent_type)
+                    if learnings:
+                        ack["learnings"] = learnings
+                    await ws.send_json(ack)
                     logger.info("Agent %s connected via WebSocket (%d skills)", agent_id, len(data.get("skills", [])))
                     await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "registered"})
+
+                elif msg_type == "save_learning":
+                    self.save_learning(
+                        agent_type=data.get("agent_type", ""),
+                        role=data.get("role", ""),
+                        model=data.get("model", ""),
+                        learning=data.get("learning", ""),
+                        confidence=data.get("confidence", 0.7),
+                        context=data.get("context", ""),
+                        source=data.get("source", "agent"),
+                    )
 
                 elif msg_type == "heartbeat":
                     if agent_id:
@@ -3974,6 +4033,21 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
                 raise HTTPException(status_code=404, detail=error)
             raise HTTPException(status_code=422, detail=error)
         return result
+
+    @app.post("/v1/learnings")
+    def save_learning(req: LearningSaveRequest):
+        result = bus.save_learning(
+            agent_type=req.agent_type, role=req.role, model=req.model,
+            learning=req.learning, confidence=req.confidence,
+            context=req.context, source=req.source,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=422, detail=result["error"])
+        return result
+
+    @app.get("/v1/learnings")
+    def list_learnings(agent_type: str = "", role: str = "", model: str = "", limit: int = 200):
+        return bus.db.list_learnings(agent_type=agent_type, role=role, model=model, limit=limit)
 
     @app.post("/v1/feedback")
     def report_feedback(req: FeedbackReport):
