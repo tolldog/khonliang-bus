@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -436,13 +437,26 @@ class BusServer:
         bus self-catalog. Returns the count purged."""
         purged = 0
         for agent_id in RESERVED_AGENT_IDS:
+            reg = self.db.get_registration(agent_id)
             had = (
-                self.db.get_registration(agent_id) is not None
+                reg is not None
                 or self.db.get_installed_agent(agent_id) is not None
                 or self.db.get_agent_welcome(agent_id) is not None
             )
             if not had:
                 continue
+            # A pre-existing reserved agent may be a live EXTERNAL process this
+            # BusServer didn't spawn (so _stop_process — which only knows this
+            # instance's children — is a no-op). Terminate its persisted PID
+            # first, else deleting the catalog rows below would orphan a running
+            # process no longer manageable through the bus.
+            pid = (reg or {}).get("pid")
+            if pid and int(pid) > 0 and _pid_alive(int(pid)):
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                    logger.warning("Purged reserved agent %r: sent SIGTERM to pid %s", agent_id, pid)
+                except OSError as e:
+                    logger.warning("Purged reserved agent %r: could not signal pid %s: %s", agent_id, pid, e)
             self._stop_process(agent_id)
             self.db.deregister_agent(agent_id)
             self.db.uninstall_agent(agent_id)

@@ -187,6 +187,25 @@ def test_boot_purges_preexisting_bus_agent(tmp_path):
     assert db.get_agent_welcome("bus") is None  # welcome purged on every surface
 
 
+def test_boot_purge_terminates_running_reserved_agent(tmp_path, monkeypatch):
+    """A pre-existing reserved 'bus' agent that's a live EXTERNAL process must be
+    SIGTERM'd before its catalog rows are deleted — else the row-delete orphans
+    a running process no longer manageable through the bus."""
+    import bus.server as srv
+
+    db = BusDB(str(tmp_path / "b.db"))
+    db.register_agent(agent_id="bus", agent_type="x", callback_url="cb", pid=54321)
+    monkeypatch.setattr(srv, "_pid_alive", lambda pid: pid == 54321)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(srv.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    bus = BusServer(db, config={})
+    bus.reconcile_on_boot()
+
+    assert (54321, srv.signal.SIGTERM) in killed  # terminated before row-delete
+    assert db.get_registration("bus") is None
+
+
 def test_reserved_id_welcome_write_rejected(tmp_path):
     """POST /v1/agents/bus/welcome must reject the reserved id, not persist a
     real-agent welcome that would leak on the welcome endpoints."""
