@@ -496,6 +496,26 @@ def test_skill_proxy_returns_response_envelope(adapter):
     assert payload["omitted"] is False
 
 
+def test_skill_proxy_structured_result_not_fragmented(adapter):
+    """A skill returning a dict/list must arrive as structured content, not a
+    JSON object chopped into per-line findings (fr_khonliang-bus_c989e906)."""
+    obj = {"count": 3, "papers": ["a", "b", "c"]}
+
+    async def mock_request(agent_id, operation, args, timeout=None):
+        return {"result": obj}
+
+    adapter._async_request = mock_request
+    mcp = adapter.build()
+    result = asyncio.run(mcp.call_tool(
+        "researcher-primary.find_papers",
+        {"args": json.dumps({})},
+    ))
+    payload = json.loads(_extract_text(result))
+    assert payload["findings"] == []       # not fragmented
+    assert payload["content"] == obj       # structure preserved
+    assert "object with 2 field" in payload["summary"]
+
+
 def test_skill_proxy_stores_large_result_as_artifact(bus_client):
     a = BusMCPAdapter("http://testserver")
     _wire_http(a, bus_client)

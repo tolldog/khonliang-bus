@@ -60,14 +60,31 @@ def build_response_envelope(
     budget: ResponseBudget,
     artifact: dict[str, Any] | None = None,
     content_type: str = "text/plain",
+    value: Any = None,
 ) -> dict[str, Any]:
-    """Build the standard compact envelope returned to MCP clients."""
+    """Build the standard compact envelope returned to MCP clients.
+
+    ``findings`` is a LINE-ORIENTED PREVIEW of text content only. Structured
+    (JSON) results are never chopped into per-line fragments — they live whole
+    in ``content`` (as the object, so callers don't reassemble) when they fit,
+    or in an artifact + bounded excerpt when they don't. Pass ``value`` (the
+    original result) so structured content stays structured
+    (fr_khonliang-bus_c989e906).
+    """
+    structured = content_type == "application/json"
     omitted = len(text) > budget.max_chars
-    findings = _findings(text, budget.max_chars, compact=not omitted)
+    if structured:
+        # No line-oriented preview for structured data — reassembling JSON
+        # fragments wastes the very inline budget the envelope protects.
+        findings: list[str] = []
+        summary = _structured_summary(value, producer=producer, operation=operation)
+    else:
+        findings = _findings(text, budget.max_chars, compact=not omitted)
+        summary = _summary(text, producer=producer, operation=operation)
     envelope: dict[str, Any] = {
         "ok": ok,
         "status": status,
-        "summary": _summary(text, producer=producer, operation=operation),
+        "summary": summary,
         "findings": findings,
         "refs": [],
         "artifact_ids": [],
@@ -105,7 +122,11 @@ def build_response_envelope(
             ])
 
     if omitted:
+        # Too big to inline — full payload is in the artifact; give a bounded
+        # text excerpt regardless of shape (structured excerpt stays a string).
         envelope["excerpt"] = _bounded_excerpt(text, budget.max_chars)
+    elif structured and value is not None:
+        envelope["content"] = value  # keep the object/array — no reassembly
     else:
         envelope["content"] = text
     return envelope
@@ -124,6 +145,24 @@ def _summary(text: str, *, producer: str, operation: str) -> str:
                 stripped = stripped[:SUMMARY_CHARS].rstrip() + "..."
             return f"{producer}.{operation}: {stripped}"
     return f"{producer}.{operation}: empty response"
+
+
+def _structured_summary(value: Any, *, producer: str, operation: str) -> str:
+    """One-line summary for a structured result — a shape description, not a
+    line of JSON (the object itself is in ``content``)."""
+    prefix = f"{producer}.{operation}:"
+    if isinstance(value, dict):
+        n = len(value)
+        if not n:
+            return f"{prefix} empty object"
+        keys = ", ".join(str(k) for k in list(value)[:5])
+        more = ", ..." if n > 5 else ""
+        return f"{prefix} object with {n} field(s) ({keys}{more})"
+    if isinstance(value, list):
+        return f"{prefix} array of {len(value)} item(s)"
+    if value is None:
+        return f"{prefix} structured result"
+    return f"{prefix} {type(value).__name__}"
 
 
 def _findings(text: str, max_chars: int, *, compact: bool) -> list[str]:
