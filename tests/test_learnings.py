@@ -40,6 +40,18 @@ def test_save_learning_new_then_merges(tmp_path):
     assert rows[0]["confidence"] == 0.9  # max(0.8, 0.9)
 
 
+def test_source_precedence_on_merge(tmp_path):
+    """Merge keeps the most-authoritative provenance: operator outranks agent,
+    and an agent re-discovery doesn't downgrade an operator-confirmed rule."""
+    db = _db(tmp_path)
+    k = dict(agent_type="a", role="r", model="m", learning="x")
+    db.save_learning(**k, source="agent")
+    db.save_learning(**k, source="operator")  # operator confirms → upgrade
+    assert db.list_learnings()[0]["source"] == "operator"
+    db.save_learning(**k, source="agent")     # re-discovery must not downgrade
+    assert db.list_learnings()[0]["source"] == "operator"
+
+
 def test_confidence_reinforced_upward_only(tmp_path):
     db = _db(tmp_path)
     k = dict(agent_type="a", role="r", model="m", learning="x")
@@ -198,3 +210,24 @@ def test_ws_save_learning_persists(client):
     assert len(rows) == 1
     assert rows[0]["learning"] == "constrain predicates"
     assert rows[0]["source"] == "agent"
+
+
+def test_ws_save_learning_binds_to_registered_identity(client):
+    """A WS save_learning must be bound to the connected socket's agent_type and
+    forced source=agent — payload agent_type/source are NOT trusted (else one
+    agent could poison another's learnings or forge operator provenance)."""
+    with client.websocket_connect("/v1/agent") as ws:
+        ws.send_json({"type": "register", "id": "researcher-1", "agent_type": "researcher", "pid": 1, "skills": []})
+        ws.receive_json()
+        ws.send_json({
+            "type": "save_learning", "agent_type": "victim", "source": "operator",  # spoof attempt
+            "role": "r", "model": "m", "learning": "poison",
+        })
+        ws.send_json({"type": "heartbeat"})
+        ws.receive_json()
+
+    # Nothing written under the spoofed 'victim' type.
+    assert client.get("/v1/learnings", params={"agent_type": "victim"}).json() == []
+    # Persisted under the real registered type, forced source=agent.
+    rows = client.get("/v1/learnings", params={"agent_type": "researcher"}).json()
+    assert len(rows) == 1 and rows[0]["source"] == "agent"

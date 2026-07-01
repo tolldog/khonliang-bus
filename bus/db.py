@@ -16,6 +16,15 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: Provenance authority for a learning, highest wins on merge (operator
+#: confirmation outranks agent self-discovery) — fr_khonliang-bus_ffd4cf00.
+_SOURCE_RANK = {"agent": 1, "harvest": 2, "feedback": 3, "operator": 4}
+
+
+def _source_rank(source: str) -> int:
+    return _SOURCE_RANK.get(source, 1)
+
+
 SCHEMA = """
 -- Persistent: what to start on boot
 CREATE TABLE IF NOT EXISTS installed_agents (
@@ -1023,23 +1032,41 @@ class BusDB:
         ``status`` 'saved' (new) or 'merged'."""
         confidence = max(0.0, min(1.0, float(confidence)))
         with self.conn() as c:
-            before = c.execute(
-                "SELECT sample_count FROM learnings WHERE agent_type=? AND role=? AND model=? AND learning=?",
+            existing = c.execute(
+                "SELECT id, confidence, source FROM learnings "
+                "WHERE agent_type=? AND role=? AND model=? AND learning=?",
                 (agent_type, role, model, learning),
             ).fetchone()
+            if existing:
+                # Keep the MOST-AUTHORITATIVE provenance across merges: an
+                # operator-confirmed rule stays 'operator' even if an agent
+                # re-discovers it, and an agent rule upgrades when an operator
+                # confirms it. Confidence reinforces upward.
+                merged_source = (
+                    source if _source_rank(source) >= _source_rank(existing["source"])
+                    else existing["source"]
+                )
+                c.execute(
+                    """
+                    UPDATE learnings SET
+                        sample_count = sample_count + 1,
+                        last_seen = datetime('now'),
+                        confidence = MAX(confidence, ?),
+                        source = ?,
+                        context = CASE WHEN ? != '' THEN ? ELSE context END
+                    WHERE id = ?
+                    """,
+                    (confidence, merged_source, context, context, existing["id"]),
+                )
+                return {"status": "merged"}
             c.execute(
                 """
                 INSERT INTO learnings (agent_type, role, model, learning, confidence, context, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(agent_type, role, model, learning) DO UPDATE SET
-                    sample_count = sample_count + 1,
-                    last_seen = datetime('now'),
-                    confidence = MAX(confidence, excluded.confidence),
-                    context = CASE WHEN excluded.context != '' THEN excluded.context ELSE context END
                 """,
                 (agent_type, role, model, learning, confidence, context, source),
             )
-            return {"status": "merged" if before else "saved"}
+            return {"status": "saved"}
 
     def get_learnings(
         self,

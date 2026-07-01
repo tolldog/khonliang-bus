@@ -2828,6 +2828,7 @@ class BusServer:
         """
         await ws.accept()
         agent_id: str | None = None
+        registered_type: str | None = None  # this socket's agent_type, set on register
 
         try:
             while True:
@@ -2892,10 +2893,10 @@ class BusServer:
                     # don't send ``models`` get nothing (they can't consume
                     # learnings until the bus-lib Phase 2 anyway).
                     ack: dict[str, Any] = {"type": "registered", "id": agent_id}
-                    agent_type = data.get("agent_type") or (
+                    registered_type = data.get("agent_type") or (
                         agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id
                     )
-                    learnings = self.db.get_learnings(agent_type, data.get("models") or {})
+                    learnings = self.db.get_learnings(registered_type, data.get("models") or {})
                     if learnings:
                         ack["learnings"] = learnings
                     await ws.send_json(ack)
@@ -2903,15 +2904,21 @@ class BusServer:
                     await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "registered"})
 
                 elif msg_type == "save_learning":
-                    self.save_learning(
-                        agent_type=data.get("agent_type", ""),
-                        role=data.get("role", ""),
-                        model=data.get("model", ""),
-                        learning=data.get("learning", ""),
-                        confidence=data.get("confidence", 0.7),
-                        context=data.get("context", ""),
-                        source=data.get("source", "agent"),
-                    )
+                    # Bind to THIS socket's registered identity — never trust the
+                    # payload's agent_type/source, or a compromised agent could
+                    # poison another agent type's learnings (fed back via its
+                    # register ack) or forge 'operator' provenance. Operator saves
+                    # come through the authenticated HTTP/MCP path instead.
+                    if registered_type:
+                        self.save_learning(
+                            agent_type=registered_type,
+                            role=data.get("role", ""),
+                            model=data.get("model", ""),
+                            learning=data.get("learning", ""),
+                            confidence=data.get("confidence", 0.7),
+                            context=data.get("context", ""),
+                            source="agent",
+                        )
 
                 elif msg_type == "heartbeat":
                     if agent_id:
