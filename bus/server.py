@@ -22,6 +22,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from functools import lru_cache
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -39,6 +41,26 @@ from bus.webhooks import build_topic, summarize, verify_signature
 from bus import webhook_install
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def load_bus_self_welcome() -> dict:
+    """The bus's own welcome blob (``bus/welcome.json``).
+
+    Static content loaded at startup and cached, so ``bus_welcome`` can render
+    the bus as a first-class participant in its own catalog without touching
+    the agent registry (fr_khonliang-bus_6638f4dc). The declared ``bus_*`` skill
+    list is asserted against the adapter's actually-registered tools by
+    ``tests/test_bus_self_welcome.py`` so it can't silently drift.
+    """
+    with Path(__file__).with_name("welcome.json").open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def bus_self_skill_names() -> list[str]:
+    """Flattened list of every skill the bus declares in its welcome catalog."""
+    cats = load_bus_self_welcome().get("skills_by_category", {})
+    return [name for skills in cats.values() for name in skills]
 
 
 # ---------------------------------------------------------------------------
@@ -2016,7 +2038,7 @@ class BusServer:
     #: shape changes in a way callers must adapt to (additive fields don't
     #: warrant a bump — clients should ignore unknown keys per
     #: ``feedback_cheap_irreversible_principle``).
-    BUS_WELCOME_SCHEMA_VERSION = 1
+    BUS_WELCOME_SCHEMA_VERSION = 2
 
     def get_bus_welcome(self, detail: str = "brief") -> dict:
         """One-call cold-start discovery of the platform.
@@ -2153,6 +2175,28 @@ class BusServer:
         suggested.append("bus_skills(agent_id=<id>) for full per-agent skill schemas")
         suggested.append("bus_topics for the event surface (subscribe via bus_wait_for_event)")
 
+        # The bus as a first-class entry in its own catalog (symmetric with
+        # agents, per fr_khonliang-bus_6638f4dc) — a sibling top-level ``bus``
+        # field rather than an entry in ``agents[]``, so consumers iterating the
+        # agent list don't get a non-dispatchable pseudo-agent (the bus has no
+        # callback and is never a routing target). Content is synthesized from
+        # bus/welcome.json at read time — no registry/catalog write.
+        blob = load_bus_self_welcome()
+        skill_names = bus_self_skill_names()
+        bus_entry: dict = {
+            "kind": "bus",
+            "identity": blob.get("identity", ""),
+            "role": blob.get("role", ""),
+            "skill_count": len(skill_names),
+            # If this call is being answered, the bus process is up.
+            "state": "healthy",
+        }
+        if detail == "full":
+            bus_entry["skills_by_category"] = blob.get("skills_by_category", {})
+            for k in ("boundaries", "suggested_next"):
+                if blob.get(k):
+                    bus_entry[k] = blob[k]
+
         return {
             "platform": {
                 "name": "khonliang",
@@ -2163,6 +2207,7 @@ class BusServer:
                 "bus_uptime_s": int(time.time() - self._started_at),
                 "schema_version": self.BUS_WELCOME_SCHEMA_VERSION,
             },
+            "bus": bus_entry,
             "agents": agents,
             "suggested_next": suggested,
         }

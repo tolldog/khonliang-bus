@@ -338,6 +338,21 @@ class BusMCPAdapter:
             )
             if p.get("identity"):
                 lines.append(p["identity"])
+            # The bus as a first-class catalog entry (fr_khonliang-bus_6638f4dc).
+            b = w.get("bus")
+            if isinstance(b, dict):
+                lines.append("")
+                lines.append(
+                    f"BUS: {b.get('identity', 'khonliang-bus')} "
+                    f"[{b.get('state', '?')}] ({b.get('skill_count', 0)} skills)"
+                )
+                if b.get("role"):
+                    lines.append(f"  role: {b['role']}")
+                if detail == "full":
+                    for cat, names in (b.get("skills_by_category") or {}).items():
+                        lines.append(f"  {cat}: {', '.join(names)}")
+                    if b.get("boundaries"):
+                        lines.append(f"  boundaries: {b['boundaries']}")
             lines.append("")
             lines.append("AGENTS:")
             for a in w.get("agents", []):
@@ -957,7 +972,30 @@ class BusMCPAdapter:
 
         @mcp.tool()
         async def bus_skills(agent_id: str = "") -> str:
-            """List skills. Optionally filter by agent_id."""
+            """List skills. Optionally filter by agent_id.
+
+            ``agent_id='bus'`` returns the bus's OWN tool catalog — the bus is a
+            first-class participant in its own catalog (fr_khonliang-bus_6638f4dc)
+            even though it isn't a registered agent. Served from the adapter's
+            actually-registered ``bus_*`` tools (the source of truth), so it can
+            never drift from what's callable.
+            """
+            if agent_id == "bus":
+                tools = await mcp.list_tools()
+                bus_tools = sorted(
+                    (
+                        t.name,
+                        (t.description or "").strip().splitlines()[0]
+                        if t.description else "",
+                    )
+                    for t in tools
+                    if t.name.startswith("bus_")
+                )
+                if not bus_tools:
+                    return "no skills registered"
+                lines = ["\n  bus:"]
+                lines += [f"    {name} — {desc}" for name, desc in bus_tools]
+                return "\n".join(lines).strip()
             params = {"agent_id": agent_id} if agent_id else {}
             skills = adapter._get("/v1/skills", params=params)
             if not skills:

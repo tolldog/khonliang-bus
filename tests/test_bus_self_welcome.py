@@ -1,0 +1,134 @@
+"""The bus as a first-class participant in its own catalog.
+
+Covers fr_khonliang-bus_6638f4dc: bus_welcome renders a top-level ``bus``
+entry, bus_skills(agent_id='bus') returns the bus tool catalog, and the
+declared bus_* skill list (bus/welcome.json) is asserted against the adapter's
+actually-registered bus_* tools so it can't silently drift.
+
+The bus is rendered as a synthesized sibling field — deliberately NOT injected
+into the agent registry — so it never becomes a routing / liveness target.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from bus.db import BusDB
+from bus.mcp_adapter import BusMCPAdapter
+from bus.server import BusServer, bus_self_skill_names, load_bus_self_welcome
+
+
+def _adapter() -> BusMCPAdapter:
+    a = BusMCPAdapter(bus_url="http://localhost:8787")
+    a._register_bus_tools()
+    return a
+
+
+def _registered_bus_tool_names() -> set[str]:
+    a = _adapter()
+    tools = asyncio.run(a.mcp.list_tools())
+    return {t.name for t in tools if t.name.startswith("bus_")}
+
+
+# ---------------------------------------------------------------------------
+# AC#3 — the sync test (the structural reason this FR matters)
+# ---------------------------------------------------------------------------
+
+
+def test_welcome_skill_list_matches_registered_bus_tools():
+    """bus/welcome.json must enumerate EXACTLY the bus_* tools the adapter
+    registers — no missing entries (undiscoverable tools) and no stale ones
+    (advertised tools that don't exist). Adding a bus_* tool without updating
+    welcome.json fails here."""
+    declared = set(bus_self_skill_names())
+    registered = _registered_bus_tool_names()
+
+    missing = registered - declared      # real tools not advertised
+    stale = declared - registered        # advertised tools that don't exist
+    assert not missing, f"welcome.json missing bus tools: {sorted(missing)}"
+    assert not stale, f"welcome.json lists non-existent bus tools: {sorted(stale)}"
+
+
+def test_welcome_skill_names_are_unique():
+    """No dup across categories (a dup would make the count wrong + is a
+    copy-paste smell)."""
+    names = bus_self_skill_names()
+    assert len(names) == len(set(names)), "duplicate skill names in welcome.json"
+
+
+# ---------------------------------------------------------------------------
+# AC#2 — bus appears in bus_welcome as a top-level entry
+# ---------------------------------------------------------------------------
+
+
+def test_bus_welcome_includes_bus_entry(tmp_path):
+    db = BusDB(str(tmp_path / "b.db"))
+    bus = BusServer(db, config={})
+    w = bus.get_bus_welcome(detail="brief")
+
+    assert "bus" in w
+    entry = w["bus"]
+    assert entry["kind"] == "bus"
+    assert entry["identity"].startswith("khonliang-bus")
+    assert entry["role"]
+    assert entry["skill_count"] == len(bus_self_skill_names())
+    assert entry["state"] == "healthy"
+    # It must NOT be smuggled into agents[] (would look like a routable agent).
+    assert all(a["agent_id"] != "bus" for a in w["agents"])
+
+
+def test_bus_welcome_full_has_skill_categories(tmp_path):
+    db = BusDB(str(tmp_path / "b.db"))
+    bus = BusServer(db, config={})
+    w = bus.get_bus_welcome(detail="full")
+
+    cats = w["bus"]["skills_by_category"]
+    assert "discovery" in cats and "bus_welcome" in cats["discovery"]
+    assert "webhooks" in cats
+    assert w["bus"]["boundaries"]  # editorial field surfaced at full detail
+
+
+# ---------------------------------------------------------------------------
+# AC#5 — works with zero agents live
+# ---------------------------------------------------------------------------
+
+
+def test_bus_welcome_bus_entry_present_with_zero_agents(tmp_path):
+    db = BusDB(str(tmp_path / "b.db"))
+    bus = BusServer(db, config={})
+    w = bus.get_bus_welcome(detail="brief")
+
+    assert w["agents"] == []          # nothing registered/installed
+    assert w["bus"]["kind"] == "bus"  # bus is still present
+    assert w["platform"]["schema_version"] == BusServer.BUS_WELCOME_SCHEMA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# AC#4 — bus_skills(agent_id='bus') returns the bus catalog, not "no skills"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bus_skills_for_bus_returns_catalog():
+    a = _adapter()
+    result = await a.mcp.call_tool("bus_skills", {"agent_id": "bus"})
+    text = result[1]["result"]
+
+    assert "no skills registered" not in text
+    # Every declared bus tool shows up in the rendered catalog.
+    for name in bus_self_skill_names():
+        assert name in text
+
+
+# ---------------------------------------------------------------------------
+# welcome.json shape sanity
+# ---------------------------------------------------------------------------
+
+
+def test_welcome_json_has_required_fields():
+    blob = load_bus_self_welcome()
+    for k in ("kind", "identity", "role", "skills_by_category", "suggested_next"):
+        assert k in blob, f"welcome.json missing {k!r}"
+    assert blob["kind"] == "bus"

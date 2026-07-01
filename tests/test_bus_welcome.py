@@ -25,7 +25,8 @@ from bus.server import BusServer
 def test_bus_welcome_shape_includes_platform(bus):
     w = bus.get_bus_welcome()
     assert w["platform"]["name"] == "khonliang"
-    assert w["platform"]["schema_version"] == 1
+    # v2 added the top-level ``bus`` self-entry (fr_khonliang-bus_6638f4dc).
+    assert w["platform"]["schema_version"] == 2
     # uptime is non-negative int.
     assert isinstance(w["platform"]["bus_uptime_s"], int)
     assert w["platform"]["bus_uptime_s"] >= 0
