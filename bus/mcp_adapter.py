@@ -174,6 +174,7 @@ class BusMCPAdapter:
         # still return quickly.
         self._http = httpx.Client(timeout=httpx.Timeout(self.default_timeout_s))
         self._async_http = httpx.AsyncClient(timeout=httpx.Timeout(self.default_timeout_s))
+        self._closed = False
         self.mcp = FastMCP("khonliang-bus")
         self._registered_tools: set[str] = set()
         # Subset of _registered_tools that are collaborative-flow tools (not
@@ -196,6 +197,21 @@ class BusMCPAdapter:
         self._register_flow_tools()
         self._assert_tool_names_within_limit()
         return self.mcp
+
+    async def aclose(self) -> None:
+        """Close the adapter's sync + async httpx clients.
+
+        ``__init__`` opens an ``httpx.Client`` and ``httpx.AsyncClient`` but the
+        adapter had no lifecycle hook to release them, so a graceful shutdown or
+        an embedding host would leak the connection pools / emit unclosed-client
+        ResourceWarnings (fr_khonliang-bus_f6da19a7). Idempotent — safe to call
+        more than once; a second call is a no-op.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._http.close()
+        await self._async_http.aclose()
 
     def _assert_tool_names_within_limit(self) -> None:
         """Fail fast if any REGISTERED tool name would exceed the API limit.
@@ -1830,7 +1846,17 @@ def main():
         default_timeout,
     )
 
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        # Best-effort: release the adapter's httpx connection pools on exit.
+        # ``mcp.run`` is blocking/sync, so the event loop is free here. Suppress
+        # errors — process exit reclaims the sockets regardless
+        # (fr_khonliang-bus_f6da19a7).
+        try:
+            asyncio.run(adapter.aclose())
+        except Exception:
+            logger.debug("adapter aclose on shutdown failed", exc_info=True)
 
 
 if __name__ == "__main__":

@@ -1806,3 +1806,19 @@ def test_flow_proxy_kwarg_threads_into_flow_request_timeout():
     assert captured["body"]["timeout"] == 240.0
     assert captured["body"]["args"] == {"path": "/x.md"}
     assert captured["http_timeout"] == 245.0
+
+
+async def test_aclose_closes_both_clients_and_is_idempotent():
+    """fr_khonliang-bus_f6da19a7: aclose() releases both httpx clients and is
+    safe to call more than once."""
+    a = BusMCPAdapter("http://testserver")
+    assert not a._http.is_closed
+    assert not a._async_http.is_closed
+
+    await a.aclose()
+
+    assert a._http.is_closed
+    assert a._async_http.is_closed
+
+    # Idempotent — a second call is a no-op and must not raise.
+    await a.aclose()
