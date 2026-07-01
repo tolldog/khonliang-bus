@@ -113,24 +113,55 @@ def test_resolve_lazy_target_by_type_ambiguous_is_none(tmp_path):
     assert bus._resolve_lazy_target(RequestMessage(agent_type="reviewer", operation="x")) is None
 
 
-def test_is_lazy_agent_down_matrix(tmp_path, monkeypatch):
+def test_lazy_reachable_matrix(tmp_path, monkeypatch):
+    """_lazy_agent_reachable: registered AND live (registration required)."""
     import bus.server as srv
     bus = _bus(tmp_path, lazy_eligible=["a"])
 
-    assert bus._is_lazy_agent_down("a", None) is True  # no reg
+    assert bus._lazy_agent_reachable("a", None) is False  # no reg → not reachable
 
     monkeypatch.setattr(srv, "_pid_alive", lambda pid: False)
-    assert bus._is_lazy_agent_down("a", {"pid": 4242, "status": "healthy"}) is True  # dead pid
+    assert bus._lazy_agent_reachable("a", {"pid": 4242, "status": "healthy"}) is False  # dead pid
     monkeypatch.setattr(srv, "_pid_alive", lambda pid: True)
-    assert bus._is_lazy_agent_down("a", {"pid": 4242, "status": "healthy"}) is False  # live pid
+    assert bus._lazy_agent_reachable("a", {"pid": 4242, "status": "healthy"}) is True   # live pid
 
-    # pid=0 (WS shape): liveness = WS-connected OR live spawned process.
     monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: True)
-    assert bus._is_lazy_agent_down("a", {"pid": 0, "status": "healthy"}) is False  # WS live
+    assert bus._lazy_agent_reachable("a", {"pid": 0, "status": "healthy"}) is True   # WS live
     monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
-    assert bus._is_lazy_agent_down("a", {"pid": 0, "status": "healthy"}) is True   # WS gone, no proc → relaunch
+    assert bus._lazy_agent_reachable("a", {"pid": 0, "status": "healthy"}) is False  # pid0, no ws, no proc
     bus._processes["a"] = _FakePopen(alive=True)
-    assert bus._is_lazy_agent_down("a", {"pid": 0, "status": "healthy"}) is False  # live spawned process
+    assert bus._lazy_agent_reachable("a", {"pid": 0, "status": "healthy"}) is True   # live spawned process
+
+
+def test_lazy_needs_launch_avoids_duplicate(tmp_path, monkeypatch):
+    """_lazy_needs_launch: launch only when NOT reachable AND no live process —
+    a live process with a dropped registration is mid-startup, not a launch cue
+    (else we'd spawn a duplicate)."""
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
+
+    assert bus._lazy_needs_launch("a", None) is True  # no reg, no proc → launch
+
+    bus._processes["a"] = _FakePopen(alive=True)  # process coming up, reg dropped
+    assert bus._lazy_needs_launch("a", None) is False  # don't duplicate a live process
+
+
+async def test_do_lazy_launch_no_duplicate_when_process_alive(tmp_path, monkeypatch):
+    """If a spawned process is still alive but its registration dropped,
+    _do_lazy_launch must NOT spawn a second one — it polls for the existing
+    process to (re)register."""
+    bus = _bus(tmp_path, lazy_eligible=["a"], lazy_launch_timeout_s=0.05)
+    _install(bus.db, "a")
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
+    bus._processes["a"] = _FakePopen(alive=True)  # running; reg dropped
+    calls: list[str] = []
+    bus._start_process = lambda inst: calls.append(inst["id"])
+    bus._stop_process = lambda aid: None  # don't kill the fake in teardown
+
+    result = await bus._do_lazy_launch("a")
+
+    assert calls == []                       # no duplicate spawn
+    assert "did not register" in result["error"]  # polled the existing proc, never registered
 
 
 # ---------------------------------------------------------------------------

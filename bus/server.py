@@ -1207,30 +1207,42 @@ class BusServer:
             return matches[0] if len(matches) == 1 else None
         return None
 
-    def _is_lazy_agent_down(self, agent_id: str, reg: dict | None) -> bool:
-        """True if a lazy-eligible agent should be (re)launched on this call.
-
-        pid-derived liveness is NOT sufficient here: a lazy agent registers over
-        WebSocket with pid=0 (``handle_agent_ws`` default), which
-        _derive_live_status can never mark 'dead', so after it exits the stale
-        row would suppress relaunch (codex). For a bus-MANAGED agent the ground
-        truth for "up right now" is an active WS connection OR a live spawned
-        process — check those directly for the pid-less case.
-        """
-        if reg is None:
-            return True
-        if self._derive_live_status(reg) == "dead":
-            return True
-        pid = reg.get("pid")
-        if pid and int(pid) > 0:
-            return False  # real local pid, not derived-dead → up
-        # pid-less (WS / remote-shape) registration: only up if a live peer or a
-        # live bus-spawned process backs it.
-        if self.is_agent_ws_connected(agent_id):
-            return False
+    def _lazy_process_alive(self, agent_id: str) -> bool:
+        """Whether a process THIS bus spawned for the agent is still running."""
         with self._processes_lock:
             proc = self._processes.get(agent_id)
-        return not (proc is not None and proc.poll() is None)
+        return proc is not None and proc.poll() is None
+
+    def _lazy_agent_reachable(self, agent_id: str, reg: dict | None) -> bool:
+        """Whether a lazy agent can serve a request NOW — registered AND live.
+
+        pid-derived liveness alone is insufficient: a lazy agent registers over
+        WebSocket with pid=0 (``handle_agent_ws`` default), which
+        _derive_live_status never marks 'dead'. For the pid-less case reachability
+        is an active WS connection OR a live bus-spawned process backing the row.
+        Registration is REQUIRED — a spawned-but-unregistered process can't yet
+        serve, so this gates the launch poll (don't dispatch before register).
+        """
+        if reg is None:
+            return False
+        if self._derive_live_status(reg) == "dead":
+            return False
+        pid = reg.get("pid")
+        if pid and int(pid) > 0:
+            return True  # real live local pid
+        return self.is_agent_ws_connected(agent_id) or self._lazy_process_alive(agent_id)
+
+    def _lazy_needs_launch(self, agent_id: str, reg: dict | None) -> bool:
+        """Whether a skill call should (re)launch the lazy agent.
+
+        Launch only when it's neither reachable NOR already coming up: a live
+        spawned process with a dropped/absent registration is mid-startup (or a
+        just-deregistered instance still exiting), so relaunching would spawn a
+        DUPLICATE (codex). That case waits for the existing process to register.
+        """
+        if self._lazy_agent_reachable(agent_id, reg):
+            return False
+        return not self._lazy_process_alive(agent_id)
 
     async def _lazy_launch(self, agent_id: str) -> dict:
         """Launch a dead lazy-eligible agent and wait for it to register.
@@ -1253,42 +1265,39 @@ class BusServer:
         installed = self.db.get_installed_agent(agent_id)
         if installed is None:
             return {"error": f"lazy agent {agent_id!r} is not installed"}
-        # start_agent's 'already_running' guard is pid-derived, so a stale pid=0
-        # WS row from a prior (now-exited) instance would make it no-op WITHOUT
-        # spawning a replacement. Re-check real liveness: if it actually came up
-        # (concurrent launch / WS reconnect) we're done; otherwise clear the stale
-        # row so start_agent's guard sees no live registration and truly spawns.
         reg = self.db.get_registration(agent_id)
-        if reg is not None:
-            if not self._is_lazy_agent_down(agent_id, reg):
-                return {}
-            self._stop_process(agent_id)
-            self.db.deregister_agent(agent_id)
-        # start_agent still guards against a same-tick concurrent spawn and
-        # records spawn failures.
-        result = self.start_agent(agent_id)
-        if result.get("status") == "already_running":
-            return {}
-        if result.get("error"):
-            # Transient: keep the agent lazy_eligible (the next call retries)
-            # rather than leaving a sticky autostart_failed row.
-            self._autostart_failures.pop(agent_id, None)
-            return {"error": f"lazy launch of {agent_id!r} failed: {result['error']}"}
-        # Poll until the agent is actually REACHABLE — the same test the trigger
-        # uses, not merely "a row exists". A pid=0 WS row whose socket already
-        # dropped is non-dead by _derive_live_status but not reachable, so a bare
-        # ``!= dead`` check would report success and then fail against a dead
-        # callback. Async-sleep between cheap reads — never block the request loop.
+        if self._lazy_agent_reachable(agent_id, reg):
+            return {}  # already up (concurrent launch / WS reconnect)
+        # Spawn ONLY if no process is already coming up — a live spawned process
+        # with a dropped/absent registration is mid-startup, so relaunching would
+        # duplicate it (codex). In that case, skip the spawn and just poll for it
+        # to register.
+        if not self._lazy_process_alive(agent_id):
+            # A stale (unreachable) registration would make start_agent's
+            # pid-derived 'already_running' guard no-op without spawning — clear
+            # it first so the launch actually happens.
+            if reg is not None:
+                self._stop_process(agent_id)
+                self.db.deregister_agent(agent_id)
+            result = self.start_agent(agent_id)
+            if result.get("error"):
+                # Transient: keep the agent lazy_eligible (next call retries)
+                # rather than leaving a sticky autostart_failed row.
+                self._autostart_failures.pop(agent_id, None)
+                return {"error": f"lazy launch of {agent_id!r} failed: {result['error']}"}
+        # Poll until the agent is actually REACHABLE (registered AND live) — the
+        # spawned process, or the one that was already coming up. Async-sleep
+        # between cheap reads — never block the request loop.
         deadline = self._now() + self._lazy_launch_timeout_s
         while self._now() < deadline:
             reg = self.db.get_registration(agent_id)
-            if not self._is_lazy_agent_down(agent_id, reg):
+            if self._lazy_agent_reachable(agent_id, reg):
                 return {}
             await asyncio.sleep(0.1)
         # Deadline passed. One last check — it may have come reachable in the
         # final tick; if so, succeed rather than kill a working agent.
         reg = self.db.get_registration(agent_id)
-        if not self._is_lazy_agent_down(agent_id, reg):
+        if self._lazy_agent_reachable(agent_id, reg):
             return {}
         # Genuinely not up — stop the half-started process AND clear any stale
         # registration. A WS agent registers with pid=0, which _derive_live_status
@@ -1417,7 +1426,7 @@ class BusServer:
         # where os.kill(pid,0) is reliable — so it can also re-launch an agent
         # whose row lingered after a crash. Non-lazy routing is unchanged.
         lazy_id = self._resolve_lazy_target(req)
-        if lazy_id and self._is_lazy_agent_down(lazy_id, reg):
+        if lazy_id and self._lazy_needs_launch(lazy_id, reg):
             launched = await self._lazy_launch(lazy_id)
             if launched.get("error"):
                 return {**launched, "trace_id": trace_id}
