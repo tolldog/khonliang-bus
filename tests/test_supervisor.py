@@ -626,6 +626,24 @@ def test_stop_clears_gave_up_failure_surface(tmp_path, monkeypatch):
     assert not any(s["id"] == "a1" for s in bus.get_services())
 
 
+def test_failed_restart_during_backoff_stays_visible(tmp_path):
+    """restart_agent on a crashed, backing-off agent whose respawn fails must not
+    drop it from /v1/services — record the failure so the outage stays visible
+    even though _stop_process cleared the dead Popen + backoff state."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus(db)
+    # Simulate: crashed + supervisor backing off.
+    bus._processes["broken"] = _FakePopen(pid=4242, alive=False, returncode=1)
+    bus._supervisor_backoff["broken"] = {"restarts": 1, "next_attempt_at": 100.0, "last_restart_at": 0.0}
+
+    result = bus.restart_agent("broken")  # _start_process fails (bad binary)
+
+    assert "error" in result
+    assert "broken" in bus._autostart_failures        # not silently dropped
+    assert any(s["id"] == "broken" for s in bus.get_services())  # still visible
+
+
 def test_restart_failure_keeps_gave_up_outage_visible(tmp_path):
     """restart_agent must NOT clear the give-up failure surface up front:
     if the manual restart fails to spawn, the outage stays on /v1/services."""

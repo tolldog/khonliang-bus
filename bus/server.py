@@ -1024,6 +1024,14 @@ class BusServer:
         # (``_drop_autostart_failure`` on the register path clears it then).
         if result.get("status") == "started":
             self._supervisor_backoff.pop(agent_id, None)
+        elif result.get("error"):
+            # The manual (re)start failed to SPAWN. restart_agent's _stop_process
+            # already removed the dead Popen + backoff state, so without this the
+            # agent would vanish from /v1/services AND from supervision (no
+            # registration, no _processes entry, no backoff) — silently unrecovered.
+            # Record the failure so it stays visible as autostart_failed until an
+            # operator fixes it and a start actually succeeds (registration clears it).
+            self._autostart_failures[agent_id] = f"start failed: {result['error']}"
         return result
 
     def stop_agent(self, agent_id: str) -> dict:
