@@ -368,6 +368,25 @@ class BusServer:
         self._supervisor_recovery_window_s = float(
             self.config.get("supervisor_recovery_window_s", 300.0)
         )
+        # Lazy hot-load (fr_khonliang-bus_c81f7ab5): agents started on the FIRST
+        # skill call to a dead agent, not kept hot. Keyed by agent_id; the agent
+        # must be INSTALLED (the launch spec is reused, same as autostart). An
+        # agent listed here is NOT autostarted and NOT supervisor-restarted
+        # ("exactly one mode" + one launch per call). Config forms accepted:
+        #   lazy_eligible: [heavy-reviewer, {agent_id: worker, idle_shutdown_s: 600}]
+        self._lazy_config: dict[str, dict] = {}
+        for entry in self.config.get("lazy_eligible", []) or []:
+            if isinstance(entry, str):
+                self._lazy_config[entry] = {}
+            elif isinstance(entry, dict) and entry.get("agent_id"):
+                self._lazy_config[str(entry["agent_id"])] = entry
+        # Wait-for-register budget on a lazy launch — distinct from the request's
+        # own dispatch timeout (we wait up to this for the agent to come live,
+        # THEN dispatch with the caller's timeout).
+        self._lazy_launch_timeout_s = float(self.config.get("lazy_launch_timeout_s", 30.0))
+        # In-flight lazy launches: agent_id -> asyncio.Task, so concurrent callers
+        # for the same dead agent share ONE launch instead of racing to spawn.
+        self._lazy_launches: dict[str, asyncio.Task] = {}
         self.flow_engine = FlowEngine(db, self._http)
         self.artifacts = ArtifactStore(db)
         self.orchestrator = Orchestrator(
@@ -495,6 +514,11 @@ class BusServer:
         skipped: list[str] = []
         for installed in self.db.get_installed_agents():
             agent_id = installed["id"]
+            # Lazy-eligible agents opt out of autostart — they're launched on the
+            # first skill call instead ("exactly one mode", fr_khonliang-bus_c81f7ab5).
+            if agent_id in self._lazy_config:
+                skipped.append(agent_id)
+                continue
             try:
                 result = self.start_agent(agent_id)
             except Exception as e:
@@ -611,6 +635,19 @@ class BusServer:
 
             exit_code = proc.returncode
             crashed_pid = proc.pid
+
+            # Lazy-eligible agents get ONE launch per skill call — the supervisor
+            # never restarts them (fr_khonliang-bus_c81f7ab5 AC#6). Stop tracking
+            # the dead Popen and move on; the next skill call re-launches it. This
+            # is a clean early-exit, deliberately kept OUT of the backoff/give-up
+            # cells. Keyed off _lazy_config (not a launching-set) so a sweep that
+            # lands mid-launch is still correct.
+            if agent_id in self._lazy_config:
+                with self._processes_lock:
+                    if self._processes.get(agent_id) is proc:
+                        self._processes.pop(agent_id, None)
+                self._supervisor_backoff.pop(agent_id, None)
+                continue
 
             # Concurrency re-check WITHOUT popping: a concurrent stop/restart may
             # have replaced (new Popen) or removed (None) our tracked entry.
@@ -1141,6 +1178,74 @@ class BusServer:
         self.db.deregister_agent(agent_id)
         return self.start_agent(agent_id)
 
+    # -- lazy hot-load (fr_khonliang-bus_c81f7ab5) --
+
+    def _resolve_lazy_target(self, req: "RequestMessage") -> str | None:
+        """The lazy-eligible agent_id a request should trigger a launch for, else
+        None. Direct ``agent_id``: the id itself if lazy-eligible. By
+        ``agent_type``: only when EXACTLY ONE installed lazy-eligible agent
+        matches the type (an ambiguous multi-match falls through to normal
+        no-healthy rather than guessing which one to start)."""
+        if req.agent_id:
+            return req.agent_id if req.agent_id in self._lazy_config else None
+        if req.agent_type:
+            matches = [
+                aid for aid in self._lazy_config
+                if (inst := self.db.get_installed_agent(aid))
+                and inst.get("agent_type") == req.agent_type
+            ]
+            return matches[0] if len(matches) == 1 else None
+        return None
+
+    async def _lazy_launch(self, agent_id: str) -> dict:
+        """Launch a dead lazy-eligible agent and wait for it to register.
+
+        Returns ``{}`` once the agent is live, or ``{"error": ...}`` on
+        not-installed / launch-failure / register-timeout. Concurrent callers for
+        the same agent share ONE launch task so a burst of cold calls can't race
+        to spawn duplicates.
+        """
+        task = self._lazy_launches.get(agent_id)
+        if task is None:
+            task = asyncio.create_task(self._do_lazy_launch(agent_id))
+            self._lazy_launches[agent_id] = task
+            task.add_done_callback(lambda t: self._lazy_launches.pop(agent_id, None))
+        # shield: a cancelled caller must not cancel the shared launch that other
+        # waiters still depend on.
+        return await asyncio.shield(task)
+
+    async def _do_lazy_launch(self, agent_id: str) -> dict:
+        installed = self.db.get_installed_agent(agent_id)
+        if installed is None:
+            return {"error": f"lazy agent {agent_id!r} is not installed"}
+        # start_agent gives the derived-liveness 'already_running' guard (a
+        # concurrent launch that already registered won't double-spawn) and
+        # records spawn failures.
+        result = self.start_agent(agent_id)
+        if result.get("status") == "already_running":
+            return {}
+        if result.get("error"):
+            # Transient: keep the agent lazy_eligible (the next call retries)
+            # rather than leaving a sticky autostart_failed row.
+            self._autostart_failures.pop(agent_id, None)
+            return {"error": f"lazy launch of {agent_id!r} failed: {result['error']}"}
+        # Poll for registration up to the launch budget. Async-sleep between cheap
+        # sqlite reads — never block the request loop with a sync sleep.
+        deadline = self._now() + self._lazy_launch_timeout_s
+        while self._now() < deadline:
+            reg = self.db.get_registration(agent_id)
+            if reg is not None and self._derive_live_status(reg) != "dead":
+                return {}
+            await asyncio.sleep(0.1)
+        # Timed out — stop the half-started process; return a clean error (AC#3).
+        self._stop_process(agent_id)
+        return {
+            "error": (
+                f"lazy agent {agent_id!r} did not register within "
+                f"{self._lazy_launch_timeout_s:g}s"
+            )
+        }
+
     def _start_process(self, installed: dict) -> dict:
         agent_id = installed["id"]
         bus_url = self.config.get("bus_url", "http://localhost:8787")
@@ -1246,6 +1351,19 @@ class BusServer:
             reg = self.db.get_healthy_agent_for_type(req.agent_type)
         else:
             return {"error": "agent_id or agent_type required", "trace_id": trace_id}
+
+        # Lazy hot-load (fr_khonliang-bus_c81f7ab5): if the target is a
+        # dead-or-absent lazy-eligible agent, launch it on demand, wait for it to
+        # register, then re-resolve and dispatch normally. The derived-liveness
+        # check is consulted ONLY for a lazy candidate — a bus-spawned local agent
+        # where os.kill(pid,0) is reliable — so it can also re-launch an agent
+        # whose row lingered after a crash. Non-lazy routing is unchanged.
+        lazy_id = self._resolve_lazy_target(req)
+        if lazy_id and (reg is None or self._derive_live_status(reg) == "dead"):
+            launched = await self._lazy_launch(lazy_id)
+            if launched.get("error"):
+                return {**launched, "trace_id": trace_id}
+            reg = self.db.get_registration(lazy_id)
 
         if not reg:
             return {"error": f"no healthy agent found for {req.agent_id or req.agent_type}", "trace_id": trace_id}
@@ -2172,6 +2290,15 @@ class BusServer:
                 # but possible (ad-hoc registrations per
                 # ``feedback_adhoc_agents_are_first_class``).
                 state = "deregistered"
+
+            # A down lazy-eligible agent isn't really 'dead' — it launches on the
+            # next skill call. Surface it as ``lazy_eligible`` so callers know the
+            # skills are available on demand (fr_khonliang-bus_c81f7ab5 AC#5). A
+            # LIVE lazy agent keeps its runtime status.
+            if agent_id in self._lazy_config and state in {
+                "cataloged_dead", "dead", "deregistered"
+            }:
+                state = "lazy_eligible"
 
             entry: dict = {
                 "agent_id": agent_id,

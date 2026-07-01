@@ -1,0 +1,251 @@
+"""Lazy hot-load Phase 1 (fr_khonliang-bus_c81f7ab5).
+
+Launch-on-demand: a skill call to a dead lazy-eligible agent triggers a launch,
+waits for register (bounded), then dispatches. Covers ACs 1,2,3,5,6. The
+idle-shutdown reaper + start_only flag (AC#4) are Phase 2.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from bus.db import BusDB
+from bus.server import BusServer, RequestMessage
+
+
+class _FakePopen:
+    def __init__(self, pid: int = 0, alive: bool = True, returncode: int = 0):
+        self.pid = pid or id(self)
+        self._alive = alive
+        self.returncode = returncode if not alive else None
+
+    def poll(self):
+        return None if self._alive else self.returncode
+
+    def die(self, code: int = 1) -> None:
+        self._alive = False
+        self.returncode = code
+
+    def terminate(self):
+        self.die(-15)
+
+    def kill(self):
+        self.die(-9)
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _bus(tmp_path, **cfg) -> BusServer:
+    db = BusDB(str(tmp_path / "bus.db"))
+    return BusServer(db, config={"bus_url": "http://localhost:9999", **cfg})
+
+
+def _install(db: BusDB, agent_id: str, agent_type: str = "test") -> None:
+    db.install_agent(agent_id=agent_id, agent_type=agent_type, command="/bin/true",
+                     args=[], cwd="/tmp", config="/tmp/c.yaml")
+
+
+def _patch_launch(bus: BusServer, register: bool = True):
+    """Make _start_process a fake success: track the spawned agent, optionally
+    write a registration row so the launch poll sees it come live. Returns the
+    call-count list."""
+    calls: list[str] = []
+
+    def _fake(installed):
+        agent_id = installed["id"]
+        calls.append(agent_id)
+        with bus._processes_lock:
+            bus._processes[agent_id] = _FakePopen(alive=True)
+        if register:
+            # pid=0 (WS-style) → _derive_live_status falls to heartbeat, not dead.
+            bus.db.register_agent(agent_id=agent_id, agent_type="test",
+                                  callback_url="ws", pid=0)
+        return {"id": agent_id, "pid": 0, "status": "started"}
+
+    bus._start_process = _fake
+    return calls
+
+
+# ---------------------------------------------------------------------------
+# AC#1 — config
+# ---------------------------------------------------------------------------
+
+
+def test_lazy_config_parses_str_and_dict_forms(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a", {"agent_id": "b", "idle_shutdown_s": 600}])
+    assert set(bus._lazy_config) == {"a", "b"}
+    assert bus._lazy_config["b"]["idle_shutdown_s"] == 600
+
+
+# ---------------------------------------------------------------------------
+# _resolve_lazy_target
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_lazy_target_by_id(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    assert bus._resolve_lazy_target(RequestMessage(agent_id="a", operation="x")) == "a"
+    assert bus._resolve_lazy_target(RequestMessage(agent_id="other", operation="x")) is None
+
+
+def test_resolve_lazy_target_by_type_single_match(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a", agent_type="reviewer")
+    assert bus._resolve_lazy_target(RequestMessage(agent_type="reviewer", operation="x")) == "a"
+
+
+def test_resolve_lazy_target_by_type_ambiguous_is_none(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a", "b"])
+    _install(bus.db, "a", agent_type="reviewer")
+    _install(bus.db, "b", agent_type="reviewer")
+    # Two lazy agents of the same type → don't guess which to start.
+    assert bus._resolve_lazy_target(RequestMessage(agent_type="reviewer", operation="x")) is None
+
+
+# ---------------------------------------------------------------------------
+# AC#2/#3 — launch + wait + timeout
+# ---------------------------------------------------------------------------
+
+
+async def test_do_lazy_launch_success(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    _patch_launch(bus, register=True)
+
+    result = await bus._do_lazy_launch("a")
+
+    assert result == {}
+    assert bus.db.get_registration("a") is not None
+
+
+async def test_do_lazy_launch_timeout_stops_and_errors(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"], lazy_launch_timeout_s=0.15)
+    _install(bus.db, "a")
+    _patch_launch(bus, register=False)  # spawns but never registers
+    stopped: list[str] = []
+    bus._stop_process = lambda aid: stopped.append(aid)
+
+    result = await bus._do_lazy_launch("a")
+
+    assert "did not register" in result["error"]
+    assert stopped == ["a"]  # half-started process cleaned up
+
+
+async def test_do_lazy_launch_not_installed(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"])  # not installed
+    result = await bus._do_lazy_launch("a")
+    assert "not installed" in result["error"]
+
+
+async def test_do_lazy_launch_spawn_failure_is_transient(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    bus._start_process = lambda installed: {"id": "a", "error": "boom"}
+
+    result = await bus._do_lazy_launch("a")
+
+    assert "failed" in result["error"]
+    # Transient — must NOT leave a sticky autostart_failed row (stays lazy).
+    assert "a" not in bus._autostart_failures
+
+
+async def test_lazy_launch_dedups_concurrent_callers(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    calls = _patch_launch(bus, register=True)
+
+    results = await asyncio.gather(bus._lazy_launch("a"), bus._lazy_launch("a"))
+
+    assert results == [{}, {}]
+    assert calls == ["a"]  # single launch shared by both callers
+
+
+# ---------------------------------------------------------------------------
+# AC#6 — no autostart, no supervisor restart
+# ---------------------------------------------------------------------------
+
+
+def test_autostart_skips_lazy_agents(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["lazy1"])
+    _install(bus.db, "lazy1")
+    _install(bus.db, "eager1")
+    started: list[str] = []
+    bus._start_process = lambda inst: (started.append(inst["id"]), {"id": inst["id"], "pid": 1, "status": "started"})[1]
+
+    result = bus.autostart_installed_agents()
+
+    assert "eager1" in started
+    assert "lazy1" not in started
+    assert "lazy1" in result["skipped"]
+
+
+def test_supervisor_never_restarts_lazy_agent(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    started: list[str] = []
+    bus._start_process = lambda inst: started.append(inst["id"])
+
+    bus._processes["a"] = _FakePopen(alive=False, returncode=1)  # crashed lazy agent
+    result = bus.supervise_once()
+
+    assert started == []                     # not restarted
+    assert result["restarted"] == []
+    assert "a" not in bus._processes          # stopped tracking; next call relaunches
+
+
+# ---------------------------------------------------------------------------
+# AC#5 — bus_welcome state
+# ---------------------------------------------------------------------------
+
+
+def test_bus_welcome_shows_lazy_eligible_state(tmp_path):
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")  # installed but never started
+
+    w = bus.get_bus_welcome(detail="brief")
+    entry = next(e for e in w["agents"] if e["agent_id"] == "a")
+    assert entry["state"] == "lazy_eligible"  # not 'cataloged_dead'
+
+
+# ---------------------------------------------------------------------------
+# handle_request trigger
+# ---------------------------------------------------------------------------
+
+
+async def test_handle_request_triggers_lazy_launch_for_lazy_target(tmp_path, monkeypatch):
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a")
+    launched: list[str] = []
+
+    async def _fake_lazy(agent_id):
+        # Simulate a successful launch: register the agent so handle_request
+        # re-resolves it and proceeds past the no-healthy guard.
+        launched.append(agent_id)
+        bus.db.register_agent(agent_id=agent_id, agent_type="test", callback_url="ws", pid=0)
+        return {}
+
+    monkeypatch.setattr(bus, "_lazy_launch", _fake_lazy)
+
+    # Stub the post-resolution dispatch so the test exercises only the lazy
+    # trigger + re-resolution, not WS/callback routing.
+    async def _fake_dispatch(*a, **k):
+        return {"ok": True, "dispatched": True}
+    monkeypatch.setattr(bus, "_dispatch_resolved_request", _fake_dispatch)
+
+    result = await bus.handle_request(RequestMessage(agent_id="a", operation="ping"))
+    assert launched == ["a"]
+    assert result.get("dispatched") is True  # got past resolution to dispatch
+
+
+async def test_handle_request_no_lazy_for_non_lazy_agent(tmp_path, monkeypatch):
+    bus = _bus(tmp_path)  # nothing lazy
+    launched: list[str] = []
+    monkeypatch.setattr(bus, "_lazy_launch", lambda aid: launched.append(aid))
+
+    result = await bus.handle_request(RequestMessage(agent_id="ghost", operation="x"))
+
+    assert launched == []
+    assert "no healthy agent" in result["error"]
