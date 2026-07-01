@@ -1134,6 +1134,48 @@ class BusMCPAdapter:
             )
             return json.dumps(reports or [], indent=2)
 
+        @mcp.tool()
+        async def bus_learnings_save(
+            agent_type: str,
+            role: str,
+            model: str,
+            learning: str,
+            confidence: float = 0.7,
+            context: str = "",
+        ) -> str:
+            """Persist an operational learning for an (agent_type, role, model).
+
+            Learnings are earned-through-experience instructions that agents load
+            into their role prompts on startup (fr_khonliang-bus_ffd4cf00). Use
+            this to record an insight an operator/session observed (source=
+            operator). Re-saving the same learning reinforces it (bumps
+            confidence + sample_count) rather than duplicating.
+            """
+            result = await adapter._async_post(
+                "/v1/learnings",
+                {
+                    "agent_type": agent_type, "role": role, "model": model,
+                    "learning": learning, "confidence": confidence,
+                    "context": context, "source": "operator",
+                },
+            )
+            return json.dumps(result or {"error": "no response"}, indent=2)
+
+        @mcp.tool()
+        async def bus_learnings_list(
+            agent_type: str = "",
+            role: str = "",
+            model: str = "",
+            limit: int = 50,
+        ) -> str:
+            """List persisted learnings, optionally filtered by agent_type / role
+            / model (fr_khonliang-bus_ffd4cf00)."""
+            rows = adapter._get(
+                "/v1/learnings",
+                params={"agent_type": agent_type, "role": role, "model": model, "limit": limit},
+            )
+            return json.dumps(rows or [], indent=2)
+
         # Read-side ``bus_artifact_*`` MCP tools were retired with
         # khonliang-store Phase 4c (`fr_khonliang-bus_9151395d`).
         # The store agent now owns the canonical artifact read

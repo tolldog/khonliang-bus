@@ -16,6 +16,15 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: Provenance authority for a learning, highest wins on merge (operator
+#: confirmation outranks agent self-discovery) — fr_khonliang-bus_ffd4cf00.
+_SOURCE_RANK = {"agent": 1, "harvest": 2, "feedback": 3, "operator": 4}
+
+
+def _source_rank(source: str) -> int:
+    return _SOURCE_RANK.get(source, 1)
+
+
 SCHEMA = """
 -- Persistent: what to start on boot
 CREATE TABLE IF NOT EXISTS installed_agents (
@@ -228,6 +237,27 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_distillation_cache
         json_extract(metadata, '$.distiller_version')
     )
     WHERE kind = 'distillation' AND producer = 'bus';
+
+-- Persistent per-(agent_type, role, model) operational learnings earned through
+-- experience — loaded into an agent's system prompt on register (fr_khonliang-
+-- bus_ffd4cf00). Keyed so a model swap (7B -> 32B) gets a clean slate.
+CREATE TABLE IF NOT EXISTS learnings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_type    TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    learning      TEXT NOT NULL,
+    confidence    REAL NOT NULL DEFAULT 0.7,
+    context       TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT 'agent',  -- agent | operator | feedback | harvest
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen     TEXT NOT NULL DEFAULT (datetime('now')),
+    sample_count  INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(agent_type, role, model, learning)
+);
+
+CREATE INDEX IF NOT EXISTS idx_learnings_lookup
+    ON learnings(agent_type, role, model, confidence DESC);
 """
 
 
@@ -980,6 +1010,117 @@ class BusDB:
                 ),
             )
             return {"feedback_id": c.execute("SELECT last_insert_rowid()").fetchone()[0], "status": "open", "count": 1}
+
+    # -- learnings (fr_khonliang-bus_ffd4cf00) --
+
+    def save_learning(
+        self,
+        *,
+        agent_type: str,
+        role: str,
+        model: str,
+        learning: str,
+        confidence: float = 0.7,
+        context: str = "",
+        source: str = "agent",
+    ) -> dict[str, Any]:
+        """Persist a per-(agent_type, role, model) learning.
+
+        Independent re-discovery of the SAME learning MERGES rather than
+        duplicates: sample_count is bumped, last_seen refreshed, and confidence
+        reinforced upward (max) — repeated discovery increases trust. Returns
+        ``status`` 'saved' (new) or 'merged'."""
+        confidence = max(0.0, min(1.0, float(confidence)))
+        rank = _source_rank(source)
+        with self.conn() as c:
+            # Atomic upsert (no SELECT-then-write TOCTOU under concurrent
+            # writers). Merge keeps the MOST-AUTHORITATIVE provenance — the
+            # source-rank CASE upgrades an agent rule when an operator confirms
+            # it and never downgrades on re-discovery. RETURNING sample_count
+            # tells saved (1) from merged (>1) accurately.
+            row = c.execute(
+                """
+                INSERT INTO learnings (agent_type, role, model, learning, confidence, context, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agent_type, role, model, learning) DO UPDATE SET
+                    sample_count = sample_count + 1,
+                    last_seen = datetime('now'),
+                    confidence = MAX(confidence, excluded.confidence),
+                    context = CASE WHEN excluded.context != '' THEN excluded.context ELSE context END,
+                    source = CASE WHEN ? >= (CASE source
+                        WHEN 'operator' THEN 4 WHEN 'feedback' THEN 3 WHEN 'harvest' THEN 2 ELSE 1 END)
+                        THEN excluded.source ELSE source END
+                RETURNING sample_count
+                """,
+                (agent_type, role, model, learning, confidence, context, source, rank),
+            ).fetchone()
+            return {"status": "saved" if row["sample_count"] == 1 else "merged"}
+
+    def get_learnings(
+        self,
+        agent_type: str,
+        role_models: dict[str, str] | None = None,
+        *,
+        min_confidence: float = 0.0,
+    ) -> dict[str, Any]:
+        """Learnings for an agent scoped to its CURRENT model per role.
+
+        ``role_models`` is the agent's ``{role: model}`` map. Only learnings for
+        exactly those (role, model) pairs are returned — a model swap (7B -> 32B)
+        never leaks the other model's rules (fr_khonliang-bus_ffd4cf00). Without
+        the map the model can't be resolved, so nothing is returned (safe: never
+        seed an agent with wrong-model instructions). Shape mirrors the
+        register_ack ``learnings`` payload: ``{role: {model, rules[]}}``, rules
+        sorted by confidence desc."""
+        if not role_models:
+            return {}
+        result: dict[str, Any] = {}
+        with self.conn() as c:
+            for role, model in role_models.items():
+                rows = c.execute(
+                    """
+                    SELECT learning, confidence, sample_count
+                    FROM learnings
+                    WHERE agent_type = ? AND role = ? AND model = ? AND confidence >= ?
+                    ORDER BY confidence DESC, last_seen DESC
+                    """,
+                    (agent_type, role, model, min_confidence),
+                ).fetchall()
+                if rows:
+                    result[role] = {
+                        "model": model,
+                        "rules": [
+                            {"learning": r["learning"], "confidence": r["confidence"],
+                             "sample_count": r["sample_count"]}
+                            for r in rows
+                        ],
+                    }
+        return result
+
+    def list_learnings(
+        self,
+        *,
+        agent_type: str = "",
+        role: str = "",
+        model: str = "",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Flat, filterable listing (operator / visibility surface)."""
+        clauses, params = [], []
+        for col, val in (("agent_type", agent_type), ("role", role), ("model", model)):
+            if val:
+                clauses.append(f"{col} = ?")
+                params.append(val)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+        with self.conn() as c:
+            rows = c.execute(
+                f"SELECT agent_type, role, model, learning, confidence, context, source, "
+                f"sample_count, created_at, last_seen FROM learnings {where} "
+                f"ORDER BY last_seen DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_feedback(
         self,

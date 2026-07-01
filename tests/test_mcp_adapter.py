@@ -496,6 +496,22 @@ def test_skill_proxy_returns_response_envelope(adapter):
     assert payload["omitted"] is False
 
 
+def test_bus_learnings_save_and_list(adapter):
+    """bus_learnings_save persists (source=operator) and bus_learnings_list
+    reads it back (fr_khonliang-bus_ffd4cf00)."""
+    mcp = adapter.build()
+    save = asyncio.run(mcp.call_tool("bus_learnings_save", {
+        "agent_type": "researcher", "role": "summarizer",
+        "model": "qwen2.5:7b", "learning": "truncate to 12K", "confidence": 0.9,
+    }))
+    assert json.loads(_extract_text(save))["status"] == "saved"
+
+    listed = asyncio.run(mcp.call_tool("bus_learnings_list", {"agent_type": "researcher"}))
+    rows = json.loads(_extract_text(listed))
+    assert rows[0]["learning"] == "truncate to 12K"
+    assert rows[0]["source"] == "operator"
+
+
 def test_skill_proxy_structured_result_not_fragmented(adapter):
     """A skill returning a dict/list must arrive as structured content, not a
     JSON object chopped into per-line findings (fr_khonliang-bus_c989e906)."""

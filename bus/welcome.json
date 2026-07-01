@@ -19,6 +19,10 @@
       "bus_trace",
       "bus_feedback"
     ],
+    "learnings": [
+      "bus_learnings_save",
+      "bus_learnings_list"
+    ],
     "lifecycle": [
       "bus_start_agent",
       "bus_stop_agent",

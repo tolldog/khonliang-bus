@@ -101,10 +101,23 @@ class RegisterRequest(BaseModel):
     # welcomes table; older bus-lib agents omit it and the bus stores nothing
     # (queries return None until the agent re-registers with the new lib).
     welcome: dict[str, Any] | None = None
+    # Per-role current model map ({role: model}), so the register response can
+    # scope delivered learnings to this agent's models (fr_khonliang-bus_ffd4cf00).
+    models: dict[str, str] = {}
 
 
 class HeartbeatRequest(BaseModel):
     id: str
+
+
+class LearningSaveRequest(BaseModel):
+    agent_type: str
+    role: str
+    model: str
+    learning: str
+    confidence: float = 0.7
+    context: str = ""
+    source: str = "agent"
 
 
 class RequestMessage(BaseModel):
@@ -1410,7 +1423,14 @@ class BusServer:
         logger.info("Registered agent %s at %s (pid=%d, %d skills)", req.id, req.callback, req.pid, len(req.skills))
         # Notify subscribers of registry change
         await self._publish_event("bus.registry_changed", {"agent_id": req.id, "action": "registered"})
-        return {"id": req.id, "status": "registered"}
+        # Deliver model-scoped learnings on the HTTP register path too, so
+        # HTTP-registered agents aren't silently starved (fr_khonliang-bus_ffd4cf00).
+        resp: dict[str, Any] = {"id": req.id, "status": "registered"}
+        agent_type = self._resolve_agent_type(req.id)  # install-first (id != type safe)
+        learnings = self.db.get_learnings(agent_type, req.models or {})
+        if learnings:
+            resp["learnings"] = learnings
+        return resp
 
     async def deregister_agent(self, agent_id: str) -> dict:
         if self.db.deregister_agent(agent_id):
@@ -1422,6 +1442,45 @@ class BusServer:
         if self.db.heartbeat(req.id):
             return {"id": req.id, "status": "ok"}
         return {"id": req.id, "status": "not_registered"}
+
+    # -- learnings (fr_khonliang-bus_ffd4cf00) --
+
+    def _resolve_agent_type(self, agent_id: str, declared: str | None = None) -> str:
+        """The agent_type to scope learnings by. Prefer the INSTALLED row's
+        agent_type — operator-set at install, so it's trusted and can't be
+        spoofed by a register payload, and it's correct even when id != type
+        (custom-id installs). Fall back to the declared type (WS) / id-derivation
+        for ad-hoc, not-installed agents (which are self-declared by design)."""
+        inst = self.db.get_installed_agent(agent_id)
+        if inst and inst.get("agent_type"):
+            return inst["agent_type"]
+        return declared or (agent_id.rsplit("-", 1)[0] if "-" in agent_id else agent_id)
+
+    def save_learning(
+        self,
+        *,
+        agent_type: str,
+        role: str,
+        model: str,
+        learning: str,
+        confidence: float = 0.7,
+        context: str = "",
+        source: str = "agent",
+    ) -> dict:
+        """Persist a per-(agent_type, role, model) learning (dedup-merged in the
+        db). Phase 1 persists only; live push to running instances lands with the
+        bus-lib agent-side that consumes it."""
+        if not (agent_type and role and model and learning):
+            return {"error": "agent_type, role, model, and learning are required"}
+        try:
+            conf = float(confidence)
+        except (TypeError, ValueError):
+            conf = 0.7
+        result = self.db.save_learning(
+            agent_type=agent_type, role=role, model=model, learning=learning,
+            confidence=conf, context=str(context or ""), source=str(source or "agent"),
+        )
+        return {"agent_type": agent_type, "role": role, "model": model, **result}
 
     # -- request/reply --
 
@@ -2790,6 +2849,7 @@ class BusServer:
         """
         await ws.accept()
         agent_id: str | None = None
+        registered_type: str | None = None  # this socket's agent_type, set on register
 
         try:
             while True:
@@ -2846,9 +2906,42 @@ class BusServer:
                                 "Welcome rejected during WS register for %s: %s",
                                 agent_id, e,
                             )
-                    await ws.send_json({"type": "registered", "id": agent_id})
+                    # Deliver persisted learnings in the register ack so the
+                    # agent injects them into its role prompts on startup — no
+                    # separate fetch (fr_khonliang-bus_ffd4cf00). Scoped to the
+                    # agent's CURRENT model per role (its ``models`` map), so a
+                    # 32B instance never receives 7B-only rules. Old agents that
+                    # don't send ``models`` get nothing (they can't consume
+                    # learnings until the bus-lib Phase 2 anyway).
+                    ack: dict[str, Any] = {"type": "registered", "id": agent_id}
+                    # Trusted for installed agents (spoof-proof); declared for ad-hoc.
+                    registered_type = self._resolve_agent_type(agent_id, data.get("agent_type"))
+                    learnings = self.db.get_learnings(registered_type, data.get("models") or {})
+                    if learnings:
+                        ack["learnings"] = learnings
+                    await ws.send_json(ack)
                     logger.info("Agent %s connected via WebSocket (%d skills)", agent_id, len(data.get("skills", [])))
                     await self._publish_event("bus.registry_changed", {"agent_id": agent_id, "action": "registered"})
+
+                elif msg_type == "save_learning":
+                    # Bind to THIS socket's resolved agent_type (install-anchored
+                    # + trusted for installed agents; self-declared for ad-hoc)
+                    # and force source='agent' — an installed agent can't poison
+                    # another type's learnings, and no WS client can forge
+                    # 'operator' provenance (operator saves use the HTTP/MCP
+                    # path). The ad-hoc-declares-an-installed-type residual is
+                    # dominated by the pre-existing install-RCE surface on the
+                    # same unauthenticated port (see the /v1/learnings comment).
+                    if registered_type:
+                        self.save_learning(
+                            agent_type=registered_type,
+                            role=data.get("role", ""),
+                            model=data.get("model", ""),
+                            learning=data.get("learning", ""),
+                            confidence=data.get("confidence", 0.7),
+                            context=data.get("context", ""),
+                            source="agent",
+                        )
 
                 elif msg_type == "heartbeat":
                     if agent_id:
@@ -3974,6 +4067,29 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
                 raise HTTPException(status_code=404, detail=error)
             raise HTTPException(status_code=422, detail=error)
         return result
+
+    # Trust model: these routes are unauthenticated like every other bus HTTP
+    # route (register / install / feedback). The network boundary is the trust
+    # boundary — and POST /v1/install is already an unauthenticated RCE surface
+    # (it Popen()s a command), which strictly dominates poisoning a learning, so
+    # gating learnings alone would be theater. Bus-wide auth is a separate
+    # cross-cutting concern. The WS save_learning path DOES bind identity because
+    # that's an in-fleet agent-vs-agent boundary (one agent must not spoof
+    # another's learnings); the HTTP path is the operator's local control surface.
+    @app.post("/v1/learnings")
+    def save_learning(req: LearningSaveRequest):
+        result = bus.save_learning(
+            agent_type=req.agent_type, role=req.role, model=req.model,
+            learning=req.learning, confidence=req.confidence,
+            context=req.context, source=req.source,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=422, detail=result["error"])
+        return result
+
+    @app.get("/v1/learnings")
+    def list_learnings(agent_type: str = "", role: str = "", model: str = "", limit: int = 200):
+        return bus.db.list_learnings(agent_type=agent_type, role=role, model=model, limit=limit)
 
     @app.post("/v1/feedback")
     def report_feedback(req: FeedbackReport):
