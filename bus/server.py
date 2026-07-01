@@ -459,13 +459,6 @@ class BusServer:
         """
         self._autostart_failures.pop(agent_id, None)
 
-    def _reset_supervisor_state(self, agent_id: str) -> None:
-        """Operator-intent reset: drop BOTH the give-up reason and the backoff
-        counter so a manually (re)started agent is supervised with a fresh
-        budget. Used by ``start_agent`` (and, for the counter, ``_stop_process``).
-        """
-        self._supervisor_backoff.pop(agent_id, None)
-        self._autostart_failures.pop(agent_id, None)
 
     def supervise_once(self) -> dict:
         """Single-pass supervision sweep: walk ``self._processes`` and re-launch
@@ -609,16 +602,38 @@ class BusServer:
             # ``autostart_failed`` (reusing the boot-autostart failure surface so
             # bus_services renders it uniformly).
             if restarts >= self._supervisor_max_restarts:
+                # Re-validate just before the destructive give-up: a replacement
+                # may have registered in the window since the ws/pid guard above.
+                # Give-up both deregisters the row (dropping skills/flows) AND
+                # stops supervising, so wiping a healthy replacement would
+                # silently undo a recovery. Re-fetch the registration here rather
+                # than trusting the earlier ``reg`` snapshot.
+                reg_now = self.db.get_registration(agent_id)
+                replacement_up = self.is_agent_ws_connected(agent_id) or (
+                    reg_now is not None
+                    and reg_now.get("pid")
+                    and int(reg_now["pid"]) != crashed_pid
+                )
                 with self._processes_lock:
                     if self._processes.get(agent_id) is proc:
                         self._processes.pop(agent_id, None)
+                if replacement_up:
+                    # A healthy replacement is up — stop tracking our dead Popen
+                    # but don't deregister it or mark it failed.
+                    self._supervisor_backoff.pop(agent_id, None)
+                    logger.info(
+                        "Supervisor: %s hit the restart ceiling but a replacement is now registered; not marking failed",
+                        agent_id,
+                    )
+                    alive.append(agent_id)
+                    continue
                 reason = (
                     f"supervisor gave up after {restarts} consecutive restarts "
                     f"(last exit code={exit_code})"
                 )
                 self._autostart_failures[agent_id] = reason
                 self._supervisor_backoff.pop(agent_id, None)
-                if reg is not None:
+                if reg_now is not None:
                     self.db.deregister_agent(agent_id)
                 gave_up[agent_id] = reason
                 logger.error("Supervisor: %s — %s; marking autostart_failed", agent_id, reason)
@@ -978,13 +993,14 @@ class BusServer:
         if reg and self._derive_live_status(reg) != "dead":
             return {"id": agent_id, "status": "already_running"}
         result = self._start_process(installed)
-        # Only clear supervisor give-up / backoff state once the manual start
-        # ACTUALLY succeeded — clearing before would hide a still-down agent
-        # from /v1/services and reset its restart budget if the retry also
-        # fails. The supervisor restarts via _start_process directly (never
-        # through start_agent), so this never clears state mid-backoff.
+        # On a successful SPAWN, reset only the backoff budget so the operator's
+        # manual restart starts fresh. Deliberately do NOT clear the
+        # autostart_failed REASON here — the new process hasn't registered yet
+        # and may die during init, so the outage must stay visible on
+        # /v1/services until registration proves the agent is actually back
+        # (``_drop_autostart_failure`` on the register path clears it then).
         if result.get("status") == "started":
-            self._reset_supervisor_state(agent_id)
+            self._supervisor_backoff.pop(agent_id, None)
         return result
 
     def stop_agent(self, agent_id: str) -> dict:

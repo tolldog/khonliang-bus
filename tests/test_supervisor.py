@@ -518,25 +518,6 @@ def test_restart_on_crash_false_disables_restart(tmp_path, monkeypatch):
     assert bus._supervisor_restart_counts == {}
 
 
-def test_manual_start_clears_give_up_state(tmp_path, monkeypatch):
-    db = BusDB(str(tmp_path / "test-bus.db"))
-    _install(db, "a1")
-    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
-    _patch_fake_start_process(monkeypatch, bus)
-    bus._now = lambda: 0.0
-
-    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
-    bus.supervise_once()  # restart #1
-    _crash(bus, "a1")
-    bus.supervise_once()  # give up
-    assert "a1" in bus._autostart_failures
-
-    # Operator manually starts it → clears the failed surface + backoff state.
-    bus.start_agent("a1")
-    assert "a1" not in bus._autostart_failures
-    assert "a1" not in bus._supervisor_backoff
-
-
 def test_manual_start_failure_keeps_failed_state(tmp_path):
     """A failed manual retry must NOT clear the failure surface — that would
     hide a still-down agent from /v1/services and reset its restart budget."""
@@ -552,7 +533,10 @@ def test_manual_start_failure_keeps_failed_state(tmp_path):
     assert "broken" in bus._autostart_failures  # outage still visible
 
 
-def test_manual_start_success_clears_failed_state(tmp_path, monkeypatch):
+def test_manual_start_resets_budget_but_keeps_outage_until_register(tmp_path, monkeypatch):
+    """A successful manual SPAWN resets the backoff budget, but the
+    autostart_failed outage stays visible until the agent actually registers —
+    the spawned process may still die during init."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
     bus = _bus(db)
@@ -563,8 +547,8 @@ def test_manual_start_success_clears_failed_state(tmp_path, monkeypatch):
     result = bus.start_agent("a1")
 
     assert result["status"] == "started"
-    assert "a1" not in bus._autostart_failures
-    assert "a1" not in bus._supervisor_backoff
+    assert "a1" not in bus._supervisor_backoff          # fresh budget
+    assert "a1" in bus._autostart_failures              # outage still visible (not yet registered)
 
 
 def test_uninstall_clears_phantom_autostart_failed(tmp_path, monkeypatch):
@@ -586,6 +570,37 @@ def test_uninstall_clears_phantom_autostart_failed(tmp_path, monkeypatch):
 
     assert "a1" not in bus._autostart_failures
     assert not any(s["id"] == "a1" for s in bus.get_services())
+
+
+def test_give_up_revalidates_before_wiping_replacement(tmp_path, monkeypatch):
+    """A replacement that becomes live in the window BETWEEN the ws/pid guard and
+    the give-up's destructive deregister must abort the give-up — not delete the
+    replacement or mark it autostart_failed. Simulated via a staged
+    is_agent_ws_connected: not connected at the guard, connected at the
+    revalidation."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()   # restart #1 → restarts=1 (== max)
+    _crash(bus, "a1")
+
+    ws_calls = {"n": 0}
+
+    def _staged_ws(agent_id):
+        ws_calls["n"] += 1
+        return ws_calls["n"] >= 2  # False at the guard, True at the revalidation
+
+    monkeypatch.setattr(bus, "is_agent_ws_connected", _staged_ws)
+
+    result = bus.supervise_once()
+
+    assert "a1" not in result["gave_up"]
+    assert "a1" in result["alive"]
+    assert "a1" not in bus._autostart_failures
 
 
 def test_get_services_skips_uninstalled_failure_entry(tmp_path):
