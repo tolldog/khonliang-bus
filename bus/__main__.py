@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import logging.handlers
 import os
 import signal
 import socket
@@ -203,6 +204,16 @@ def main():
         help=f"Unix domain socket path (default: {DEFAULT_SOCK_PATH}).",
     )
     parser.add_argument(
+        "--log-dir",
+        default=os.environ.get("KHONLIANG_BUS_LOG_DIR", "logs/agents"),
+        help=(
+            "Directory for per-agent log files (spawned agents' stdout+stderr) "
+            "and the bus's own bus.log — the L0 debugging floor "
+            "(docs/log-agent-design.md). Cwd-relative by default, like --db. "
+            "Env: KHONLIANG_BUS_LOG_DIR. Pass an empty string to disable."
+        ),
+    )
+    parser.add_argument(
         "--no-uds",
         action="store_true",
         help="Disable the UDS listener (TCP only).",
@@ -233,6 +244,27 @@ def main():
         stream=sys.stderr,
     )
 
+    # The bus's OWN log joins the L0 floor at <log_dir>/bus.log so bus crashes
+    # are debuggable from the same place as agent crashes. RotatingFileHandler
+    # (the bus owns this handle, so in-process rotation is safe — unlike the
+    # agent files, whose fds the children own). Guarded: an unwritable dir
+    # skips the handler; stderr/systemd logging is unaffected either way.
+    log_dir = args.log_dir.strip() if args.log_dir else ""
+    if log_dir:
+        try:
+            log_dir_path = Path(log_dir).expanduser()
+            log_dir_path.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                log_dir_path / "bus.log", maxBytes=50_000_000, backupCount=1
+            )
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+            )
+            logging.getLogger().addHandler(handler)
+        except OSError as e:
+            logger.warning("bus: log dir %s unusable (%s); file logging disabled", log_dir, e)
+            log_dir = ""
+
     tcp = _resolve_tcp(args)
     # Absolutize a custom --uds: bus_url (unix://<path>) is forwarded to spawned
     # agents launched under their OWN cwd, so a relative path would resolve to a
@@ -262,6 +294,9 @@ def main():
         config={
             "bus_url": bus_url,
             "provenance_disclose_full": args.provenance_disclose_full,
+            # L0 fleet logging (empty string disables → agents spawn to DEVNULL).
+            "agent_log_dir": log_dir or None,
+            "agent_log_max_bytes": os.environ.get("KHONLIANG_BUS_LOG_MAX_BYTES", 50_000_000),
         },
     )
     asyncio.run(_serve(app, tcp, uds_path))
