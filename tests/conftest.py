@@ -48,7 +48,7 @@ def register_test_agent(
     return client.post("/v1/register", json={
         "id": agent_id,
         "callback": callback,
-        "pid": 12345,
+        "pid": 0,  # WS/remote-style registration (no bus-checkable local pid)
         "version": "0.1.0",
         "skills": skills or [
             {"name": "do_thing", "description": "does a thing", "parameters": {"x": {"type": "string"}}},

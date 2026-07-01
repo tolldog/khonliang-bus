@@ -626,6 +626,37 @@ def test_stop_clears_gave_up_failure_surface(tmp_path, monkeypatch):
     assert not any(s["id"] == "a1" for s in bus.get_services())
 
 
+async def test_direct_dispatch_excludes_dead_agent(tmp_path, monkeypatch):
+    """handle_request(agent_id=...) must not route to an agent whose local
+    process is gone (e.g. crashed and in backoff, row kept for visibility) —
+    it returns no-healthy rather than POSTing to a dead callback."""
+    import bus.server as srv
+    from bus.server import RequestMessage
+
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    bus = _bus(db)
+    db.register_agent(agent_id="a1", agent_type="test", callback_url="cb", pid=4242)
+    monkeypatch.setattr(srv, "_pid_alive", lambda pid: False)  # pid 4242 is dead
+
+    result = await bus.handle_request(RequestMessage(agent_id="a1", operation="ping"))
+
+    assert "no healthy agent" in result["error"]
+
+
+def test_restart_failure_keeps_gave_up_outage_visible(tmp_path):
+    """restart_agent must NOT clear the give-up failure surface up front:
+    if the manual restart fails to spawn, the outage stays on /v1/services."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus(db)
+    bus._autostart_failures["broken"] = "supervisor gave up after 5 consecutive restarts"
+
+    result = bus.restart_agent("broken")  # _start_process fails (bad binary)
+
+    assert "error" in result
+    assert "broken" in bus._autostart_failures  # outage preserved after failed retry
+
+
 def test_restart_on_crash_false_disables_restart(tmp_path, monkeypatch):
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")

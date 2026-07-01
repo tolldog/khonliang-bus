@@ -1028,11 +1028,21 @@ class BusServer:
 
     def stop_agent(self, agent_id: str) -> dict:
         self._stop_process(agent_id)
+        # Explicit stop = intentionally down: clear any supervisor give-up record
+        # so it doesn't linger as a synthetic autostart_failed outage. Do this in
+        # stop_agent, NOT _stop_process — restart_agent must NOT clear it (a
+        # failed restart has to keep the outage visible; the failure is cleared
+        # only when the replacement actually registers).
+        self._autostart_failures.pop(agent_id, None)
         self.db.deregister_agent(agent_id)
         return {"id": agent_id, "status": "stopped"}
 
     def restart_agent(self, agent_id: str) -> dict:
-        self.stop_agent(agent_id)
+        # Deliberately NOT stop_agent: keep any autostart_failed record until the
+        # replacement registers, so a restart that fails to come up stays visible
+        # on /v1/services instead of hiding the outage.
+        self._stop_process(agent_id)
+        self.db.deregister_agent(agent_id)
         return self.start_agent(agent_id)
 
     def _start_process(self, installed: dict) -> dict:
@@ -1062,12 +1072,12 @@ class BusServer:
         with self._processes_lock:
             proc = self._processes.pop(agent_id, None)
         # Operator-/lifecycle-initiated stop (stop_agent, uninstall, restart):
-        # drop supervisor backoff AND any give-up failure record — an explicit
-        # stop means "this agent is intentionally down", so it must not linger as
-        # a synthetic autostart_failed outage on /v1/services. The supervisor
-        # never calls _stop_process, so this can't race its own bookkeeping.
+        # drop supervisor backoff state so the agent isn't treated as mid-crash-
+        # loop on its next start. The give-up failure surface is cleared by the
+        # CALLERS instead (stop_agent / uninstall_agent) — restart_agent must
+        # keep it until the replacement registers. The supervisor never calls
+        # _stop_process, so this can't race its own bookkeeping.
         self._supervisor_backoff.pop(agent_id, None)
-        self._autostart_failures.pop(agent_id, None)
         if proc and proc.poll() is None:
             proc.terminate()
             try:
@@ -1138,6 +1148,17 @@ class BusServer:
 
         if not reg:
             return {"error": f"no healthy agent found for {req.agent_id or req.agent_type}", "trace_id": trace_id}
+
+        # Don't route to an agent whose process is confirmed gone. A crashed
+        # bus-spawned agent's registration row lingers during supervisor backoff
+        # (kept for observability), and the direct agent_id path above bypasses
+        # the healthy-only filter that type resolution uses — so gate on derived
+        # liveness. Only a registered LOCAL pid that os.kill(pid, 0) can't find
+        # (or a negative pid) reads 'dead'; WS/remote agents register pid=0 and
+        # fall through to the heartbeat signal, so this never blocks a live
+        # remote agent (a stale-heartbeat one reads 'stale', not 'dead').
+        if self._derive_live_status(reg) == "dead":
+            return {"error": f"no healthy agent found for {req.agent_id or req.agent_type} (agent process is down)", "trace_id": trace_id}
 
         agent_id = reg["id"]
 
