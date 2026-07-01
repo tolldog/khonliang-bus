@@ -456,6 +456,36 @@ async def test_agent_type_skips_lazy_when_healthy_agent_exists(tmp_path, monkeyp
     assert result.get("who") == "b"
 
 
+async def test_agent_type_relaunches_stale_self_registration(tmp_path, monkeypatch):
+    """If type routing resolves to the lazy agent's OWN stale 'healthy' row (it
+    crashed but reconcile hasn't run), it must relaunch — not skip as
+    'already served' and dispatch to the dead callback."""
+    import bus.server as srv
+
+    bus = _bus(tmp_path, lazy_eligible=["a"])
+    _install(bus.db, "a", agent_type="reviewer")
+    stale = {"id": "a", "agent_type": "reviewer", "pid": 4242, "status": "healthy", "callback_url": "ws"}
+    monkeypatch.setattr(bus.db, "get_healthy_agent_for_type", lambda t: stale)
+    monkeypatch.setattr(bus.db, "get_registration", lambda aid: stale if aid == "a" else None)
+    monkeypatch.setattr(srv, "_pid_alive", lambda pid: False)          # pid 4242 is dead
+    monkeypatch.setattr(bus, "is_agent_ws_connected", lambda aid: False)
+
+    launched: list[str] = []
+
+    async def _fake_lazy(agent_id):
+        launched.append(agent_id)
+        return {}
+    monkeypatch.setattr(bus, "_lazy_launch", _fake_lazy)
+
+    async def _fake_dispatch(**k):
+        return {"ok": True}
+    monkeypatch.setattr(bus, "_dispatch_resolved_request", _fake_dispatch)
+
+    await bus.handle_request(RequestMessage(agent_type="reviewer", operation="x"))
+
+    assert launched == ["a"]  # stale self-reg → relaunch, not dispatch-to-dead
+
+
 async def test_handle_request_no_lazy_for_non_lazy_agent(tmp_path, monkeypatch):
     bus = _bus(tmp_path)  # nothing lazy
     launched: list[str] = []

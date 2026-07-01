@@ -1424,7 +1424,17 @@ class BusServer:
             # resolved a healthy agent (``reg`` set) — don't cold-start a dormant
             # worker when another instance already serves the type.
             own_reg = self.db.get_registration(lazy_id)
-            already_served = reg is not None if req.agent_type else False
+            # "Already served" means a DIFFERENT agent covers the type — not the
+            # lazy agent's own (possibly stale 'healthy') row: get_healthy_agent_
+            # for_type can still return a crashed lazy agent until reconcile marks
+            # it dead, so treating that as served would skip the relaunch and
+            # dispatch to a dead callback. When the type resolves to the lazy
+            # agent itself, its own reachability (below) governs the relaunch.
+            already_served = (
+                req.agent_type is not None
+                and reg is not None
+                and reg.get("id") != lazy_id
+            )
             if not already_served and not self._lazy_agent_reachable(lazy_id, own_reg):
                 launched = await self._lazy_launch(lazy_id)
                 if launched.get("error"):
