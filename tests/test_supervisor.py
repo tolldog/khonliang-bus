@@ -30,6 +30,17 @@ class _FakePopen:
         self._alive = False
         self.returncode = code
 
+    # subprocess.Popen-shaped lifecycle no-ops so _stop_process can terminate a
+    # (fake) live process without spawning a real one.
+    def terminate(self) -> None:
+        self.die(-15)
+
+    def kill(self) -> None:
+        self.die(-9)
+
+    def wait(self, timeout=None):
+        return self.returncode
+
 
 def _bus(db: BusDB) -> BusServer:
     return BusServer(db, config={"bus_url": "http://localhost:9999"})
@@ -127,33 +138,38 @@ def test_supervise_once_records_restart_failure(tmp_path):
 
 
 def test_supervise_once_counts_repeated_restarts(tmp_path, monkeypatch):
-    """Restart counter accumulates across calls so operators can spot a flapping agent."""
+    """Restart counter accumulates across calls so operators can spot a flapping
+    agent — but only once each crash is past the backoff window (advance the
+    injectable clock between crashes)."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "flapper")
     bus = _bus(db)
     _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 1000.0}
+    bus._now = lambda: clock["t"]
 
-    # First crash + restart.
+    # First crash + restart (immediate).
     bus._processes["flapper"] = _FakePopen(alive=False, returncode=1)
     bus.supervise_once()
-    # Second crash + restart.
+    # Second crash, past the first backoff (backoff_s[0] = 1s) → restart again.
+    clock["t"] += 2.0
     bus._processes["flapper"] = _FakePopen(alive=False, returncode=1)
     bus.supervise_once()
 
     assert bus._supervisor_restart_counts["flapper"] == 2
 
 
-def test_supervise_once_clears_stale_registration_before_restart(tmp_path, monkeypatch):
-    """Without deregister, ``start_agent`` would short-circuit to
-    ``already_running`` because the prior crash left a 'healthy' registration."""
+def test_supervise_once_keeps_registration_visible_across_restart(tmp_path, monkeypatch):
+    """The supervisor no longer deregisters the crashed row before restarting:
+    a successful respawn re-registers (overwrite), and a FAILED respawn leaves
+    the row visible on get_services during backoff. Routing is unaffected —
+    reconcile / derived-liveness exclude the dead row, and start_agent's guard
+    reads derived liveness (so a leftover 'healthy' row never short-circuits it)."""
     db = BusDB(str(tmp_path / "test-bus.db"))
     _install(db, "a1")
     bus = _bus(db)
     _patch_fake_start_process(monkeypatch, bus)
 
-    # Simulate a prior successful run: agent registered + heartbeat'd healthy
-    # with the SAME pid that's now dead, so the PID-match check upholds
-    # ownership and the deregister fires.
     fake = _FakePopen(pid=99999, alive=False, returncode=1)
     db.register_agent(
         agent_id="a1",
@@ -169,9 +185,9 @@ def test_supervise_once_clears_stale_registration_before_restart(tmp_path, monke
     result = bus.supervise_once()
 
     assert "a1" in result["restarted"]
-    # The stale 'healthy' row WAS cleared. The fake ``_start_process`` doesn't
-    # re-register, so the table stays empty afterwards.
-    assert db.get_registration("a1") is None
+    # The fake _start_process doesn't re-register, so the row is left intact
+    # (in production the respawned process overwrites it on re-registration).
+    assert db.get_registration("a1") is not None
 
 
 def test_supervise_once_skips_when_active_ws_connection_with_zero_pid(tmp_path, monkeypatch):
@@ -286,6 +302,572 @@ async def test_start_supervisor_returns_running_task_and_is_idempotent(tmp_path)
         await task
     except asyncio.CancelledError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff + give-up (fr_khonliang-bus_dc4ef3e9 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def _bus_cfg(db: BusDB, **cfg) -> BusServer:
+    return BusServer(db, config={"bus_url": "http://localhost:9999", **cfg})
+
+
+def _crash(bus: BusServer, agent_id: str, code: int = 1) -> None:
+    """Mark the agent's current tracked process dead in place."""
+    bus._processes[agent_id].die(code)
+
+
+def test_backoff_window_skips_immediate_recrash(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0, 30.0])
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 100.0}
+    bus._now = lambda: clock["t"]
+
+    # First crash → immediate restart.
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    r1 = bus.supervise_once()
+    assert r1["restarted"] == ["a1"]
+
+    # Re-crash within the 5s window → backing_off, NOT restarted.
+    _crash(bus, "a1")
+    r2 = bus.supervise_once()
+    assert r2["restarted"] == []
+    assert r2["backing_off"] == ["a1"]
+    assert bus._supervisor_restart_counts["a1"] == 1  # unchanged
+
+    # Past the window → restart again.
+    clock["t"] += 6.0
+    r3 = bus.supervise_once()
+    assert r3["restarted"] == ["a1"]
+    assert bus._supervisor_restart_counts["a1"] == 2
+
+
+def test_backoff_escalates_per_schedule(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[1.0, 5.0, 30.0], supervisor_max_restarts=10)
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 0.0}
+    bus._now = lambda: clock["t"]
+
+    # Restart #1 → next window = backoff_s[0] = 1s.
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()
+    assert bus._supervisor_backoff["a1"]["next_attempt_at"] == 1.0
+
+    # +1s, restart #2 → next window = backoff_s[1] = 5s.
+    clock["t"] = 1.0
+    _crash(bus, "a1")
+    bus.supervise_once()
+    assert bus._supervisor_backoff["a1"]["next_attempt_at"] == 6.0
+
+    # +5s, restart #3 → next window = backoff_s[2] = 30s (capped at last).
+    clock["t"] = 6.0
+    _crash(bus, "a1")
+    bus.supervise_once()
+    assert bus._supervisor_backoff["a1"]["next_attempt_at"] == 36.0
+    assert bus._supervisor_restart_counts["a1"] == 3
+
+
+def test_gives_up_after_max_restarts(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=2)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 100.0  # frozen; backoff_s=[0] keeps every sweep eligible
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()           # restart #1
+    _crash(bus, "a1")
+    bus.supervise_once()           # restart #2
+    _crash(bus, "a1")
+    result = bus.supervise_once()  # restarts == 2 == max → give up
+
+    assert "a1" in result["gave_up"]
+    assert result["restarted"] == []
+    assert "a1" in bus._autostart_failures
+    assert "gave up" in bus._autostart_failures["a1"]
+    assert "a1" not in bus._processes          # stopped supervising
+    assert "a1" not in bus._supervisor_backoff
+
+
+def test_gave_up_agent_surfaced_as_autostart_failed(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()   # restart #1
+    _crash(bus, "a1")
+    bus.supervise_once()   # give up
+
+    services = bus.get_services()
+    row = next(s for s in services if s["id"] == "a1")
+    assert row["status"] == "autostart_failed"
+    assert "gave up" in row["autostart_error"]
+
+
+def test_recovery_window_resets_counter(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[1.0], supervisor_recovery_window_s=100.0)
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 0.0}
+    bus._now = lambda: clock["t"]
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()  # restart #1; the fake start leaves it alive
+    assert bus._supervisor_backoff["a1"]["restarts"] == 1
+
+    # Survives past the recovery window → next sweep (alive) resets the counter.
+    clock["t"] = 150.0
+    result = bus.supervise_once()
+    assert result["alive"] == ["a1"]
+    assert "a1" not in bus._supervisor_backoff
+
+
+def test_dead_agent_gives_up_even_when_backoff_exceeds_recovery_window(tmp_path):
+    """A permanently-dead agent must still hit the give-up ceiling even when the
+    elapsed time between sweeps exceeds the recovery window. Recovery is only
+    proven by an ALIVE observation — resetting on a still-dead sweep would let a
+    broken agent dodge the ceiling forever once backoff >= the window."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=2,
+                   supervisor_recovery_window_s=1.0)
+    clock = {"t": 0.0}
+    bus._now = lambda: clock["t"]
+
+    bus._processes["broken"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()              # attempt #1 (fails), restarts=1
+    clock["t"] = 5.0                  # 5s > 1s recovery window, but still DEAD
+    bus.supervise_once()              # attempt #2 (fails), restarts=2 — NOT reset
+    clock["t"] = 10.0
+    result = bus.supervise_once()     # restarts == max → give up
+
+    assert "broken" in result["gave_up"]
+    assert "broken" in bus._autostart_failures
+
+
+def test_scalar_backoff_config_accepted(tmp_path):
+    """A constant backoff (scalar) config must not abort bus startup — the
+    other supervisor_*_s knobs are scalars too."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    bus = BusServer(db, config={"supervisor_backoff_s": 5})
+    assert bus._supervisor_backoff_s == [5.0]
+
+
+def test_backoff_config_sanitizes_bad_values(tmp_path):
+    """Negative / NaN / Inf backoff values would corrupt the now<next gate;
+    they're coerced to 0.0 (immediate retry) rather than wedging the supervisor."""
+    db = BusDB(str(tmp_path / "b.db"))
+    bus = BusServer(db, config={"supervisor_backoff_s": [-5.0, float("nan"), float("inf"), 5.0]})
+    assert bus._supervisor_backoff_s == [0.0, 0.0, 0.0, 5.0]
+
+
+def test_give_up_not_delayed_by_backoff_window(tmp_path, monkeypatch):
+    """Once the restart ceiling is reached, a further crash must give up promptly
+    — not sit in backing_off for one more (long) cooldown first."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[100.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    clock = {"t": 0.0}
+    bus._now = lambda: clock["t"]
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()          # restart #1 → restarts=1 (== max), next window 100s
+    clock["t"] = 1.0              # still deep inside the 100s window
+    _crash(bus, "a1")
+    result = bus.supervise_once()
+
+    assert "a1" in result["gave_up"]      # gave up immediately, not backing_off
+    assert result["backing_off"] == []
+
+
+def test_string_scalar_backoff_config(tmp_path):
+    """A string scalar ("30" / "0.5") from quoted-YAML / env config is one
+    value, not iterated char-by-char."""
+    db = BusDB(str(tmp_path / "b.db"))
+    assert BusServer(db, config={"supervisor_backoff_s": "30"})._supervisor_backoff_s == [30.0]
+    db2 = BusDB(str(tmp_path / "b2.db"))
+    assert BusServer(db2, config={"supervisor_backoff_s": "0.5"})._supervisor_backoff_s == [0.5]
+
+
+def test_string_restart_on_crash_false_disables(tmp_path):
+    """supervisor_restart_on_crash="false" must disable restarts — bool("false")
+    would otherwise be truthy."""
+    db = BusDB(str(tmp_path / "b.db"))
+    assert BusServer(db, config={"supervisor_restart_on_crash": "false"})._supervisor_restart_on_crash is False
+    db2 = BusDB(str(tmp_path / "b2.db"))
+    assert BusServer(db2, config={"supervisor_restart_on_crash": "true"})._supervisor_restart_on_crash is True
+
+
+def test_restart_failure_keeps_supervising_then_gives_up(tmp_path):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=2)
+    bus._now = lambda: 0.0  # backoff_s=[0] → always eligible
+
+    bus._processes["broken"] = _FakePopen(alive=False, returncode=1)
+    r1 = bus.supervise_once()  # restart attempt #1 fails
+    assert "broken" in r1["lost"]
+    # The dead Popen is LEFT in _processes so the next sweep retries it.
+    assert "broken" in bus._processes
+    assert bus._supervisor_backoff["broken"]["restarts"] == 1
+
+    r2 = bus.supervise_once()  # attempt #2 fails
+    assert "broken" in r2["lost"]
+    assert bus._supervisor_backoff["broken"]["restarts"] == 2
+
+    r3 = bus.supervise_once()  # restarts == max → give up
+    assert "broken" in r3["gave_up"]
+    assert "broken" not in bus._processes
+
+
+def test_backoff_preserves_registration_for_visibility(tmp_path, monkeypatch):
+    """A backing-off agent keeps its registration row (so get_services/diagnose
+    still show the outage) — routing safety comes from derived-liveness, not
+    from deleting the row."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    bus._now = lambda: 10.0
+
+    proc = _FakePopen(pid=4242, alive=False, returncode=1)
+    bus._processes["a1"] = proc
+    bus._supervisor_backoff["a1"] = {"restarts": 1, "next_attempt_at": 100.0, "last_restart_at": 0.0}
+    db.register_agent(agent_id="a1", agent_type="test", callback_url="cb", pid=4242)
+
+    result = bus.supervise_once()
+
+    assert result["backing_off"] == ["a1"]
+    assert db.get_registration("a1") is not None       # row preserved (visible)
+    # get_services still lists it (as derived-'dead'), so operators see the
+    # outage during cooldown instead of it vanishing (R9). pid 4242 is dead →
+    # derived status is 'dead', so routing correctly excludes it.
+    row = next((s for s in bus.get_services() if s["id"] == "a1"), None)
+    assert row is not None and row["status"] == "dead"
+
+
+def test_replacement_during_backoff_stops_tracking_dead_popen(tmp_path):
+    """A replacement that registers during backoff is caught by the guard (which
+    runs BEFORE the backoff skip): the dead Popen is dropped so lifecycle ops
+    don't act on it, and the replacement's registration is not wiped."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    bus._now = lambda: 10.0
+
+    bus._processes["a1"] = _FakePopen(pid=4242, alive=False, returncode=1)
+    bus._supervisor_backoff["a1"] = {"restarts": 1, "next_attempt_at": 100.0, "last_restart_at": 0.0}
+    # Replacement registered out-of-band with a DIFFERENT pid.
+    db.register_agent(agent_id="a1", agent_type="test", callback_url="cb", pid=9999)
+
+    result = bus.supervise_once()
+
+    assert result["alive"] == ["a1"]
+    assert "a1" not in bus._processes            # dead Popen dropped
+    assert "a1" not in bus._supervisor_backoff
+    assert db.get_registration("a1") is not None  # replacement not wiped
+
+
+def test_restart_revalidates_before_wiping_replacement(tmp_path, monkeypatch):
+    """Same TOCTOU guard as give-up, on the restart path: a replacement that goes
+    live between the ws/pid guard and the restart's deregister must abort the
+    restart — not wipe the replacement or spawn a duplicate."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    started: list[str] = []
+
+    def _fake_start(installed):
+        started.append(installed["id"])
+        return {"id": installed["id"], "pid": 1, "status": "started"}
+
+    monkeypatch.setattr(bus, "_start_process", _fake_start)
+    bus._now = lambda: 10.0
+
+    bus._processes["a1"] = _FakePopen(pid=4242, alive=False, returncode=1)
+    # Backoff window already elapsed → eligible to restart this sweep.
+    bus._supervisor_backoff["a1"] = {"restarts": 1, "next_attempt_at": 0.0, "last_restart_at": 0.0}
+
+    ws_calls = {"n": 0}
+
+    def _staged_ws(agent_id):
+        ws_calls["n"] += 1
+        return ws_calls["n"] >= 2  # False at the guard, True at the restart revalidation
+
+    monkeypatch.setattr(bus, "is_agent_ws_connected", _staged_ws)
+
+    result = bus.supervise_once()
+
+    assert started == []                 # restart aborted (no duplicate spawned)
+    assert result["restarted"] == []
+    assert "a1" in result["alive"]
+    assert "a1" not in bus._processes     # dead Popen dropped
+
+
+def test_failed_restart_keeps_agent_visible(tmp_path):
+    """A broken agent whose respawn keeps failing must stay listed on
+    get_services (as dead) during backoff, not vanish until eventual give-up."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    bus._now = lambda: 0.0
+
+    proc = _FakePopen(pid=4242, alive=False, returncode=1)
+    bus._processes["broken"] = proc
+    db.register_agent(agent_id="broken", agent_type="test", callback_url="cb", pid=4242)
+
+    result = bus.supervise_once()  # restart attempt fails (bad binary)
+
+    assert "broken" in result["lost"]
+    assert db.get_registration("broken") is not None  # not deregistered → visible
+    row = next((s for s in bus.get_services() if s["id"] == "broken"), None)
+    assert row is not None and row["status"] == "dead"
+
+
+def test_stop_clears_gave_up_failure_surface(tmp_path, monkeypatch):
+    """An explicit stop of a supervisor-given-up agent clears the synthetic
+    autostart_failed row — the stop API and /v1/services must agree."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()
+    _crash(bus, "a1")
+    bus.supervise_once()  # give up
+    assert "a1" in bus._autostart_failures
+
+    bus.stop_agent("a1")
+
+    assert "a1" not in bus._autostart_failures
+    assert not any(s["id"] == "a1" for s in bus.get_services())
+
+
+def test_failed_restart_during_backoff_stays_visible(tmp_path):
+    """restart_agent on a crashed, backing-off agent whose respawn fails must not
+    drop it from /v1/services — record the failure so the outage stays visible
+    even though _stop_process cleared the dead Popen + backoff state."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus(db)
+    # Simulate: crashed + supervisor backing off.
+    bus._processes["broken"] = _FakePopen(pid=4242, alive=False, returncode=1)
+    bus._supervisor_backoff["broken"] = {"restarts": 1, "next_attempt_at": 100.0, "last_restart_at": 0.0}
+
+    result = bus.restart_agent("broken")  # _start_process fails (bad binary)
+
+    assert "error" in result
+    assert "broken" in bus._autostart_failures        # not silently dropped
+    assert any(s["id"] == "broken" for s in bus.get_services())  # still visible
+
+
+def test_restart_failure_keeps_gave_up_outage_visible(tmp_path):
+    """restart_agent must NOT clear the give-up failure surface up front:
+    if the manual restart fails to spawn, the outage stays on /v1/services."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus(db)
+    bus._autostart_failures["broken"] = "supervisor gave up after 5 consecutive restarts"
+
+    result = bus.restart_agent("broken")  # _start_process fails (bad binary)
+
+    assert "error" in result
+    assert "broken" in bus._autostart_failures  # outage preserved after failed retry
+
+
+def test_restart_on_crash_false_disables_restart(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_restart_on_crash=False)
+    _patch_fake_start_process(monkeypatch, bus)
+
+    dead = _FakePopen(alive=False, returncode=1)
+    bus._processes["a1"] = dead
+    result = bus.supervise_once()
+
+    assert result["would_restart"] == ["a1"]
+    assert result["restarted"] == []
+    assert bus._processes["a1"] is dead  # left in place, untouched
+    assert bus._supervisor_restart_counts == {}
+
+
+def test_manual_start_failure_keeps_failed_state(tmp_path):
+    """A failed manual retry must NOT clear the failure surface — that would
+    hide a still-down agent from /v1/services and reset its restart budget."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "broken", command="/no/such/binary/for/supervise")
+    bus = _bus(db)
+    # Simulate a prior supervisor give-up.
+    bus._autostart_failures["broken"] = "supervisor gave up after 5 consecutive restarts"
+
+    result = bus.start_agent("broken")  # _start_process fails (bad binary)
+
+    assert "error" in result
+    assert "broken" in bus._autostart_failures  # outage still visible
+
+
+def test_manual_start_resets_budget_but_keeps_outage_until_register(tmp_path, monkeypatch):
+    """A successful manual SPAWN resets the backoff budget, but the
+    autostart_failed outage stays visible until the agent actually registers —
+    the spawned process may still die during init."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus(db)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._autostart_failures["a1"] = "supervisor gave up after 5 consecutive restarts"
+    bus._supervisor_backoff["a1"] = {"restarts": 5, "next_attempt_at": 0.0, "last_restart_at": 0.0}
+
+    result = bus.start_agent("a1")
+
+    assert result["status"] == "started"
+    assert "a1" not in bus._supervisor_backoff          # fresh budget
+    assert "a1" in bus._autostart_failures              # outage still visible (not yet registered)
+
+
+def test_uninstall_clears_phantom_autostart_failed(tmp_path, monkeypatch):
+    """A supervisor give-up writes _autostart_failures; uninstalling the agent
+    must drop it from /v1/services (no phantom service)."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()
+    _crash(bus, "a1")
+    bus.supervise_once()  # give up
+    assert any(s["id"] == "a1" for s in bus.get_services())
+
+    bus.uninstall_agent("a1")
+
+    assert "a1" not in bus._autostart_failures
+    assert not any(s["id"] == "a1" for s in bus.get_services())
+
+
+def test_give_up_revalidates_before_wiping_replacement(tmp_path, monkeypatch):
+    """A replacement that becomes live in the window BETWEEN the ws/pid guard and
+    the give-up's destructive deregister must abort the give-up — not delete the
+    replacement or mark it autostart_failed. Simulated via a staged
+    is_agent_ws_connected: not connected at the guard, connected at the
+    revalidation."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()   # restart #1 → restarts=1 (== max)
+    _crash(bus, "a1")
+
+    ws_calls = {"n": 0}
+
+    def _staged_ws(agent_id):
+        ws_calls["n"] += 1
+        return ws_calls["n"] >= 2  # False at the guard, True at the revalidation
+
+    monkeypatch.setattr(bus, "is_agent_ws_connected", _staged_ws)
+
+    result = bus.supervise_once()
+
+    assert "a1" not in result["gave_up"]
+    assert "a1" in result["alive"]
+    assert "a1" not in bus._autostart_failures
+
+
+def test_get_services_skips_uninstalled_failure_entry(tmp_path):
+    """Read-time guard: even a leftover _autostart_failures entry for an agent
+    that's no longer installed is not surfaced."""
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    bus = _bus(db)
+    bus._autostart_failures["ghost"] = "supervisor gave up"  # never installed
+
+    assert not any(s["id"] == "ghost" for s in bus.get_services())
+
+
+async def test_registration_clears_give_up_state(tmp_path, monkeypatch):
+    """An agent that gave up and then recovers OUT OF BAND (registers directly,
+    not via start_agent) must clear its stale autostart_failed record — else the
+    old reason re-surfaces on /v1/services once the replacement later
+    deregisters."""
+    from bus.server import RegisterRequest
+
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[0.0], supervisor_max_restarts=1)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(bus, "_publish_event", _noop)
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()
+    _crash(bus, "a1")
+    bus.supervise_once()  # give up
+    assert "a1" in bus._autostart_failures
+
+    await bus.register_agent(RegisterRequest(id="a1", callback="http://x", pid=123))
+
+    assert "a1" not in bus._autostart_failures
+    # (give-up already popped backoff; this just confirms it's gone)
+    assert "a1" not in bus._supervisor_backoff
+
+
+async def test_registration_preserves_active_backoff_counter(tmp_path, monkeypatch):
+    """A supervisor-restarted agent re-registers immediately; registration must
+    NOT zero its consecutive-restart counter, or backoff + the give-up ceiling
+    would never engage for a crash-loop that keeps registering."""
+    from bus.server import RegisterRequest
+
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0], supervisor_max_restarts=3)
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(bus, "_publish_event", _noop)
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()  # supervisor restart → restarts=1
+    assert bus._supervisor_backoff["a1"]["restarts"] == 1
+
+    # The restarted agent registers (the normal post-restart handshake).
+    await bus.register_agent(RegisterRequest(id="a1", callback="ws", pid=99))
+
+    assert bus._supervisor_backoff["a1"]["restarts"] == 1  # preserved
+
+
+def test_stop_clears_backoff_state(tmp_path, monkeypatch):
+    db = BusDB(str(tmp_path / "test-bus.db"))
+    _install(db, "a1")
+    bus = _bus_cfg(db, supervisor_backoff_s=[5.0])
+    _patch_fake_start_process(monkeypatch, bus)
+    bus._now = lambda: 0.0
+
+    bus._processes["a1"] = _FakePopen(alive=False, returncode=1)
+    bus.supervise_once()  # restart → backoff state set
+    assert "a1" in bus._supervisor_backoff
+
+    bus.stop_agent("a1")
+    assert "a1" not in bus._supervisor_backoff
 
 
 def test_start_supervisor_rejects_non_positive_interval(tmp_path):

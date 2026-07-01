@@ -263,10 +263,23 @@ class BusServer:
         # missing agents are real outages. fr_khonliang-bus_37498850.
         self._started_at = time.time()
         # agent_id → count of times the supervisor re-started this agent in
-        # the current bus lifetime. Reset on each bus restart. v1: pure
-        # counter for visibility / log signal — no max-failures cap or
-        # backoff (sibling fr_khonliang-bus_dc4ef3e9 follow-up).
+        # the current bus lifetime (cumulative; reset only on bus restart) —
+        # log/visibility signal, distinct from the consecutive-restart counter
+        # in ``_supervisor_backoff`` below which drives backoff + give-up.
         self._supervisor_restart_counts: dict[str, int] = {}
+        # Per-agent backoff/give-up state (fr_khonliang-bus_dc4ef3e9 follow-up),
+        # keyed by agent_id → {restarts, next_attempt_at, last_restart_at}:
+        #   restarts        — consecutive supervisor restart attempts not yet
+        #                     cleared by a sustained-liveness recovery; indexes
+        #                     the backoff schedule and drives the give-up ceiling.
+        #   next_attempt_at — earliest wall-clock the next restart may run.
+        #   last_restart_at — for the recovery-window reset.
+        # Runtime-only: AC #6 default is no persistence across bus restarts, so a
+        # fresh dict each boot is correct.
+        self._supervisor_backoff: dict[str, dict] = {}
+        # Injectable clock so deterministic tests drive backoff windows without
+        # sleeping. Production reads wall-clock.
+        self._now = time.time
         self._supervisor_task: asyncio.Task | None = None
         self._http = httpx.AsyncClient(timeout=30.0)
         self._subscribers: dict[str, list[WebSocket]] = {}  # topic → websockets
@@ -283,6 +296,50 @@ class BusServer:
             "max_attempts": 3,
             "backoff": "exponential",
         })
+        # Supervisor backoff/give-up policy (fr_khonliang-bus_dc4ef3e9). Flat
+        # config keys, consistent with ``supervisor_interval_s``:
+        #   supervisor_restart_on_crash  — global auto-restart kill-switch
+        #       (True default preserves v1 behaviour). Per-entry gating is a
+        #       follow-up — installed_agents has no per-agent metadata column.
+        #   supervisor_backoff_s         — cooldown applied AFTER each restart
+        #       before the next attempt, indexed by restart count and capped at
+        #       the last element.
+        #   supervisor_max_restarts      — consecutive-restart ceiling; on reach,
+        #       the bus gives up and marks the agent autostart_failed.
+        #   supervisor_recovery_window_s — sustained liveness that resets the
+        #       consecutive-restart counter.
+        # Parse explicitly: config may arrive string-valued (quoted YAML /
+        # env-backed), where bool("false") is truthy — so an operator's
+        # "false"/"0" must actually disable restarts, not silently enable them.
+        _rc = self.config.get("supervisor_restart_on_crash", True)
+        if isinstance(_rc, str):
+            self._supervisor_restart_on_crash = _rc.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            self._supervisor_restart_on_crash = bool(_rc)
+        raw_backoff = self.config.get("supervisor_backoff_s", [1.0, 5.0, 30.0, 300.0])
+        # Accept a scalar (constant backoff) as well as a schedule list — the
+        # other supervisor_*_s knobs are scalars, so a single number is a
+        # plausible config and shouldn't abort startup. A string scalar ("30")
+        # must be one value, not iterated char-by-char into [3.0, 0.0].
+        if isinstance(raw_backoff, (int, float, str)):
+            raw_backoff = [raw_backoff]
+
+        def _san_backoff(x) -> float:
+            # A non-finite (NaN/Inf) or negative backoff would corrupt the
+            # ``now < next_attempt_at`` gate (NaN comparisons are always False;
+            # Inf never elapses; negative fires instantly in the past). Coerce
+            # any such value to 0.0 (immediate retry) rather than letting bad
+            # config wedge the supervisor.
+            v = float(x)
+            return v if (math.isfinite(v) and v >= 0) else 0.0
+
+        self._supervisor_backoff_s = [_san_backoff(x) for x in raw_backoff] or [1.0]
+        self._supervisor_max_restarts = max(
+            1, int(self.config.get("supervisor_max_restarts", 5))
+        )
+        self._supervisor_recovery_window_s = float(
+            self.config.get("supervisor_recovery_window_s", 300.0)
+        )
         self.flow_engine = FlowEngine(db, self._http)
         self.artifacts = ArtifactStore(db)
         self.orchestrator = Orchestrator(
@@ -396,9 +453,27 @@ class BusServer:
             "failed": dict(self._autostart_failures),
         }
 
+    def _drop_autostart_failure(self, agent_id: str) -> None:
+        """Drop a stale ``autostart_failed`` REASON when the agent comes alive.
+
+        Called from both registration paths (HTTP + WS): registration proves the
+        agent is up, so a prior give-up/boot-failure reason is stale and must not
+        re-surface on /v1/services when a later replacement deregisters.
+
+        Deliberately does NOT touch ``_supervisor_backoff`` — a
+        supervisor-restarted agent re-registers immediately, so zeroing its
+        consecutive-restart counter on every registration would defeat backoff +
+        the give-up ceiling. The counter is reset only by sustained liveness
+        (the recovery window, in :meth:`supervise_once`) or explicit operator
+        action (``start_agent`` on spawn success / ``_stop_process`` on stop).
+        """
+        self._autostart_failures.pop(agent_id, None)
+
+
     def supervise_once(self) -> dict:
         """Single-pass supervision sweep: walk ``self._processes`` and re-launch
-        any whose underlying subprocess has exited.
+        any whose underlying subprocess has exited, with exponential backoff and
+        a give-up ceiling (fr_khonliang-bus_dc4ef3e9).
 
         Only attaches to processes the CURRENT bus instance spawned (per
         ``feedback_supervision_asymmetry_bus_vs_agents`` — agents stay
@@ -406,67 +481,99 @@ class BusServer:
         ``_processes`` dict is fresh and supervision picks up whatever
         autostart spawned in this lifetime.
 
-        v1 scope (fr_khonliang-bus_dc4ef3e9): detect + restart. No backoff,
-        no per-agent max-failures threshold, no operator notification — all
-        explicit follow-ups. Restart count tracked in
-        ``self._supervisor_restart_counts`` for log / visibility signal.
+        Backoff: the first crash restarts immediately; each subsequent crash
+        waits ``supervisor_backoff_s[min(restarts, last)]`` before the next
+        attempt (capped at the last element). After ``supervisor_max_restarts``
+        consecutive restarts the bus gives up — marks the agent
+        ``autostart_failed`` (surfaced via ``bus_services``) and stops trying.
+        An agent that stays alive for ``supervisor_recovery_window_s`` since its
+        last restart has its consecutive-restart counter reset (so the ceiling
+        counts a crash-loop, not lifetime crashes). ``effective backoff`` is
+        ``max(backoff_s[i], supervisor_interval_s)`` since the sweep only gates
+        on the window — it never sleeps inside the loop. Setting
+        ``supervisor_restart_on_crash=False`` disables auto-restart globally;
+        dead agents are then reported under ``would_restart`` but left down.
 
-        Returns ``{restarted: [...], alive: [...], lost: {id: reason}}``.
-        ``lost`` covers cases where the agent was found dead but the
-        restart attempt also failed.
+        The dead Popen is deliberately LEFT in ``_processes`` while backing off
+        or after a failed restart, so the next sweep re-sees it; only a give-up
+        or an uninstall removes it (a successful restart overwrites the entry).
+
+        Returns ``{restarted, alive, lost, backing_off, gave_up, would_restart}``.
+        ``lost`` covers a dead agent whose restart attempt also failed (it stays
+        supervised and is retried after backoff); ``gave_up`` is terminal.
         """
+        now = self._now()
         restarted: list[str] = []
         alive: list[str] = []
         lost: dict[str, str] = {}
-        # Snapshot under the lock so the supervisor's view of the world
-        # doesn't change underfoot while a threadpool-served lifecycle
-        # handler mutates ``_processes``. Inspecting dead Popens and
-        # calling ``_start_process`` happen outside the lock — they
-        # don't need it (Popen.poll is per-process) and ``_start_process``
-        # re-acquires the lock for its own write.
+        backing_off: list[str] = []
+        gave_up: dict[str, str] = {}
+        would_restart: list[str] = []
+        # Snapshot under the lock so the supervisor's view of the world doesn't
+        # change underfoot while a threadpool-served lifecycle handler mutates
+        # ``_processes``. Inspecting dead Popens and calling ``_start_process``
+        # happen outside the lock — Popen.poll is per-process and
+        # ``_start_process`` re-acquires the lock for its own write.
         with self._processes_lock:
             tracked = list(self._processes.items())
         for agent_id, proc in tracked:
+            st = self._supervisor_backoff.get(agent_id)
             if proc.poll() is None:
+                # Alive. Recovery is detected ONLY by OBSERVING the agent up past
+                # the window: clear the consecutive-restart counter so the give-up
+                # ceiling counts a crash-LOOP, not lifetime crashes. We never reset
+                # on a dead sweep — a dead process can't be distinguished from one
+                # that crashed immediately and sat dead, and resetting there would
+                # let a permanently-broken agent dodge the give-up ceiling once
+                # backoff_s reaches the window (each post-window sweep would zero
+                # the counter). This requires supervisor_interval_s <
+                # supervisor_recovery_window_s so an alive sweep lands during
+                # recovery — true by default (5s << 300s).
+                if st and now - st["last_restart_at"] >= self._supervisor_recovery_window_s:
+                    self._supervisor_backoff.pop(agent_id, None)
+                    logger.info(
+                        "Supervisor: %s stable %.0fs since last restart; reset backoff counter",
+                        agent_id, self._supervisor_recovery_window_s,
+                    )
                 alive.append(agent_id)
                 continue
-            # Process exited. Pop the dead entry before relaunching so the
-            # new Popen replaces it cleanly.
+
             exit_code = proc.returncode
             crashed_pid = proc.pid
+
+            # Concurrency re-check WITHOUT popping: a concurrent stop/restart may
+            # have replaced (new Popen) or removed (None) our tracked entry.
+            # Sweeps are serialized on the supervisor task, so this is never a
+            # competing supervisor pass.
             with self._processes_lock:
-                # Re-check under the lock: a concurrent stop_agent may have
-                # already removed/replaced the entry.
                 current = self._processes.get(agent_id)
-                if current is proc:
-                    self._processes.pop(agent_id, None)
-                elif current is not None:
-                    # Someone else replaced our tracked Popen with a new one
-                    # — that's the new canonical process. Don't touch it.
-                    alive.append(agent_id)
+                if current is not proc:
+                    if current is not None:
+                        # A replacement is the canonical process now.
+                        alive.append(agent_id)
+                    # Either way our crashed instance is no longer canonical;
+                    # drop any backoff state we held for it.
+                    self._supervisor_backoff.pop(agent_id, None)
                     continue
-                else:
-                    # current is None: a concurrent stop_agent / restart /
-                    # uninstall already popped our tracked entry. That path
-                    # now owns this agent_id — don't resurrect a deliberately
-                    # stopped agent. (Sweeps are serialized on the supervisor
-                    # task, so this is never a competing supervisor pass.)
-                    continue
+
             installed = self.db.get_installed_agent(agent_id)
             if installed is None:
-                # Agent was uninstalled while supervised — don't relaunch.
+                # Uninstalled while supervised — stop tracking, don't relaunch.
+                with self._processes_lock:
+                    if self._processes.get(agent_id) is proc:
+                        self._processes.pop(agent_id, None)
+                self._supervisor_backoff.pop(agent_id, None)
                 lost[agent_id] = "no longer installed"
                 logger.warning("Supervisor: %s exited (code=%s) and is no longer installed", agent_id, exit_code)
                 continue
-            # If a different instance has already registered against this
-            # agent_id (operator manually started a replacement between the
-            # crash and this sweep, or another supervisor instance got there
-            # first), don't touch its registration. WS-register payloads
-            # may legitimately carry ``pid=0`` (see ``handle_agent_ws``
-            # default), so the PID-mismatch check alone isn't sufficient
-            # — also short-circuit if there's an active WebSocket
-            # connection for this agent_id, which always means a live
-            # peer is talking to the bus right now.
+
+            # A replacement registered out-of-band (operator manually started a
+            # copy, or another instance got there first). WS-register payloads
+            # may legitimately carry ``pid=0`` (see ``handle_agent_ws`` default),
+            # so the PID-mismatch check alone isn't sufficient — also short-circuit
+            # on an active WebSocket, which always means a live peer is talking to
+            # the bus right now. Stop tracking our dead Popen and don't disturb
+            # the replacement.
             reg = self.db.get_registration(agent_id)
             ws_active = self.is_agent_ws_connected(agent_id)
             different_pid = (
@@ -475,6 +582,10 @@ class BusServer:
                 and int(reg["pid"]) != crashed_pid
             )
             if ws_active or different_pid:
+                with self._processes_lock:
+                    if self._processes.get(agent_id) is proc:
+                        self._processes.pop(agent_id, None)
+                self._supervisor_backoff.pop(agent_id, None)
                 logger.info(
                     "Supervisor: %s exited (code=%s, pid=%s) but a replacement is present (ws=%s, reg_pid=%s); not disturbing",
                     agent_id, exit_code, crashed_pid, ws_active,
@@ -482,34 +593,143 @@ class BusServer:
                 )
                 alive.append(agent_id)
                 continue
-            # Clear the stale registration (our own crashed instance's row) so
-            # start_agent doesn't see a leftover 'healthy' row and short-circuit
-            # to ``already_running``. Only delete when a row actually exists:
-            # ``deregister_agent`` also drops the agent's skills/flows, so an
-            # unconditional delete would wipe a replacement that registered in
-            # the (near-zero, no-I/O) window since the guard above. When reg is
-            # None there's nothing of ours to clear — go straight to restart.
-            # Full atomicity (a pid-conditional DB delete) is out of v1 scope
-            # (fr_khonliang-bus_dc4ef3e9).
-            if reg is not None:
-                self.db.deregister_agent(agent_id)
-            result = self._start_process(installed)
+
+            # Still inside the backoff window AND below the give-up ceiling: skip
+            # the restart this sweep, leaving the dead Popen so a later sweep
+            # re-sees it. The ``restarts < max`` guard matters: once the ceiling
+            # is reached, a further crash must fall through to the give-up path
+            # promptly rather than waiting out one more (up to 300s) cooldown
+            # first. We deliberately DON'T deregister the crashed row here — it
+            # stays visible on get_services/diagnose (as a derived-'dead' agent)
+            # instead of vanishing for the whole cooldown; type-based routing
+            # still excludes it (reconcile_liveness marks it dead). A replacement
+            # that comes up during the window is caught by the guard above on the
+            # NEXT sweep (which pops the dead Popen).
+            if (
+                st
+                and now < st["next_attempt_at"]
+                and st["restarts"] < self._supervisor_max_restarts
+            ):
+                backing_off.append(agent_id)
+                continue
+
+            # Global kill-switch: report but don't restart (leave the dead Popen
+            # so the state stays visible across sweeps).
+            if not self._supervisor_restart_on_crash:
+                would_restart.append(agent_id)
+                continue
+
+            restarts = st["restarts"] if st else 0
+
+            # Give-up ceiling reached: stop supervising and surface the agent as
+            # ``autostart_failed`` (reusing the boot-autostart failure surface so
+            # bus_services renders it uniformly).
+            if restarts >= self._supervisor_max_restarts:
+                # Re-validate just before the destructive give-up: a replacement
+                # may have registered in the window since the ws/pid guard above.
+                # Give-up both deregisters the row (dropping skills/flows) AND
+                # stops supervising, so wiping a healthy replacement would
+                # silently undo a recovery. Re-fetch the registration here rather
+                # than trusting the earlier ``reg`` snapshot.
+                reg_now = self.db.get_registration(agent_id)
+                replacement_up = self.is_agent_ws_connected(agent_id) or (
+                    reg_now is not None
+                    and reg_now.get("pid")
+                    and int(reg_now["pid"]) != crashed_pid
+                )
+                with self._processes_lock:
+                    if self._processes.get(agent_id) is proc:
+                        self._processes.pop(agent_id, None)
+                if replacement_up:
+                    # A healthy replacement is up — stop tracking our dead Popen
+                    # but don't deregister it or mark it failed.
+                    self._supervisor_backoff.pop(agent_id, None)
+                    logger.info(
+                        "Supervisor: %s hit the restart ceiling but a replacement is now registered; not marking failed",
+                        agent_id,
+                    )
+                    alive.append(agent_id)
+                    continue
+                reason = (
+                    f"supervisor gave up after {restarts} consecutive restarts "
+                    f"(last exit code={exit_code})"
+                )
+                self._autostart_failures[agent_id] = reason
+                self._supervisor_backoff.pop(agent_id, None)
+                if reg_now is not None:
+                    self.db.deregister_agent(agent_id)
+                gave_up[agent_id] = reason
+                logger.error("Supervisor: %s — %s; marking autostart_failed", agent_id, reason)
+                continue
+
+            # At the actual restart instant (window elapsed), re-validate for a
+            # replacement (same TOCTOU the give-up path guards): one could have
+            # registered between the ws/pid guard above and here on another
+            # threadpool thread. If so, abort — don't deregister it or spawn a
+            # duplicate; stop tracking our dead Popen and treat as alive.
+            reg_now = self.db.get_registration(agent_id)
+            if self.is_agent_ws_connected(agent_id) or (
+                reg_now is not None
+                and reg_now.get("pid")
+                and int(reg_now["pid"]) != crashed_pid
+            ):
+                with self._processes_lock:
+                    if self._processes.get(agent_id) is proc:
+                        self._processes.pop(agent_id, None)
+                self._supervisor_backoff.pop(agent_id, None)
+                alive.append(agent_id)
+                continue
+            # No replacement — restart. We deliberately do NOT deregister the
+            # crashed row first: a successful respawn re-registers (INSERT OR
+            # REPLACE overwrites it), and if the spawn FAILS the row stays visible
+            # on get_services (as derived-'dead') for the whole backoff period
+            # instead of the agent vanishing until eventual give-up. Routing is
+            # unaffected — reconcile_liveness marks the stale row dead, and
+            # start_agent's guard reads derived liveness, so neither resolves it.
+            result = self._start_process(installed)  # overwrites _processes[id] on success
+            backoff_s = self._supervisor_backoff_s[
+                min(restarts, len(self._supervisor_backoff_s) - 1)
+            ]
+            next_at = now + backoff_s
             if result.get("status") == "started":
-                count = self._supervisor_restart_counts.get(agent_id, 0) + 1
-                self._supervisor_restart_counts[agent_id] = count
+                self._supervisor_backoff[agent_id] = {
+                    "restarts": restarts + 1,
+                    "next_attempt_at": next_at,
+                    "last_restart_at": now,
+                }
+                self._supervisor_restart_counts[agent_id] = (
+                    self._supervisor_restart_counts.get(agent_id, 0) + 1
+                )
                 restarted.append(agent_id)
                 logger.info(
-                    "Supervisor: %s exited (code=%s), restarted (pid=%s, restart_count=%d)",
-                    agent_id, exit_code, result.get("pid"), count,
+                    "Supervisor: %s exited (code=%s), restarted (pid=%s, attempt=%d/%d, next_backoff=%gs)",
+                    agent_id, exit_code, result.get("pid"), restarts + 1,
+                    self._supervisor_max_restarts, backoff_s,
                 )
             else:
+                # Restart FAILED: _start_process did not add a new Popen, so the
+                # old dead Popen remains in _processes and a later sweep retries
+                # after backoff. Still count the attempt so we escalate toward
+                # give-up rather than retrying a broken launch forever.
+                self._supervisor_backoff[agent_id] = {
+                    "restarts": restarts + 1,
+                    "next_attempt_at": next_at,
+                    "last_restart_at": now,
+                }
                 err = result.get("error", f"unexpected _start_process result: {result!r}")
                 lost[agent_id] = err
                 logger.warning(
-                    "Supervisor: %s exited (code=%s); restart failed: %s",
-                    agent_id, exit_code, err,
+                    "Supervisor: %s exited (code=%s); restart attempt %d/%d failed: %s (retry in %.0fs)",
+                    agent_id, exit_code, restarts + 1, self._supervisor_max_restarts, err, backoff_s,
                 )
-        return {"restarted": restarted, "alive": alive, "lost": lost}
+        return {
+            "restarted": restarted,
+            "alive": alive,
+            "lost": lost,
+            "backing_off": backing_off,
+            "gave_up": gave_up,
+            "would_restart": would_restart,
+        }
 
     def reconcile_liveness(self) -> dict:
         """Persist derived live state to the stored registration status so the
@@ -784,6 +1004,9 @@ class BusServer:
 
     def uninstall_agent(self, agent_id: str) -> dict:
         self._stop_process(agent_id)
+        # Drop any recorded autostart/supervisor-give-up failure so an
+        # uninstalled agent doesn't linger on the autostart_failed surface.
+        self._autostart_failures.pop(agent_id, None)
         if self.db.uninstall_agent(agent_id):
             self.db.deregister_agent(agent_id)
             logger.info("Uninstalled agent %s", agent_id)
@@ -807,15 +1030,42 @@ class BusServer:
         # restart_agent (stop + start).
         if reg and self._derive_live_status(reg) != "dead":
             return {"id": agent_id, "status": "already_running"}
-        return self._start_process(installed)
+        result = self._start_process(installed)
+        # On a successful SPAWN, reset only the backoff budget so the operator's
+        # manual restart starts fresh. Deliberately do NOT clear the
+        # autostart_failed REASON here — the new process hasn't registered yet
+        # and may die during init, so the outage must stay visible on
+        # /v1/services until registration proves the agent is actually back
+        # (``_drop_autostart_failure`` on the register path clears it then).
+        if result.get("status") == "started":
+            self._supervisor_backoff.pop(agent_id, None)
+        elif result.get("error"):
+            # The manual (re)start failed to SPAWN. restart_agent's _stop_process
+            # already removed the dead Popen + backoff state, so without this the
+            # agent would vanish from /v1/services AND from supervision (no
+            # registration, no _processes entry, no backoff) — silently unrecovered.
+            # Record the failure so it stays visible as autostart_failed until an
+            # operator fixes it and a start actually succeeds (registration clears it).
+            self._autostart_failures[agent_id] = f"start failed: {result['error']}"
+        return result
 
     def stop_agent(self, agent_id: str) -> dict:
         self._stop_process(agent_id)
+        # Explicit stop = intentionally down: clear any supervisor give-up record
+        # so it doesn't linger as a synthetic autostart_failed outage. Do this in
+        # stop_agent, NOT _stop_process — restart_agent must NOT clear it (a
+        # failed restart has to keep the outage visible; the failure is cleared
+        # only when the replacement actually registers).
+        self._autostart_failures.pop(agent_id, None)
         self.db.deregister_agent(agent_id)
         return {"id": agent_id, "status": "stopped"}
 
     def restart_agent(self, agent_id: str) -> dict:
-        self.stop_agent(agent_id)
+        # Deliberately NOT stop_agent: keep any autostart_failed record until the
+        # replacement registers, so a restart that fails to come up stays visible
+        # on /v1/services instead of hiding the outage.
+        self._stop_process(agent_id)
+        self.db.deregister_agent(agent_id)
         return self.start_agent(agent_id)
 
     def _start_process(self, installed: dict) -> dict:
@@ -844,6 +1094,13 @@ class BusServer:
     def _stop_process(self, agent_id: str) -> None:
         with self._processes_lock:
             proc = self._processes.pop(agent_id, None)
+        # Operator-/lifecycle-initiated stop (stop_agent, uninstall, restart):
+        # drop supervisor backoff state so the agent isn't treated as mid-crash-
+        # loop on its next start. The give-up failure surface is cleared by the
+        # CALLERS instead (stop_agent / uninstall_agent) — restart_agent must
+        # keep it until the replacement registers. The supervisor never calls
+        # _stop_process, so this can't race its own bookkeeping.
+        self._supervisor_backoff.pop(agent_id, None)
         if proc and proc.poll() is None:
             proc.terminate()
             try:
@@ -866,6 +1123,7 @@ class BusServer:
             launch_spec=req.launch_spec,
             launch_info=req.launch_info,
         )
+        self._drop_autostart_failure(req.id)
         # Persist welcome (survives-deregister) so the bus_welcome super-skill
         # and GET /v1/agents/<id>/welcome work after the agent process exits.
         # fr_khonliang-bus_f96722dd. An oversized welcome must not break the
@@ -914,6 +1172,14 @@ class BusServer:
         if not reg:
             return {"error": f"no healthy agent found for {req.agent_id or req.agent_type}", "trace_id": trace_id}
 
+        # NB: direct agent_id resolution intentionally does NOT gate on
+        # _derive_live_status. That check is os.kill(pid, 0) on the LOCAL pid
+        # namespace, which is only meaningful for bus-spawned agents — a remote
+        # agent that registers a positive pid from another host/container would
+        # be false-flagged 'dead' and become unreachable. So a crashed
+        # bus-spawned agent that is still registered during supervisor backoff
+        # gets a failed dispatch against its (dead) callback rather than a clean
+        # no-healthy; type-based routing still excludes it via reconcile_liveness.
         agent_id = reg["id"]
 
         # Record trace (include args for push-back replay)
@@ -1525,10 +1791,22 @@ class BusServer:
         # successes. Skip any agent that DID end up registered (a retry
         # after autostart succeeded — the live entry is canonical).
         # Per fr_khonliang-bus_fc904c3e acceptance #3.
-        for agent_id, error in self._autostart_failures.items():
+        #
+        # Snapshot the dict: the supervisor worker thread now writes
+        # _autostart_failures continuously on give-up (fr_khonliang-bus_dc4ef3e9),
+        # while this iteration runs on the FastAPI request thread. ``list(...)``
+        # materializes in one C call with no intervening bytecode, so a
+        # concurrent give-up can't raise "dictionary changed size during
+        # iteration" here.
+        for agent_id, error in list(self._autostart_failures.items()):
             if agent_id in registered_ids:
                 continue
             installed = self.db.get_installed_agent(agent_id)
+            if installed is None:
+                # Agent was uninstalled after the failure was recorded (e.g. a
+                # supervisor give-up followed by uninstall). Don't surface a
+                # phantom service for something no longer installed.
+                continue
             result.append({
                 "id": agent_id,
                 "agent_type": (installed or {}).get("agent_type", "unknown"),
@@ -2176,6 +2454,7 @@ class BusServer:
                         launch_spec=data.get("launch_spec"),
                         launch_info=data.get("launch_info"),
                     )
+                    self._drop_autostart_failure(agent_id)
                     # Persist welcome to the survives-deregister catalog so
                     # cold-start LLMs + bus_welcome super-skill see it even
                     # after the agent process exits.
