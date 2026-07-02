@@ -4194,9 +4194,15 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             },
             timeout=20.0,
         ))
-        if isinstance(result, dict) and "no healthy agent" in str(result.get("error", "")):
+        # ANY dispatch-level error means the log path can't serve this query —
+        # not just "no healthy agent": a crashed-but-still-registered agent
+        # yields "not connected via WebSocket" / timeouts in the window before
+        # liveness reconciliation, and callers must get the L0 fallback then
+        # too, never a 200-with-error (codex).
+        if isinstance(result, dict) and result.get("error"):
             raise HTTPException(status_code=503, detail={
                 "error": "log agent unreachable",
+                "cause": str(result["error"]),
                 "hint": (
                     f"raw log files at {bus.config.get('agent_log_dir')}"
                     if bus.config.get("agent_log_dir")

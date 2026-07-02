@@ -161,6 +161,18 @@ def test_main_fails_closed_when_log_dir_disabled(monkeypatch):
         lam.main()
 
 
+def test_ingest_with_offset_is_atomic(tmp_path):
+    """Content + offset commit together or not at all — a failure mid-txn
+    (NOT NULL violation on the second record) must leave NEITHER applied."""
+    import sqlite3 as sq
+    s = SqliteSubstrate(tmp_path / "sub.db")
+    bad = [_rec("good line"), LogRecord(ts=1.0, agent_id="a1", level=None, message=None)]
+    with pytest.raises(sq.IntegrityError):
+        s.ingest_with_offset(bad, "/x/a1.log", 42, 100)
+    assert s.query() == []                     # no rows
+    assert s.get_offset("/x/a1.log") is None   # no offset — next sweep re-reads
+
+
 def test_tailer_copytruncate_resets(tmp_path):
     d, s, t = _tailer(tmp_path)
     p = d / "a1.log"
@@ -264,6 +276,23 @@ def test_logs_query_limp_verdict_when_no_log_agent(client, tmp_path):
     detail = r.json()["detail"]
     assert detail["error"] == "log agent unreachable"          # clear verdict…
     assert str(tmp_path / "logs") in detail["hint"]            # …with the L0 fallback
+
+
+def test_logs_query_limp_verdict_on_dispatch_error(client, monkeypatch):
+    """A crashed-but-still-registered log agent errors at dispatch ('not
+    connected via WebSocket'), not at resolution — that window must ALSO 503
+    with the L0 fallback, never 200-with-error."""
+    import bus.server as srv
+
+    async def _fake_handle(self, req):
+        return {"error": "agent log-agent not connected via WebSocket", "trace_id": "t"}
+
+    monkeypatch.setattr(srv.BusServer, "handle_request", _fake_handle)
+    r = client.get("/v1/logs/query", params={"pattern": "x"})
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["error"] == "log agent unreachable"
+    assert "not connected" in detail["cause"]
 
 
 async def test_logs_query_e2e_real_agent_over_uds(tmp_path):

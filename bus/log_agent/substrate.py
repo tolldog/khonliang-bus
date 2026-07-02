@@ -80,14 +80,37 @@ class SqliteSubstrate:
     def ingest(self, records: list[LogRecord]) -> int:
         if not records:
             return 0
-        now = time.time()
         with self._conn() as c:
-            c.executemany(
-                "INSERT INTO log_lines (ts, agent_id, level, message, ingested_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [(r.ts, r.agent_id, r.level, r.message, now) for r in records],
+            self._insert_records(c, records)
+        return len(records)
+
+    def ingest_with_offset(
+        self, records: list[LogRecord], path: str, inode: int, offset: int
+    ) -> int:
+        """Ingest AND advance the tail offset in ONE transaction.
+
+        A crash between a separate ingest and set_offset would re-read and
+        duplicate the same lines on the next sweep — content and offset must
+        commit together or not at all."""
+        with self._conn() as c:
+            self._insert_records(c, records)
+            c.execute(
+                "INSERT INTO tail_offsets (path, inode, offset) VALUES (?, ?, ?) "
+                "ON CONFLICT(path) DO UPDATE SET inode = excluded.inode, offset = excluded.offset",
+                (path, inode, offset),
             )
         return len(records)
+
+    @staticmethod
+    def _insert_records(c: sqlite3.Connection, records: list[LogRecord]) -> None:
+        if not records:
+            return
+        now = time.time()
+        c.executemany(
+            "INSERT INTO log_lines (ts, agent_id, level, message, ingested_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(r.ts, r.agent_id, r.level, r.message, now) for r in records],
+        )
 
     def query(
         self,

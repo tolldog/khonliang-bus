@@ -75,7 +75,7 @@ class Tailer:
         agent_id = _agent_id_from_filename(path.name)
         st = path.stat()
         stored = self.substrate.get_offset(str(path))
-        ingested = 0
+        records: list[LogRecord] = []
 
         if stored is None:
             inode, offset = st.st_ino, 0
@@ -84,31 +84,35 @@ class Tailer:
             if inode != st.st_ino:
                 # Rotated (rename): drain the old inode's remainder from .log.1
                 # BEFORE resetting, else the unforwarded backlog is lost (▸R1).
-                ingested += self._drain_rotated(path, inode, offset, agent_id)
+                records.extend(self._drain_rotated(path, inode, offset, agent_id))
                 inode, offset = st.st_ino, 0
             elif st.st_size < offset:
                 # Same inode, shrunk: copytruncate-style rotation.
                 offset = 0
 
-        new_offset, records = self._read_complete_lines(path, offset, agent_id)
-        if records:
-            ingested += self.substrate.ingest(records)
-        if stored is None or (inode, new_offset) != stored:
-            self.substrate.set_offset(str(path), inode, new_offset)
-        return ingested
+        new_offset, fresh = self._read_complete_lines(path, offset, agent_id)
+        records.extend(fresh)
+        if not records and stored == (inode, new_offset):
+            return 0
+        # ONE transaction for content + offset: a crash between separate
+        # ingest and set_offset commits would re-read and duplicate these
+        # lines on the next sweep (crash-safe forwarding, codex).
+        return self.substrate.ingest_with_offset(records, str(path), inode, new_offset)
 
-    def _drain_rotated(self, path: Path, old_inode: int, offset: int, agent_id: str) -> int:
+    def _drain_rotated(
+        self, path: Path, old_inode: int, offset: int, agent_id: str
+    ) -> list[LogRecord]:
         rotated = path.parent / (path.name + ".1")
         try:
             if rotated.stat().st_ino != old_inode:
                 # A different (older) rotation generation — the backlog is gone.
                 self.substrate.record_drop()
-                return 0
+                return []
         except OSError:
             self.substrate.record_drop()
-            return 0
+            return []
         _, records = self._read_complete_lines(rotated, offset, agent_id, drain_to_eof=True)
-        return self.substrate.ingest(records) if records else 0
+        return records
 
     def _read_complete_lines(
         self, path: Path, offset: int, agent_id: str, *, drain_to_eof: bool = False
