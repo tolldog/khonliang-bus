@@ -4185,15 +4185,20 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
         # — no new liveness machinery. The limp verdict is synthesized HERE
         # because only the bus knows agent_log_dir, the L0 floor callers should
         # fall back to (docs/log-agent-design.md; fr_khonliang-bus_70862caa).
+        args = {
+            "agent_id": agent_id, "since": since, "until": until,
+            "level": level, "pattern": pattern, "limit": limit,
+        }
+        # Target the CANONICAL singleton id first so results stay deterministic
+        # if a second instance ever registers (each tails its own filesystem);
+        # fall back to type routing for custom-id single-instance deployments.
         result = await bus.handle_request(RequestMessage(
-            agent_type="log-agent",
-            operation="log_query",
-            args={
-                "agent_id": agent_id, "since": since, "until": until,
-                "level": level, "pattern": pattern, "limit": limit,
-            },
-            timeout=20.0,
+            agent_id="log-agent", operation="log_query", args=args, timeout=20.0,
         ))
+        if isinstance(result, dict) and "no healthy agent" in str(result.get("error", "")):
+            result = await bus.handle_request(RequestMessage(
+                agent_type="log-agent", operation="log_query", args=args, timeout=20.0,
+            ))
         # ANY dispatch-level error means the log path can't serve this query —
         # not just "no healthy agent": a crashed-but-still-registered agent
         # yields "not connected via WebSocket" / timeouts in the window before

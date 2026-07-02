@@ -20,7 +20,7 @@ from typing import Any
 
 import websockets
 
-from bus.log_agent.substrate import LogRecord, SqliteSubstrate
+from bus.log_agent.substrate import SqliteSubstrate
 from bus.log_agent.tailer import Tailer
 
 logger = logging.getLogger("log_agent")
@@ -98,11 +98,19 @@ class LogAgent:
         return self.substrate.status()
 
     def skill_self_test(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Exercise the REAL forward path: write a probe line to an L0 file,
+        tail-sweep it, query it back. Inserting straight into the substrate
+        would report green with the tailer broken or aimed at the wrong dir —
+        a false pass in exactly the failure mode this probes (codex)."""
         probe = f"self-test probe {time.time():.6f}"
-        self.substrate.ingest(
-            [LogRecord(ts=time.time(), agent_id=self.agent_id, level=None, message=probe)]
-        )
-        found = self.substrate.query(agent_id=self.agent_id, pattern=probe, limit=1)
+        probe_file = os.path.join(self.log_dir, "self-test.log")
+        try:
+            with open(probe_file, "a") as f:
+                f.write(probe + "\n")
+        except OSError as e:
+            return {"ok": False, "error": f"log dir not writable: {e}", **self.substrate.status()}
+        self.tailer.sweep()
+        found = self.substrate.query(agent_id="self-test", pattern=probe, limit=1)
         return {"ok": bool(found), "probe_found": bool(found), **self.substrate.status()}
 
     def skill_health_check(self, args: dict[str, Any]) -> dict[str, Any]:

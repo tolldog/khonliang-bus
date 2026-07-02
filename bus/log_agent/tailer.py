@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 import urllib.parse
 from datetime import datetime
@@ -57,19 +58,24 @@ class Tailer:
     def __init__(self, log_dir: str | Path, substrate: SqliteSubstrate):
         self.log_dir = Path(log_dir)
         self.substrate = substrate
+        # Serializes sweeps: the background loop (via to_thread) and an
+        # on-demand self_test sweep would otherwise race the read-offset →
+        # ingest+commit window and double-ingest the same lines.
+        self._lock = threading.Lock()
 
     def sweep(self) -> int:
         """One pass over every log file; returns lines ingested."""
-        total = 0
-        if not self.log_dir.is_dir():
-            return 0
-        for path in sorted(self.log_dir.glob("*.log")):
-            try:
-                total += self._sweep_file(path)
-            except OSError as e:
-                # One unreadable file must not stall the rest of the fleet.
-                logger.warning("tail %s failed: %s", path.name, e)
-        return total
+        with self._lock:
+            total = 0
+            if not self.log_dir.is_dir():
+                return 0
+            for path in sorted(self.log_dir.glob("*.log")):
+                try:
+                    total += self._sweep_file(path)
+                except OSError as e:
+                    # One unreadable file must not stall the rest of the fleet.
+                    logger.warning("tail %s failed: %s", path.name, e)
+            return total
 
     def _sweep_file(self, path: Path) -> int:
         agent_id = _agent_id_from_filename(path.name)
