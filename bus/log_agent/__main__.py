@@ -23,7 +23,11 @@ def main() -> None:
     parser.add_argument(
         "--log-dir",
         default=os.environ.get("KHONLIANG_BUS_LOG_DIR", "logs/agents"),
-        help="The L0 log dir to tail (must match the bus's --log-dir).",
+        help=(
+            "The L0 log dir to tail (must match the bus's --log-dir). When the "
+            "bus spawns this agent it exports KHONLIANG_BUS_LOG_DIR with its "
+            "actual dir, so bus-spawned instances inherit it automatically."
+        ),
     )
     parser.add_argument("--config", default=None, help="Accepted for the bus spawn contract; unused.")
     args = parser.parse_args()

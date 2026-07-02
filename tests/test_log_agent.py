@@ -60,6 +60,13 @@ def test_substrate_retention(tmp_path):
     assert [r["message"] for r in s.query()] == ["fresh"]
 
 
+def test_substrate_creates_missing_dir(tmp_path):
+    """Fresh deployment: the agent can start before the bus wrote any L0 file —
+    the substrate mkdirs its parent rather than failing sqlite connect."""
+    s = SqliteSubstrate(tmp_path / "not-yet" / "sub.db")
+    assert s.status()["reachable"] is True
+
+
 def test_substrate_status(tmp_path):
     s = SqliteSubstrate(tmp_path / "sub.db")
     st = s.status()

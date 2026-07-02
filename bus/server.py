@@ -1433,6 +1433,13 @@ class BusServer:
             "--config", installed["config"],
         ]
         log_file = self._open_agent_log(agent_id)
+        # Python children block-buffer stdout (~8KB) when it isn't a tty, so
+        # crash-adjacent lines would die in the buffer on SIGKILL. The log dir
+        # is exported so consumers (the log agent tailing this very dir) inherit
+        # the bus's ACTUAL --log-dir without per-install plumbing (codex).
+        child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        if self._agent_log_dir is not None:
+            child_env["KHONLIANG_BUS_LOG_DIR"] = str(self._agent_log_dir)
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -1440,9 +1447,7 @@ class BusServer:
                 stdout=log_file if log_file is not None else subprocess.DEVNULL,
                 # Merge stderr into the same stream — one file per agent.
                 stderr=subprocess.STDOUT if log_file is not None else subprocess.DEVNULL,
-                # Python children block-buffer stdout (~8KB) when it isn't a tty,
-                # so crash-adjacent lines would die in the buffer on SIGKILL.
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=child_env,
             )
             with self._processes_lock:
                 self._processes[agent_id] = proc

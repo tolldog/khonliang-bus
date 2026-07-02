@@ -249,6 +249,22 @@ def test_sanitized_ids_do_not_collide(tmp_path):
             f.close()
 
 
+def test_spawned_agent_inherits_log_dir_env(tmp_path):
+    """The bus exports its ACTUAL --log-dir to children so consumers (the log
+    agent tailing this very dir) need no per-install plumbing."""
+    log_dir = tmp_path / "custom-logs"
+    bus = _bus(tmp_path, agent_log_dir=str(log_dir))
+    script = tmp_path / "env_agent.py"
+    script.write_text("import os; print('DIR=' + os.environ.get('KHONLIANG_BUS_LOG_DIR', 'MISSING'))\n")
+    bus.db.install_agent(agent_id="a1", agent_type="test", command=sys.executable,
+                         args=[str(script)], cwd=str(tmp_path), config=str(tmp_path / "c.yaml"))
+
+    bus.start_agent("a1")
+    _wait_exit(bus, "a1")
+
+    assert f"DIR={log_dir}" in (log_dir / "a1.log").read_text()
+
+
 def test_agent_log_max_bytes_floor(tmp_path):
     bus = _bus(tmp_path, agent_log_dir=str(tmp_path / "logs"), agent_log_max_bytes=5)
     assert bus._agent_log_max_bytes == 1_000_000  # floored, not 5 bytes

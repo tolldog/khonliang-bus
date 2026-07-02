@@ -35,6 +35,9 @@ class SqliteSubstrate:
         self.db_path = str(db_path)
         self.retention_days = float(retention_days)
         self._drop_count = 0
+        # The agent may start before the bus has written any L0 file (fresh
+        # deployment) — sqlite can't create a db in a missing directory.
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
             c.executescript(
                 """
