@@ -452,7 +452,11 @@ class BusServer:
         raw_log_dir = self.config.get("agent_log_dir")
         if raw_log_dir:
             try:
-                d = Path(raw_log_dir).expanduser()
+                # Absolutize: the dir is exported to spawned agents that run
+                # under their OWN cwd — a relative path would resolve to a
+                # different directory there and the log agent would tail the
+                # wrong place (same class as the relative --uds fix).
+                d = Path(raw_log_dir).expanduser().resolve()
                 d.mkdir(parents=True, exist_ok=True)
                 self._agent_log_dir = d
             except OSError as e:

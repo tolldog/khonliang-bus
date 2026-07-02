@@ -249,6 +249,16 @@ def test_sanitized_ids_do_not_collide(tmp_path):
             f.close()
 
 
+def test_relative_log_dir_exported_absolute(tmp_path, monkeypatch):
+    """A relative --log-dir must be absolutized before export — a spawned agent
+    runs under its OWN cwd, where the relative path points elsewhere."""
+    monkeypatch.chdir(tmp_path)
+    bus = _bus(tmp_path, agent_log_dir="logs/agents")  # relative, the default
+    assert bus._agent_log_dir is not None
+    assert bus._agent_log_dir.is_absolute()
+    assert bus._agent_log_dir == (tmp_path / "logs/agents").resolve()
+
+
 def test_spawned_agent_inherits_log_dir_env(tmp_path):
     """The bus exports its ACTUAL --log-dir to children so consumers (the log
     agent tailing this very dir) need no per-install plumbing."""
