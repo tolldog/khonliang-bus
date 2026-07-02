@@ -141,6 +141,26 @@ def test_tailer_drains_rotated_backlog_before_reset(tmp_path):
     assert "forwarded" in msgs and len(msgs) == 3  # no duplicates either
 
 
+def test_tailer_keeps_blank_lines(tmp_path):
+    """'Never drops a line' is literal — blank separators in multi-line output
+    must survive so log_query reconstructs the stream exactly."""
+    d, s, t = _tailer(tmp_path)
+    (d / "a1.log").write_text("first block\n\nsecond block\n")
+    assert t.sweep() == 3
+    msgs = [r["message"] for r in s.query(agent_id="a1", limit=10)]
+    assert "" in msgs
+
+
+def test_main_fails_closed_when_log_dir_disabled(monkeypatch):
+    """A bus with L0 disabled exports an EMPTY log dir — the agent must refuse
+    to start (fail closed), not tail a fresh default dir and serve healthy
+    empty results."""
+    import bus.log_agent.__main__ as lam
+    monkeypatch.setattr("sys.argv", ["log-agent", "--log-dir", ""])
+    with pytest.raises(SystemExit, match="disabled"):
+        lam.main()
+
+
 def test_tailer_copytruncate_resets(tmp_path):
     d, s, t = _tailer(tmp_path)
     p = d / "a1.log"

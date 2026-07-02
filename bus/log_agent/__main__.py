@@ -32,6 +32,15 @@ def main() -> None:
     parser.add_argument("--config", default=None, help="Accepted for the bus spawn contract; unused.")
     args = parser.parse_args()
 
+    if not args.log_dir:
+        # An empty --log-dir / env is the bus's explicit "L0 file logging
+        # disabled" sentinel — fail closed rather than tail a fresh default dir
+        # and register healthy with misleading empty results (codex R2).
+        raise SystemExit(
+            "log-agent: the bus has L0 file logging disabled (empty log dir); "
+            "nothing to tail — enable --log-dir on the bus first"
+        )
+
     # WARNING+: this agent's own stdout lands inside the glob it tails —
     # chatty logging would self-amplify (design doc).
     logging.basicConfig(

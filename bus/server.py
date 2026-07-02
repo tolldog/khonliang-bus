@@ -1437,9 +1437,13 @@ class BusServer:
         # crash-adjacent lines would die in the buffer on SIGKILL. The log dir
         # is exported so consumers (the log agent tailing this very dir) inherit
         # the bus's ACTUAL --log-dir without per-install plumbing (codex).
+        # Empty string = explicit "L0 disabled" sentinel: a bus-spawned log
+        # agent must FAIL CLOSED (nothing to tail) rather than tail a fresh
+        # default dir and serve misleading empty results.
         child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-        if self._agent_log_dir is not None:
-            child_env["KHONLIANG_BUS_LOG_DIR"] = str(self._agent_log_dir)
+        child_env["KHONLIANG_BUS_LOG_DIR"] = (
+            str(self._agent_log_dir) if self._agent_log_dir is not None else ""
+        )
         try:
             proc = subprocess.Popen(
                 cmd,

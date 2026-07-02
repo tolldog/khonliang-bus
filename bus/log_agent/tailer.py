@@ -129,9 +129,11 @@ class Tailer:
                 return offset, []  # only a partial line so far — carry it
             consumed = last_nl + 1
         now = time.time()
+        # Blank lines are kept — "never drops a line" is literal: multi-line
+        # output with intentional blank separators must reconstruct from
+        # log_query exactly as written (codex R2).
         records = [
             _parse_line(raw.decode("utf-8", errors="replace"), agent_id, now)
             for raw in chunk[:consumed].splitlines()
-            if raw.strip()
         ]
         return offset + consumed, records
