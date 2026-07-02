@@ -452,7 +452,11 @@ class BusServer:
         raw_log_dir = self.config.get("agent_log_dir")
         if raw_log_dir:
             try:
-                d = Path(raw_log_dir).expanduser()
+                # Absolutize: the dir is exported to spawned agents that run
+                # under their OWN cwd — a relative path would resolve to a
+                # different directory there and the log agent would tail the
+                # wrong place (same class as the relative --uds fix).
+                d = Path(raw_log_dir).expanduser().resolve()
                 d.mkdir(parents=True, exist_ok=True)
                 self._agent_log_dir = d
             except OSError as e:
@@ -1433,6 +1437,17 @@ class BusServer:
             "--config", installed["config"],
         ]
         log_file = self._open_agent_log(agent_id)
+        # Python children block-buffer stdout (~8KB) when it isn't a tty, so
+        # crash-adjacent lines would die in the buffer on SIGKILL. The log dir
+        # is exported so consumers (the log agent tailing this very dir) inherit
+        # the bus's ACTUAL --log-dir without per-install plumbing (codex).
+        # Empty string = explicit "L0 disabled" sentinel: a bus-spawned log
+        # agent must FAIL CLOSED (nothing to tail) rather than tail a fresh
+        # default dir and serve misleading empty results.
+        child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        child_env["KHONLIANG_BUS_LOG_DIR"] = (
+            str(self._agent_log_dir) if self._agent_log_dir is not None else ""
+        )
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -1440,9 +1455,7 @@ class BusServer:
                 stdout=log_file if log_file is not None else subprocess.DEVNULL,
                 # Merge stderr into the same stream — one file per agent.
                 stderr=subprocess.STDOUT if log_file is not None else subprocess.DEVNULL,
-                # Python children block-buffer stdout (~8KB) when it isn't a tty,
-                # so crash-adjacent lines would die in the buffer on SIGKILL.
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=child_env,
             )
             with self._processes_lock:
                 self._processes[agent_id] = proc
@@ -4157,6 +4170,54 @@ def create_app(db_path: str = "data/bus.db", config: dict[str, Any] | None = Non
             if "not found" in error:
                 raise HTTPException(status_code=404, detail=error)
             raise HTTPException(status_code=422, detail=error)
+        return result
+
+    @app.get("/v1/logs/query")
+    async def logs_query(
+        agent_id: str = "",
+        since: float = 0.0,
+        until: float | None = None,
+        level: str = "",
+        pattern: str = "",
+        limit: int = 200,
+    ):
+        # Thin passthrough to the log agent's log_query skill via NORMAL routing
+        # — no new liveness machinery. The limp verdict is synthesized HERE
+        # because only the bus knows agent_log_dir, the L0 floor callers should
+        # fall back to (docs/log-agent-design.md; fr_khonliang-bus_70862caa).
+        args = {
+            "agent_id": agent_id, "since": since, "until": until,
+            "level": level, "pattern": pattern, "limit": limit,
+        }
+        # Target the CANONICAL singleton id first so results stay deterministic
+        # if a second instance ever registers (each tails its own filesystem);
+        # fall back to type routing for custom-id single-instance deployments.
+        result = await bus.handle_request(RequestMessage(
+            agent_id="log-agent", operation="log_query", args=args, timeout=20.0,
+        ))
+        if isinstance(result, dict) and "no healthy agent" in str(result.get("error", "")):
+            result = await bus.handle_request(RequestMessage(
+                agent_type="log-agent", operation="log_query", args=args, timeout=20.0,
+            ))
+        # ANY dispatch-level error means the log path can't serve this query —
+        # not just "no healthy agent": a crashed-but-still-registered agent
+        # yields "not connected via WebSocket" / timeouts in the window before
+        # liveness reconciliation, and callers must get the L0 fallback then
+        # too, never a 200-with-error (codex).
+        if isinstance(result, dict) and result.get("error"):
+            raise HTTPException(status_code=503, detail={
+                "error": "log agent unreachable",
+                "cause": str(result["error"]),
+                "hint": (
+                    f"raw log files at {bus.config.get('agent_log_dir')}"
+                    if bus.config.get("agent_log_dir")
+                    else "L0 file logging is disabled on this bus (--log-dir)"
+                ),
+            })
+        # Unwrap the dispatch envelope ({"result": payload, "trace_id"}) so
+        # callers get {lines, count, trace_id} directly.
+        if isinstance(result, dict) and isinstance(result.get("result"), dict):
+            return {**result["result"], "trace_id": result.get("trace_id")}
         return result
 
     # Trust model: these routes are unauthenticated like every other bus HTTP

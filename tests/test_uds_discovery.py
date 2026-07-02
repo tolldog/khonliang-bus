@@ -40,7 +40,7 @@ def test_discover_bus_live_socket(monkeypatch, tmp_path):
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(sock))
     srv.listen(1)  # a live listener
-    monkeypatch.setattr("bus.mcp_adapter.BUS_SOCK_PATH", sock)
+    monkeypatch.setattr("bus.discovery.BUS_SOCK_PATH", sock)
     try:
         assert discover_bus() == f"unix://{sock}"
     finally:
@@ -56,13 +56,13 @@ def test_discover_bus_ignores_dead_socket(monkeypatch, tmp_path):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.bind(str(sock))
     s.close()  # socket file remains, nothing listening
-    monkeypatch.setattr("bus.mcp_adapter.BUS_SOCK_PATH", sock)
+    monkeypatch.setattr("bus.discovery.BUS_SOCK_PATH", sock)
     assert discover_bus() == "http://localhost:8787"
 
 
 def test_discover_bus_fallback(monkeypatch, tmp_path):
     monkeypatch.delenv("KHONLIANG_BUS_URL", raising=False)
-    monkeypatch.setattr("bus.mcp_adapter.BUS_SOCK_PATH", tmp_path / "absent.sock")
+    monkeypatch.setattr("bus.discovery.BUS_SOCK_PATH", tmp_path / "absent.sock")
     assert discover_bus() == "http://localhost:8787"
 
 
